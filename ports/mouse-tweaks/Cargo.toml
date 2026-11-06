@@ -1,0 +1,12 @@
+[package]
+name = "mouse-tweaks"
+version = "1.0.0"
+edition = "2024"
+license = "BSD-3-Clause"
+description = "Mouse Tweaks for Horizon: drag-pickup and wheel item tweaks in menus."
+publish = false
+
+[lib]
+path = "mixins/mouse_tweaks/runtime.rs"
+
+[dependencies]

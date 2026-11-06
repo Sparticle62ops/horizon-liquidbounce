@@ -1,0 +1,85 @@
+[mod]
+id = "simple_voice_chat"
+version = "1.0.0"
+priority = 100
+
+# The commit it was built and tested on.
+[compatibility]
+horizon_revision = "3fb4c3138e0c5d8fdd2fdb555cf31368e8897497"
+
+[[module]]
+id = "runtime"
+file = "crates/horizon-client/src/game.rs"
+name = "simple_voice_chat"
+source = "runtime.rs"
+
+[[injection]]
+id = "world_lifecycle"
+kind = "HEAD"
+hook = "world_lifecycle"
+hook_version = 1
+helper = "lifecycle.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "phase", ty = "&crate::game::native_lifecycle::WorldPhase", value = "&phase" },
+]
+
+[[injection]]
+id = "net_from_server"
+kind = "HEAD"
+hook = "net_from_server"
+hook_version = 1
+helper = "net.rs"
+bindings = [
+  { name = "channel", ty = "&str", value = "channel" },
+  { name = "data", ty = "&[u8]", value = "data" },
+]
+
+[[injection]]
+id = "player_submit"
+kind = "HEAD"
+hook = "player_submit"
+hook_version = 1
+helper = "players.rs"
+bindings = [
+  { name = "player", ty = "&crate::game::native_mob_draw::NativeMobRender<'_>", value = "player" },
+  { name = "who", ty = "&crate::game::native_mob_draw::NativePlayerRender<'_>", value = "who" },
+]
+
+[[injection]]
+id = "input_key"
+kind = "HEAD"
+hook = "input_key"
+hook_version = 1
+helper = "input.rs"
+bindings = [
+  { name = "event", ty = "&winit::event::KeyEvent", value = "event" },
+  { name = "modifiers", ty = "u32", value = "modifiers" },
+]
+
+[[injection]]
+id = "command_handle"
+kind = "HEAD"
+hook = "command"
+hook_version = 1
+helper = "command_hook.rs"
+bindings = [
+  { name = "command", ty = "&str", value = "command" },
+  { name = "ran", ty = "&mut bool", value = "&mut *ran" },
+]
+
+[[injection]]
+id = "frame"
+kind = "HEAD"
+hook = "frame"
+hook_version = 1
+helper = "frame.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "elapsed", ty = "std::time::Duration", value = "elapsed" },
+]
+
+[[crate]]
+id = "svc_client"
+path = "crates/svc_client"
+dependent = "horizon-client"

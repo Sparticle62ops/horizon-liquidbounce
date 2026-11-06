@@ -1,0 +1,17 @@
+[package]
+name = "horizon-mod-e4mc"
+version = "1.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "Open your Horizon world to friends through the e4mc relay: a Rust port of e4mc."
+
+[lib]
+path = "runtime.rs"
+
+[dependencies]
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

@@ -1,0 +1,13 @@
+[mod]
+id = "ukus_armor_hud"
+version = "1.0.0"
+priority = 100
+
+[compatibility]
+horizon_revision = "3fb4c3138e0c5d8fdd2fdb555cf31368e8897497"
+
+[[module]]
+id = "runtime"
+file = "crates/horizon-client/src/game.rs"
+name = "ukus_armor_hud"
+source = "mixins/ukus_armor_hud/runtime.rs"

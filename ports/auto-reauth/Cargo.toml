@@ -1,0 +1,15 @@
+[package]
+name = "horizon-mod-auto-reauth"
+version = "1.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "Automatically refreshes an expiring Microsoft session: a Rust port of Auto Reauth."
+
+# The mod logic and its tests: the same file the bundle adds to the game.
+[lib]
+path = "mixins/auto_reauth/runtime.rs"
+
+[dependencies]
+serde_json = "1"
+ureq = "2"

@@ -1,0 +1,11 @@
+[package]
+name = "horizon-mod-auto-lectern"
+version = "1.0.0"
+edition = "2024"
+license = "CC-BY-SA-4.0"
+publish = false
+description = "Farm librarian trades on Horizon: a Rust port of AutoLectern."
+
+# The mod logic and its tests: the same file the bundle adds to the game.
+[lib]
+path = "runtime.rs"

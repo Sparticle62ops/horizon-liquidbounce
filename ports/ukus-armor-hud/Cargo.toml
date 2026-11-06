@@ -1,0 +1,10 @@
+[package]
+name = "horizon-mod-ukus-armor-hud"
+version = "1.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "Minimalist vanilla-like armor HUD widget with low-durability warning: a Horizon port of uku's Armor HUD."
+
+[lib]
+path = "mixins/ukus_armor_hud/runtime.rs"

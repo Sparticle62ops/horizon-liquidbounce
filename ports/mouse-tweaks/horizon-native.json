@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "id": "mouse_tweaks",
+  "version": "1.0.0",
+  "game": "26.3",
+  "horizon": "3fb4c3138e0c5d8fdd2fdb555cf31368e8897497",
+  "mixins": "7f6395061749207acfc0260ea78dad95a20566ac",
+  "hooks": 123
+}

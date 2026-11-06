@@ -1,0 +1,10 @@
+[package]
+name = "svc_client_protocol"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "The voice chat wire format spoken client-side: control messages on voicechat: channels over the game connection, and AES-128-GCM UDP datagrams for voice."
+
+[dependencies]
+ring = "0.17"

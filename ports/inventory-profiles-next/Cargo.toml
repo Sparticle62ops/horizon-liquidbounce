@@ -1,0 +1,12 @@
+[package]
+name = "horizon-mod-inventory-profiles-next"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+publish = false
+description = "Slice 1 of a Horizon port of Inventory Profiles Next: the inventory grid model, sorting and the move plan that produces the slot clicks."
+
+[lib]
+path = "src/lib.rs"
+
+[workspace]

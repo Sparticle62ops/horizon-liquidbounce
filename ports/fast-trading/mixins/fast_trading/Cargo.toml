@@ -1,0 +1,11 @@
+[package]
+name = "horizon-mod-fast-trading"
+version = "1.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "Repeat the selected villager trade fast on Horizon: a Rust port of FastTrading."
+
+# The mod logic and its tests: the same file the bundle adds to the game.
+[lib]
+path = "runtime.rs"

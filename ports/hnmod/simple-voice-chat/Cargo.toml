@@ -1,0 +1,3 @@
+[workspace]
+members = ["mixins/simple-voice-chat/crates/svc_client"]
+resolver = "3"

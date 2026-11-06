@@ -1,0 +1,55 @@
+[mod]
+id = "combat_hitboxes_plus"
+version = "1.0.0"
+priority = 100
+
+# The commit it was built and tested on.
+[compatibility]
+horizon_revision = "3242adcfbb26b1a80a322c920463476bcc56d9d5"
+
+[[module]]
+id = "runtime"
+file = "crates/horizon-client/src/game.rs"
+name = "combat_hitboxes"
+source = "runtime.rs"
+
+[[injection]]
+id = "mob_submit"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_mob_submit"
+helper = "mob_submit.rs"
+bindings = [
+  { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+  { name = "mob", ty = "&crate::mod_api::NativeMobRender<'_>", value = "mob" },
+]
+
+[[injection]]
+id = "player_submit"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_player_submit"
+helper = "player_submit.rs"
+bindings = [
+  { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+  { name = "player", ty = "&crate::mod_api::NativeMobRender<'_>", value = "player" },
+]
+
+[[injection]]
+id = "player_render_listened"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_player_render_listened"
+helper = "listened.rs"
+bindings = [
+  { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+  { name = "listened", ty = "&mut bool", value = "listened" },
+]
+
+[[injection]]
+id = "world_primitives"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_world_primitives"
+helper = "primitives.rs"
+bindings = [
+  { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+  { name = "camera", ty = "[f64; 3]", value = "camera" },
+  { name = "primitives", ty = "&mut crate::world_primitives::WorldPrimitives", value = "primitives" },
+]

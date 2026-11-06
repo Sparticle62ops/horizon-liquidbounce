@@ -1,0 +1,10 @@
+[package]
+name = "horizon-mod-commandkeys"
+version = "1.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+description = "Keybind macros (delays, repeats, cycling, ratelimit) for Horizon chat: a Rust port of CommandKeys."
+
+[lib]
+path = "runtime.rs"

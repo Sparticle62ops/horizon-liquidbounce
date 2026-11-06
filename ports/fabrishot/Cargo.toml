@@ -1,0 +1,7 @@
+[package]
+name = "horizon-mod-fabrishot"
+version = "1.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "Hi-res screenshots at a custom resolution with HUD hiding and delay: a Horizon port of fabrishot."

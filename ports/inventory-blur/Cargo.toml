@@ -1,0 +1,10 @@
+[package]
+name = "horizon-mod-inventory-blur"
+version = "1.0.0"
+edition = "2024"
+license = "CC-BY-NC-4.0"
+publish = false
+description = "Applies the 1.20.5+ menu background blur to in-world inventories: a Horizon port of Inventory Blur."
+
+[lib]
+path = "mixins/inventory_blur/runtime.rs"

@@ -1,7 +1,0 @@
-[package]
-name = "svc_client_audio"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-opus = "0.3"

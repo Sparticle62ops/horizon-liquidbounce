@@ -1,0 +1,12 @@
+[package]
+name = "liquidbounce"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+<<<<<<< HEAD
+=======
+
+[workspace]
+>>>>>>> 3c0a73b (port: liquidbounce slice 1 (categories, value/settings system, ClientModule state machine, ModuleManager, config round-trip, 18 tests))

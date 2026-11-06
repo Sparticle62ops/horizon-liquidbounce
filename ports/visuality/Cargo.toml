@@ -1,8 +1,0 @@
-[package]
-name = "horizon-mixin-visuality"
-version = "0.1.0"
-edition = "2021"
-license = "MIT"
-description = "Visuality for Horizon: cosmetic client particles (sparkle, soul, slime blobs, water circles, hit particles, charge) - logic core ported 1:1 from PinkGoosik/visuality (MIT)"
-
-[workspace]

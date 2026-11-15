@@ -851,6 +851,8 @@ pub enum TransferOrigin {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BlinkAction {
     Queue,
+    /// Upstream `BlinkManager.Action.PASS` (set by CriticalsBlink).
+    Pass,
 }
 
 /// The packets FakeLag's logic distinguishes, flattened to their
@@ -1333,6 +1335,7 @@ fn sk_debug(hooks: &mut SkHooks, label: &str) {
 pub enum SprintEventSource {
     MovementTick,
     Input,
+    Network,
     Other,
 }
 
@@ -1350,6 +1353,8 @@ pub enum DirectionalInput {
 
 pub struct MovementInputEvent {
     pub directional_input: DirectionalInput,
+    /// Upstream `event.jump` (written by CriticalsJump; false elsewhere).
+    pub jump: bool,
 }
 
 /// Upstream `Mode` tags.
@@ -2536,7 +2541,7 @@ mod tests5 {
         assert_eq!(debug, vec!["Waiting for Movement Block".to_string()]);
 
         // Movement is NOT yet blocked during the block countdown.
-        let mut ev = MovementInputEvent { directional_input: DirectionalInput::Other };
+        let mut ev = MovementInputEvent { directional_input: DirectionalInput::Other, jump: false };
         sk_movement_input_handler(&state, &mut ev);
         assert_eq!(ev.directional_input, DirectionalInput::Other);
 
@@ -2546,7 +2551,7 @@ mod tests5 {
         assert_eq!(debug.last().unwrap(), "Disallowing Movement");
 
         // Now movement input is zeroed.
-        let mut ev = MovementInputEvent { directional_input: DirectionalInput::Other };
+        let mut ev = MovementInputEvent { directional_input: DirectionalInput::Other, jump: false };
         sk_movement_input_handler(&state, &mut ev);
         assert_eq!(ev.directional_input, DirectionalInput::None);
 
@@ -15893,5 +15898,1606 @@ mod auto_armor_tests {
         );
         assert_eq!(action, SaveArmorAction::CloseContainer);
         assert!(!state.has_opened_inventory);
+    }
+}
+
+// ----- Seams + ModuleCriticals.kt + modes -----
+
+/// Upstream `LivingEntity.BASE_JUMP_POWER` (the jump-height attribute's base).
+pub const CRIT_BASE_JUMP_POWER: f32 = 0.42;
+/// Upstream `LivingEntity.DEFAULT_BASE_GRAVITY`.
+pub const CRIT_DEFAULT_BASE_GRAVITY: f64 = 0.08;
+
+/// Upstream `ModuleCriticals.WhenSprinting.StopSprintingMode`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CritStopSprintingMode {
+    None,
+    Legit,
+    OnNetwork,
+    OnAttack,
+}
+
+/// Upstream `CriticalsPacket.Mode` tags.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CritPacketSubMode {
+    Vanilla,
+    NoCheatPlus,
+    Falling,
+    Low,
+    Down,
+    Grim,
+    BlocksMc,
+}
+
+/// Upstream `MovePacketType` (utils/network/NetworkUtils.kt): which
+/// `ServerboundMovePlayerPacket` variant the Packet mode sends. The packet is
+/// generated from the player's current state, then `y` and `onGround` are
+/// applied, so the seam receives only the applied values.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MovePacketType {
+    OnGroundOnly,
+    PositionAndOnGround,
+    LookAndOnGround,
+    Full,
+}
+
+/// Upstream `ServerboundMovePlayerPacket` fields the NoGround/Rewound
+/// handlers read or write (the `as?` cast flattens to `Option`).
+#[derive(Clone, Copy, Debug)]
+pub struct CritMovePlayerPacket {
+    pub has_pos: bool,
+    pub y: f64,
+    pub on_ground: bool,
+}
+
+/// Upstream `ModuleCriticals.blockingEffects` (+ the modules and conditions
+/// `allowsCriticalHit` reads), flattened onto the player snapshot.
+#[derive(Clone, Debug)]
+pub struct CritPlayer {
+    pub on_ground: bool,
+    pub is_sprinting: bool,
+    pub was_sprinting: bool,
+    pub fall_distance: f32,
+    pub delta_movement: Vec3,
+    pub is_fall_flying: bool,
+    /// Upstream `player.isInLiquid`.
+    pub is_in_liquid: bool,
+    pub is_passenger: bool,
+    /// `player.box.collideBlockIntersects(checkCollisionShape = false) { it is WebBlock }`.
+    pub in_web: bool,
+    pub on_climbable: bool,
+    pub is_no_gravity: bool,
+    pub is_hands_busy: bool,
+    pub abilities_flying: bool,
+    pub has_levitation: bool,
+    pub has_blindness: bool,
+    pub has_slow_falling: bool,
+    /// `player.input.keyPresses.jump`.
+    pub jump_pressed: bool,
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+    /// Upstream `player.yo` (the previous tick's y).
+    pub yo: f64,
+    pub y_rot: f32,
+    /// `player.tickCount`.
+    pub tick_count: i64,
+    /// `player.currentItemAttackStrengthDelay`.
+    pub attack_strength_delay: f32,
+}
+
+impl Default for CritPlayer {
+    fn default() -> Self {
+        CritPlayer {
+            on_ground: true,
+            is_sprinting: false,
+            was_sprinting: false,
+            fall_distance: 0.0,
+            delta_movement: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            is_fall_flying: false,
+            is_in_liquid: false,
+            is_passenger: false,
+            in_web: false,
+            on_climbable: false,
+            is_no_gravity: false,
+            is_hands_busy: false,
+            abilities_flying: false,
+            has_levitation: false,
+            has_blindness: false,
+            has_slow_falling: false,
+            jump_pressed: false,
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+            yo: 0.0,
+            y_rot: 0.0,
+            tick_count: 0,
+            attack_strength_delay: 0.0,
+        }
+    }
+}
+
+/// The module and world surfaces the Criticals module tree reads.
+pub trait CritHooks {
+    /// `ModuleFly.running`.
+    fn fly_running(&self) -> bool {
+        false
+    }
+    /// `ModuleLiquidWalk.running && ModuleLiquidWalk.standingOnWater()`.
+    fn liquid_walk_standing_on_water(&self) -> bool {
+        false
+    }
+    /// `CombatManager.attackCooldownProgress()` (0..1).
+    fn attack_cooldown_progress(&self) -> f32 {
+        1.0
+    }
+    /// `CombatManager.attackCooldownTicks()`.
+    fn attack_cooldown_ticks(&self) -> i32 {
+        0
+    }
+    /// `ServerObserver.tickSpeed`.
+    fn server_tick_speed(&self) -> f32 {
+        1.0
+    }
+    /// `world.findEnemy(0.0f, maxRange) != null`.
+    fn find_enemy(&self, max_range: f32) -> bool {
+        false
+    }
+    /// `world.findEnemies(0f, maxRange).filter { (entity, _) ->
+    /// !canBeSeen || player.hasLineOfSight(entity) }` as "any enemy left".
+    fn find_enemy_with_visibility(&self, max_range: f32, require_line_of_sight: bool) -> bool {
+        false
+    }
+    /// `ModuleKillAura.running`.
+    fn killaura_running(&self) -> bool {
+        false
+    }
+    /// `ModuleAutoClicker.running`.
+    fn autoclicker_running(&self) -> bool {
+        false
+    }
+    /// `ModuleTriggerBot.running`.
+    fn triggerbot_running(&self) -> bool {
+        false
+    }
+    /// `Timer.requestTimerSpeed(speed, Priority.IMPORTANT_FOR_USAGE_1, ModuleCriticals)`.
+    fn request_timer_speed(&mut self, _speed: f32) {}
+    /// `network.send(packetType.generatePacket().apply { y += mod; onGround })`:
+    /// the generated packet plus the applied y delta and onGround flag.
+    fn send_move_packet(&mut self, _packet_type: MovePacketType, _y_delta: f64, _on_ground: bool) {}
+    /// `network.sendStopSprinting()`.
+    fn send_stop_sprinting(&mut self) {}
+    /// `BlinkManager.isAboveTime(delay)` (the FakeLag seam).
+    fn blink_is_above_time(&self, _delay_ms: u64) -> bool {
+        false
+    }
+    /// The per-tick `FallingPlayer` simulation seam (see `FallingPlayerSim`).
+    fn falling_player_sim(&mut self) -> &mut dyn FallingPlayerSim;
+}
+
+/// Upstream `FallingPlayer` (utils/entity/FallingPlayer.kt): follows the
+/// player with its current movement input until it lands. The underlying
+/// `SimulatedPlayer` world simulation is engine work that arrives with the
+/// movement slice, so `find_collision` drives it through the per-tick
+/// `FallingPlayerSim` seam; the tick counting and result shape stay 1:1.
+#[derive(Clone, Copy, Debug)]
+pub struct FallingPlayer {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+    pub motion_x: f64,
+    pub motion_y: f64,
+    pub motion_z: f64,
+    /// Upstream `movementYaw` (`fromPlayer` defaults to `player.yRot`).
+    pub movement_yaw: f32,
+}
+
+/// Upstream `FallingPlayer.CollisionResult` (`pos` and
+/// `positionBeforeMovement` are engine-side; only the tick is read here).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CollisionResult {
+    pub tick: i32,
+}
+
+/// Per-tick simulation seam for `FallingPlayer`: advance the simulation one
+/// tick and report whether the player is on the ground after it
+/// (`simulation.tick()` + `simulation.onGround()`).
+pub trait FallingPlayerSim {
+    fn tick_on_ground(&mut self) -> bool;
+}
+
+impl FallingPlayer {
+    /// Upstream `FallingPlayer.fromPlayer(player)` (default `movementYaw`).
+    pub fn from_player(player: &CritPlayer) -> Self {
+        Self::from_player_with_yaw(player, player.y_rot)
+    }
+
+    /// Upstream `FallingPlayer.fromPlayer(player, movementYaw)`.
+    pub fn from_player_with_yaw(player: &CritPlayer, movement_yaw: f32) -> Self {
+        FallingPlayer {
+            x: player.x,
+            y: player.y,
+            z: player.z,
+            motion_x: player.delta_movement.x,
+            motion_y: player.delta_movement.y,
+            motion_z: player.delta_movement.z,
+            movement_yaw,
+        }
+    }
+
+    /// Upstream `findCollision(ticks)`.
+    pub fn find_collision(&self, sim: &mut dyn FallingPlayerSim, ticks: i32) -> Option<CollisionResult> {
+        for tick in 0..ticks {
+            if sim.tick_on_ground() {
+                return Some(CollisionResult { tick });
+            }
+        }
+        None
+    }
+}
+
+/// Upstream `PlayerJumpEvent` (only `motion` is read/written here).
+pub struct PlayerJumpEvent {
+    pub motion: f64,
+}
+
+/// Upstream `PacketEvent` flattened for the Criticals packet handlers: the
+/// `as? ServerboundMovePlayerPacket` cast becomes `Option`.
+pub struct CritPacketEvent {
+    pub origin: TransferOrigin,
+    pub packet: Option<CritMovePlayerPacket>,
+}
+
+/// Upstream `AttackEntityEvent` flattened to the attacked entity's kinds.
+#[derive(Clone, Copy, Debug)]
+pub struct CritAttackEvent {
+    /// Upstream `event.entity is LivingEntity`.
+    pub is_living_entity: bool,
+}
+
+/// The critical/magic-crit particle repeats `showCriticals` asks for
+/// (`player.crit(entity)` / `player.magicCrit(entity)` seam).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct CritVisualsRequest {
+    pub critical: u32,
+    pub magic: u32,
+}
+
+/// The module-tree state (`ModuleCriticals` + mode objects).
+#[derive(Clone, Debug)]
+pub struct CriticalsState {
+    /// CriticalsJump `adjustNextJump`.
+    pub jump_adjust_next_jump: bool,
+    /// CriticalsBlink `nextDelay`, `isInState`, `enemyInRange`.
+    pub blink_next_delay: i64,
+    pub blink_is_in_state: bool,
+    pub blink_enemy_in_range: bool,
+    /// CriticalsRewound `ticks`.
+    pub rewound_ticks: i64,
+}
+
+impl Default for CriticalsState {
+    fn default() -> Self {
+        CriticalsState {
+            jump_adjust_next_jump: false,
+            blink_next_delay: 300,
+            blink_is_in_state: false,
+            blink_enemy_in_range: false,
+            rewound_ticks: 0,
+        }
+    }
+}
+
+fn crit_float(module: &Module, name: &str, default: f64) -> f64 {
+    match module.setting(name).map(|v| &v.kind) {
+        Some(ValueKind::Float(v, _, _)) => *v,
+        _ => default,
+    }
+}
+
+/// The active mode tag (`choices("Mode", 1)`).
+fn crit_mode(module: &Module) -> String {
+    match module.setting("Mode").map(|v| &v.kind) {
+        Some(ValueKind::Choice(sel, _)) => sel.to_string(),
+        _ => "None".to_string(),
+    }
+}
+
+/// A `Mode` object runs when it is the active choice and the parent module is
+/// enabled.
+fn criticals_mode_running(module: &Module, tag: &str) -> bool {
+    module.running && crit_mode(module) == tag
+}
+
+/// Upstream `ModuleCriticals` — automatically crits every time you attack
+/// someone. Upstream's mode value groups (`WhenSprinting`, `Visuals`) and the
+/// six modes' own settings are flattened onto the module; names that collide
+/// carry their group as a prefix (`WhenSprintingRange`, `JumpRange`,
+/// `BlinkRange`, `TimerRange`, `PacketMode`, `PacketType`). The
+/// `SkipCursed`-style multi-enum does not exist here; the only multi-value
+/// setting is Blink's `Delay` int range.
+pub fn criticals() -> Module {
+    Module::new(
+        "Criticals",
+        COMBAT,
+        vec![
+            choice("Mode", "None", &["None", "Packet", "NoGround", "Jump", "Blink", "Timer", "Rewound"]),
+            // WhenSprinting group ("WhenSprinting", false)
+            boolean("WhenSprinting", false),
+            choice("StopSprinting", "Legit", &["None", "Legit", "OnNetwork", "OnAttack"]),
+            float("WhenSprintingRange", 4.0, 0.0, 10.0),
+            // Visuals group ("Visuals", false)
+            boolean("Visuals", false),
+            boolean("Fake", false),
+            int("Critical", 1, 0, 20),
+            int("Magic", 0, 0, 20),
+            // Packet mode
+            choice("PacketMode", "NCP-2024-01-25", &["Vanilla", "NCP-2024-01-25", "Falling", "Low", "Down", "Grim-2.3.59", "BlocksMC"]),
+            choice("PacketType", "Full", &["OnGroundOnly", "PositionAndOnGround", "LookAndOnGround", "Full"]),
+            // Jump mode
+            float("Height", CRIT_BASE_JUMP_POWER as f64, 0.1, CRIT_BASE_JUMP_POWER as f64),
+            float("JumpRange", 4.0, 1.0, 6.0),
+            boolean("OptimizeForCooldown", true),
+            boolean("CheckKillaura", false),
+            boolean("CheckAutoClicker", false),
+            boolean("CheckTriggerBot", false),
+            boolean("CanBeSeen", true),
+            // Blink mode
+            int_range("Delay", 300, 600, 0, 1000),
+            float("BlinkRange", 4.0, 0.0, 10.0),
+            // Timer mode
+            float("Speed", 0.8, 0.1, 1.0),
+            float("TimerRange", 4.0, 0.0, 10.0),
+        ],
+    )
+}
+
+/// Upstream `ModuleCriticals.allowsCriticalHit`.
+pub fn criticals_allows_critical_hit(
+    module: &Module,
+    hooks: &dyn CritHooks,
+    player: &CritPlayer,
+    ignore_on_ground: bool,
+) -> bool {
+    let _ = module;
+    let blocking_conditions = [
+        // Modules
+        hooks.fly_running(),
+        hooks.liquid_walk_standing_on_water(),
+        player.is_in_liquid,
+        player.is_passenger,
+        // Cobwebs
+        player.in_web,
+        // Effects
+        player.has_levitation || player.has_blindness || player.has_slow_falling,
+        // Disabling conditions
+        player.on_climbable,
+        player.is_no_gravity,
+        player.is_hands_busy,
+        player.abilities_flying,
+        // On Ground
+        player.on_ground && !ignore_on_ground,
+    ];
+
+    // Do not replace this with .none() since it is equivalent to .isEmpty()
+    blocking_conditions.iter().all(|c| !*c)
+}
+
+/// Upstream `ModuleCriticals.canDoCriticalHit`.
+pub fn criticals_can_do_critical_hit(
+    module: &Module,
+    hooks: &dyn CritHooks,
+    player: &CritPlayer,
+    ignore_on_ground: bool,
+    ignore_sprint: bool,
+) -> bool {
+    criticals_allows_critical_hit(module, hooks, player, ignore_on_ground)
+        && hooks.attack_cooldown_progress() > 0.9
+        && (!player.is_sprinting || ignore_sprint)
+}
+
+/// Upstream `ModuleCriticals.wouldDoCriticalHit`.
+pub fn criticals_would_do_critical_hit(
+    module: &Module,
+    hooks: &dyn CritHooks,
+    player: &CritPlayer,
+    ignore_sprint: bool,
+) -> bool {
+    criticals_can_do_critical_hit(module, hooks, player, false, ignore_sprint)
+        && player.fall_distance > 0.0
+}
+
+/// Upstream `ModuleCriticals.shouldWaitForCrit`.
+pub fn criticals_should_wait_for_crit(
+    module: &Module,
+    hooks: &mut dyn CritHooks,
+    player: &CritPlayer,
+    state: &CriticalsState,
+    blink_running: bool,
+    ignore_state: bool,
+) -> bool {
+    if blink_running && state.blink_is_in_state {
+        false
+    } else {
+        criticals_jump_should_wait_for_crit(module, hooks, player, state, ignore_state)
+    }
+}
+
+// -- WhenSprinting group ---------------------------------------------------
+
+/// The `StopSprinting` setting (default `Legit`).
+fn crit_stop_sprinting_mode(module: &Module) -> CritStopSprintingMode {
+    match module.setting("StopSprinting").map(|v| &v.kind) {
+        Some(ValueKind::Choice(sel, _)) if sel == "None" => CritStopSprintingMode::None,
+        Some(ValueKind::Choice(sel, _)) if sel == "OnNetwork" => CritStopSprintingMode::OnNetwork,
+        Some(ValueKind::Choice(sel, _)) if sel == "OnAttack" => CritStopSprintingMode::OnAttack,
+        _ => CritStopSprintingMode::Legit,
+    }
+}
+
+/// Upstream `WhenSprinting.running`: `super.running && wouldDoCriticalHit(true)
+/// && world.findEnemy(0.0f, enemyInRange) != null`.
+pub fn criticals_when_sprinting_running(
+    module: &Module,
+    hooks: &dyn CritHooks,
+    player: &CritPlayer,
+) -> bool {
+    setting_bool(module, "WhenSprinting", false)
+        && criticals_would_do_critical_hit(module, hooks, player, true)
+        && hooks.find_enemy(crit_float(module, "WhenSprintingRange", 4.0) as f32)
+}
+
+/// Upstream `WhenSprinting.shouldAttemptCritWhileSprinting()`.
+pub fn criticals_when_sprinting_should_attempt_crit_while_sprinting(
+    module: &Module,
+    hooks: &dyn CritHooks,
+    player: &CritPlayer,
+) -> bool {
+    criticals_when_sprinting_running(module, hooks, player)
+        && crit_stop_sprinting_mode(module) == CritStopSprintingMode::None
+}
+
+/// Upstream `WhenSprinting.attackHandler` (`handler<AttackEntityEvent>` with
+/// `CRITICAL_MODIFICATION` priority).
+pub fn criticals_when_sprinting_attack_handler(
+    module: &Module,
+    hooks: &mut dyn CritHooks,
+    player: &mut CritPlayer,
+    event: &CritAttackEvent,
+) {
+    let _ = event;
+    if crit_stop_sprinting_mode(module) == CritStopSprintingMode::OnAttack && player.was_sprinting {
+        hooks.send_stop_sprinting();
+        player.was_sprinting = false;
+    }
+}
+
+/// Upstream `WhenSprinting.sprintHandler` (`handler<SprintEvent>`).
+pub fn criticals_when_sprinting_sprint_handler(module: &Module, event: &mut SprintEvent) {
+    match crit_stop_sprinting_mode(module) {
+        CritStopSprintingMode::Legit => {
+            if event.source == SprintEventSource::MovementTick
+                || event.source == SprintEventSource::Input
+            {
+                event.sprint = false;
+            }
+        }
+        CritStopSprintingMode::OnNetwork => {
+            if event.source == SprintEventSource::Network
+                || event.source == SprintEventSource::Input
+            {
+                event.sprint = false;
+            }
+        }
+        _ => {}
+    }
+}
+
+// -- Visuals group ---------------------------------------------------------
+
+/// Upstream `VisualsValueGroup.attackHandler` (`handler<AttackEntityEvent>`).
+pub fn criticals_visuals_attack_handler(
+    module: &Module,
+    hooks: &dyn CritHooks,
+    player: &CritPlayer,
+    event: &CritAttackEvent,
+) -> Option<CritVisualsRequest> {
+    if !event.is_living_entity {
+        return None;
+    }
+
+    if !setting_bool(module, "Fake", false)
+        && !criticals_would_do_critical_hit(module, hooks, player, false)
+    {
+        return None;
+    }
+
+    Some(criticals_show_criticals(module))
+}
+
+/// Upstream `VisualsValueGroup.showCriticals(entity)`. `enabled` is the
+/// `Visuals` toggle.
+pub fn criticals_show_criticals(module: &Module) -> CritVisualsRequest {
+    if !setting_bool(module, "Visuals", false) {
+        return CritVisualsRequest::default();
+    }
+
+    CritVisualsRequest {
+        critical: setting_int(module, "Critical", 1).max(0) as u32,
+        magic: setting_int(module, "Magic", 0).max(0) as u32,
+    }
+}
+
+// -- CriticalsSelectionMode ------------------------------------------------
+
+/// Upstream `CriticalsSelectionMode.isCriticalHit()`.
+pub fn criticals_selection_mode_is_critical_hit(
+    mode: CriticalsSelectionMode,
+    module: &Module,
+    hooks: &mut dyn CritHooks,
+    player: &CritPlayer,
+    state: &CriticalsState,
+    blink_running: bool,
+) -> bool {
+    match mode {
+        CriticalsSelectionMode::Ignore => true,
+        CriticalsSelectionMode::Smart => {
+            !criticals_should_wait_for_crit(module, hooks, player, state, blink_running, true)
+        }
+        CriticalsSelectionMode::Always => {
+            criticals_would_do_critical_hit(module, hooks, player, false)
+        }
+    }
+}
+
+/// Upstream `CriticalsSelectionMode.shouldStopSprinting(clicker, target)`:
+/// `clicker.willClickAt(1)` arrives as `will_click_at_one`.
+pub fn criticals_selection_mode_should_stop_sprinting(
+    mode: CriticalsSelectionMode,
+    hooks: &dyn CritHooks,
+    player: &CritPlayer,
+    will_click_at_one: bool,
+    target: bool,
+) -> bool {
+    // If we don't care about critical hits we don't have to stop sprinting.
+    if mode == CriticalsSelectionMode::Ignore {
+        return false;
+    }
+
+    // On ground, we cannot do critical hits anyway.
+    if player.on_ground {
+        return false;
+    }
+
+    // If we are about to do a critical hit, we should stop sprinting.
+    target && will_click_at_one
+}
+
+// -- Packet mode -----------------------------------------------------------
+
+/// The `PacketMode` setting (default `NCP-2024-01-25`).
+fn crit_packet_sub_mode(module: &Module) -> CritPacketSubMode {
+    match module.setting("PacketMode").map(|v| &v.kind) {
+        Some(ValueKind::Choice(sel, _)) if sel == "Vanilla" => CritPacketSubMode::Vanilla,
+        Some(ValueKind::Choice(sel, _)) if sel == "Falling" => CritPacketSubMode::Falling,
+        Some(ValueKind::Choice(sel, _)) if sel == "Low" => CritPacketSubMode::Low,
+        Some(ValueKind::Choice(sel, _)) if sel == "Down" => CritPacketSubMode::Down,
+        Some(ValueKind::Choice(sel, _)) if sel == "Grim-2.3.59" => CritPacketSubMode::Grim,
+        Some(ValueKind::Choice(sel, _)) if sel == "BlocksMC" => CritPacketSubMode::BlocksMc,
+        _ => CritPacketSubMode::NoCheatPlus,
+    }
+}
+
+/// The `PacketType` setting (default `Full`).
+fn crit_packet_type(module: &Module) -> MovePacketType {
+    match module.setting("PacketType").map(|v| &v.kind) {
+        Some(ValueKind::Choice(sel, _)) if sel == "OnGroundOnly" => MovePacketType::OnGroundOnly,
+        Some(ValueKind::Choice(sel, _)) if sel == "PositionAndOnGround" => {
+            MovePacketType::PositionAndOnGround
+        }
+        Some(ValueKind::Choice(sel, _)) if sel == "LookAndOnGround" => {
+            MovePacketType::LookAndOnGround
+        }
+        _ => MovePacketType::Full,
+    }
+}
+
+/// Upstream `CriticalsPacket.attackHandler` (`handler<AttackEntityEvent>`).
+/// The `showCriticals` calls come back as the returned request (the visual
+/// seam); None is `return@handler`.
+pub fn criticals_packet_attack_handler(
+    module: &Module,
+    hooks: &mut dyn CritHooks,
+    player: &CritPlayer,
+    event: &CritAttackEvent,
+) -> Option<CritVisualsRequest> {
+    if !event.is_living_entity {
+        return None;
+    }
+
+    let ignore_sprinting =
+        criticals_when_sprinting_should_attempt_crit_while_sprinting(module, hooks, player);
+
+    if !criticals_can_do_critical_hit(module, hooks, player, true, ignore_sprinting) {
+        return None;
+    }
+
+    let packet_type = crit_packet_type(module);
+
+    match crit_packet_sub_mode(module) {
+        CritPacketSubMode::Vanilla => {
+            crit_packet_p(module, hooks, packet_type, 0.2);
+            crit_packet_p(module, hooks, packet_type, 0.01);
+            Some(criticals_show_criticals(module))
+        }
+        CritPacketSubMode::NoCheatPlus => {
+            crit_packet_p(module, hooks, packet_type, 0.11);
+            crit_packet_p(module, hooks, packet_type, 0.1100013579);
+            crit_packet_p(module, hooks, packet_type, 0.0000013579);
+            Some(criticals_show_criticals(module))
+        }
+        CritPacketSubMode::Falling => {
+            crit_packet_p(module, hooks, packet_type, 0.0625);
+            crit_packet_p(module, hooks, packet_type, 0.0625013579);
+            crit_packet_p(module, hooks, packet_type, 0.0000013579);
+            Some(criticals_show_criticals(module))
+        }
+        CritPacketSubMode::Low => {
+            crit_packet_p(module, hooks, packet_type, 1e-9);
+            crit_packet_p(module, hooks, packet_type, 0.0);
+            Some(criticals_show_criticals(module))
+        }
+        CritPacketSubMode::Down => {
+            crit_packet_p(module, hooks, packet_type, -1e-9);
+            Some(criticals_show_criticals(module))
+        }
+        CritPacketSubMode::Grim => {
+            if !player.on_ground {
+                // If player is in air, go down a little bit.
+                // Vanilla still crits and movement is too small
+                // for simulation checks.
+
+                // Requires packet type to be .FULL
+                crit_packet_p(module, hooks, packet_type, -0.000001);
+
+                Some(criticals_show_criticals(module))
+            } else {
+                None
+            }
+        }
+        CritPacketSubMode::BlocksMc => {
+            if player.tick_count % 4 == 0 {
+                crit_packet_p(module, hooks, packet_type, 0.0011);
+                // Upstream `p(0.0, true)` sends the packet with onGround = true.
+                crit_packet_p_on_ground(module, hooks, packet_type, 0.0, true);
+                Some(criticals_show_criticals(module))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Upstream `CriticalsPacket.p(mod, onGround = false)`.
+fn crit_packet_p(module: &Module, hooks: &mut dyn CritHooks, packet_type: MovePacketType, y_delta: f64) {
+    crit_packet_p_on_ground(module, hooks, packet_type, y_delta, false);
+}
+
+fn crit_packet_p_on_ground(
+    module: &Module,
+    hooks: &mut dyn CritHooks,
+    packet_type: MovePacketType,
+    y_delta: f64,
+    on_ground: bool,
+) {
+    let _ = module;
+    hooks.send_move_packet(packet_type, y_delta, on_ground);
+}
+
+// -- NoGround mode ---------------------------------------------------------
+
+/// Upstream `CriticalsNoGround.packetHandler` (`handler<PacketEvent>`):
+/// same thing as NoGround NoFall mode.
+pub fn criticals_no_ground_packet_handler(event: &mut CritPacketEvent) {
+    if let Some(packet) = event.packet.as_mut() {
+        packet.on_ground = false;
+    }
+}
+
+// -- Jump mode -------------------------------------------------------------
+
+/// Upstream `CriticalsJump.isActive()`.
+pub fn criticals_jump_is_active(module: &Module, hooks: &dyn CritHooks) -> bool {
+    if !module.running {
+        return false;
+    }
+
+    // if all module checks are disabled, we can safely say that we are active
+    let check_killaura = setting_bool(module, "CheckKillaura", false);
+    let check_auto_clicker = setting_bool(module, "CheckAutoClicker", false);
+    let check_trigger_bot = setting_bool(module, "CheckTriggerBot", false);
+    if !check_killaura && !check_auto_clicker && !check_trigger_bot {
+        return true;
+    }
+
+    (hooks.killaura_running() && check_killaura)
+        || (hooks.autoclicker_running() && check_auto_clicker)
+        || (hooks.triggerbot_running() && check_trigger_bot)
+}
+
+/// Upstream `CriticalsJump.movementInputEvent` (`handler<MovementInputEvent>`);
+/// returns the `event.jump = true` write (None keeps the event untouched).
+pub fn criticals_jump_movement_input_handler(
+    module: &Module,
+    hooks: &mut dyn CritHooks,
+    player: &CritPlayer,
+    state: &mut CriticalsState,
+) -> bool {
+    if !criticals_jump_is_active(module, hooks) {
+        return false;
+    }
+
+    if !criticals_allows_critical_hit(module, hooks, player, true) {
+        return false;
+    }
+
+    let optimize_for_cooldown = setting_bool(module, "OptimizeForCooldown", true);
+    if optimize_for_cooldown && criticals_jump_should_wait_for_jump(module, hooks, player, CRIT_BASE_JUMP_POWER) {
+        return false;
+    }
+
+    let range = crit_float(module, "JumpRange", 4.0) as f32;
+    let can_be_seen = setting_bool(module, "CanBeSeen", true);
+    let enemies =
+        hooks.find_enemy_with_visibility(range, can_be_seen);
+
+    // Change the jump motion only if the jump is a normal jump (small jumps, i.e. honey blocks
+    // are not affected) and currently.
+    if enemies && player.on_ground {
+        return true;
+    }
+    false
+}
+
+/// The `event.jump = true` write applied to the shared movement-input event.
+pub fn criticals_jump_apply_movement_input(jump_requested: bool, event: &mut MovementInputEvent) {
+    if jump_requested {
+        event.jump = true;
+        // `adjustNextJump = true`
+    }
+}
+
+/// Upstream `CriticalsJump.jumpHandler` (`handler<PlayerJumpEvent>`).
+pub fn criticals_jump_jump_handler(
+    module: &Module,
+    state: &mut CriticalsState,
+    event: &mut PlayerJumpEvent,
+) {
+    // The `value`-option only changes *normal jumps* with upwards velocity 0.42.
+    // Jumps with lower velocity (i.e. from honey blocks) are not affected.
+    let is_jump_normal = event.motion == CRIT_BASE_JUMP_POWER as f64;
+
+    // Is the jump a normal jump and auto-jumping is enabled.
+    if is_jump_normal && state.jump_adjust_next_jump {
+        event.motion = crit_float(module, "Height", CRIT_BASE_JUMP_POWER as f64);
+        state.jump_adjust_next_jump = false;
+    }
+}
+
+/// Upstream `CriticalsJump.calculateTicksUntilNextCrit()`.
+pub fn criticals_jump_calculate_ticks_until_next_crit(
+    hooks: &dyn CritHooks,
+    player: &CritPlayer,
+) -> f32 {
+    let duration_to_wait = player.attack_strength_delay * 0.9 - 0.5;
+    let waited_duration = hooks.attack_cooldown_ticks() as f32;
+
+    // Server ticks left, which pass slower than ours while the server lags
+    ((duration_to_wait - waited_duration) / hooks.server_tick_speed()).max(0.0)
+}
+
+/// Upstream `CriticalsJump.shouldWaitForCrit`.
+pub fn criticals_jump_should_wait_for_crit(
+    module: &Module,
+    hooks: &mut dyn CritHooks,
+    player: &CritPlayer,
+    state: &CriticalsState,
+    ignore_state: bool,
+) -> bool {
+    if !criticals_jump_is_active(module, hooks) && !ignore_state {
+        return false;
+    }
+
+    if player.is_fall_flying {
+        return false;
+    }
+
+    // If general critical conditions are not met, don't wait.
+    if !criticals_allows_critical_hit(module, hooks, player, true) {
+        return false;
+    }
+
+    let on_ground = player.on_ground;
+    let is_jumping = player.jump_pressed || state.jump_adjust_next_jump;
+
+    // If player is on ground and not trying to jump, no need to wait for a crit.
+    if on_ground && !is_jumping {
+        return false;
+    }
+
+    let next_possible_crit = criticals_jump_calculate_ticks_until_next_crit(hooks, player);
+
+    // If player is already falling in the air
+    if !on_ground && player.delta_movement.y <= 0.0 {
+        // If already capable of landing a critical hit right now, don't wait!
+        if player.fall_distance > 0.0 && hooks.attack_cooldown_progress() > 0.9 {
+            return false;
+        }
+
+        // If cooldown is not ready yet during fall, check if cooldown will recover before landing
+        let collision = FallingPlayer::from_player(player).find_collision(
+            hooks.falling_player_sim(),
+            (next_possible_crit + 1.0) as i32,
+        );
+        return match collision {
+            None => true,
+            Some(collision) => collision.tick as f32 >= next_possible_crit,
+        };
+    }
+
+    // If player is rising (in jump) or starting a jump on ground
+    let height = crit_float(module, "Height", CRIT_BASE_JUMP_POWER as f64);
+    let initial_motion_y = if on_ground {
+        height
+    } else {
+        player.delta_movement.y
+    };
+    let gravity = 0.08;
+    let ticks_till_fall = (initial_motion_y / gravity) as f32;
+    let ticks_till_crit = next_possible_crit.max(ticks_till_fall);
+
+    // Check whether player will hit the ground before reaching falling critical state
+    let simulated_falling_player = if on_ground {
+        FallingPlayer {
+            x: player.x,
+            y: player.y,
+            z: player.z,
+            motion_x: player.delta_movement.x,
+            motion_y: player.delta_movement.y + initial_motion_y,
+            motion_z: player.delta_movement.z,
+            movement_yaw: player.y_rot,
+        }
+    } else {
+        FallingPlayer::from_player(player)
+    };
+
+    let collision =
+        simulated_falling_player.find_collision(hooks.falling_player_sim(), (ticks_till_crit + 5.0) as i32);
+    // If player lands before reaching the apex/crit tick, cannot land a crit by waiting
+    if let Some(collision) = collision {
+        if collision.tick < ticks_till_fall as i32 {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Upstream `CriticalsJump.shouldWaitForJump(initialMotion =
+/// LivingEntity.BASE_JUMP_POWER)`.
+pub fn criticals_jump_should_wait_for_jump(
+    module: &Module,
+    hooks: &mut dyn CritHooks,
+    player: &CritPlayer,
+    initial_motion: f32,
+) -> bool {
+    if !criticals_allows_critical_hit(module, hooks, player, true) || !module.running {
+        return false;
+    }
+
+    let ticks_till_fall = initial_motion / CRIT_DEFAULT_BASE_GRAVITY as f32;
+    let next_possible_crit = criticals_jump_calculate_ticks_until_next_crit(hooks, player);
+
+    let simulated = FallingPlayer {
+        x: player.x,
+        y: player.y,
+        z: player.z,
+        motion_x: player.delta_movement.x,
+        motion_y: player.delta_movement.y + initial_motion as f64,
+        motion_z: player.delta_movement.z,
+        movement_yaw: player.y_rot,
+    };
+    let mut ticks_till_next_on_ground = simulated
+        .find_collision(hooks.falling_player_sim(), (ticks_till_fall * 3.0) as i32)
+        .map(|collision| collision.tick);
+
+    if ticks_till_next_on_ground.is_none() {
+        ticks_till_next_on_ground = Some(ticks_till_fall as i32 * 2);
+    }
+    let ticks_till_next_on_ground = ticks_till_next_on_ground.unwrap();
+
+    if ticks_till_next_on_ground as f32 + ticks_till_fall < next_possible_crit {
+        return false;
+    }
+
+    ticks_till_fall + 1.0 < next_possible_crit
+}
+
+// -- Blink mode ------------------------------------------------------------
+
+/// Upstream `CriticalsBlink.delay.random()` (`IntRange.random()` with the
+/// caller-supplied roll).
+pub fn criticals_blink_delay_random(module: &Module, roll: f64) -> i64 {
+    let (from, to) = setting_int_range(module, "Delay", (300, 600));
+    let len = (to - from + 1).max(1) as f64;
+    (from as f64 + roll * len).floor().clamp(from as f64, to as f64) as i64
+}
+
+/// Upstream `CriticalsBlink.tickHandler` (`handler<GameTickEvent>`).
+pub fn criticals_blink_tick_handler(module: &Module, hooks: &dyn CritHooks, state: &mut CriticalsState) {
+    let range = crit_float(module, "BlinkRange", 4.0) as f32;
+    state.blink_enemy_in_range = hooks.find_enemy(range);
+}
+
+/// Upstream `CriticalsBlink.fakeLagHandler` (`handler<BlinkPacketEvent>`).
+/// `blink_is_above_time` comes from the BlinkManager seam.
+pub fn criticals_blink_fake_lag_handler(
+    module: &Module,
+    hooks: &mut dyn CritHooks,
+    player: &CritPlayer,
+    state: &mut CriticalsState,
+    event: &mut BlinkPacketEvent,
+) {
+    if event.origin == TransferOrigin::Outgoing
+        && !criticals_would_do_critical_hit(module, hooks, player, true)
+        && state.blink_enemy_in_range
+    {
+        if hooks.blink_is_above_time(state.blink_next_delay as u64) {
+            state.blink_next_delay = criticals_blink_delay_random(module, 0.5);
+            return;
+        }
+
+        event.action = Some(match event.packet {
+            FakeLagPacket::UseItemOn
+            | FakeLagPacket::PlayerAction
+            | FakeLagPacket::SignUpdate
+            | FakeLagPacket::Interact
+            | FakeLagPacket::Attack
+            | FakeLagPacket::SpectatorAction
+            | FakeLagPacket::Punch
+            | FakeLagPacket::ServerboundResourcePack => BlinkAction::Pass,
+            _ => BlinkAction::Queue,
+        });
+        state.blink_is_in_state = true;
+    } else {
+        state.blink_is_in_state = false;
+    }
+}
+
+/// Upstream `CriticalsBlink.disable()`.
+pub fn criticals_blink_disable(state: &mut CriticalsState) {
+    state.blink_is_in_state = false;
+}
+
+// -- Timer mode ------------------------------------------------------------
+
+/// Upstream `CriticalsTimer.tickHandler` (`handler<GameTickEvent>`).
+pub fn criticals_timer_tick_handler(module: &Module, hooks: &mut dyn CritHooks, player: &CritPlayer) {
+    let range = crit_float(module, "TimerRange", 4.0) as f32;
+    if !hooks.find_enemy(range) {
+        return;
+    }
+
+    if criticals_would_do_critical_hit(module, hooks, player, true) {
+        hooks.request_timer_speed(crit_float(module, "Speed", 0.8) as f32);
+    }
+}
+
+// -- Rewound mode ----------------------------------------------------------
+
+/// Upstream `CriticalsRewound.enable()` (`ticks = 0`).
+pub fn criticals_rewound_enable(state: &mut CriticalsState) {
+    state.rewound_ticks = 0;
+}
+
+/// Upstream `CriticalsRewound.packetHandler` (`handler<PacketEvent>` with
+/// `READ_FINAL_STATE` priority; `@anticheat NoCheatPlus`, `@testedOn
+/// rewound.cc`).
+pub fn criticals_rewound_packet_handler(
+    player: &CritPlayer,
+    state: &mut CriticalsState,
+    event: &mut CritPacketEvent,
+) {
+    if event.origin != TransferOrigin::Outgoing {
+        return;
+    }
+    let Some(packet) = event.packet.as_mut() else {
+        return;
+    };
+
+    state.rewound_ticks = if player.on_ground && player.y <= player.yo {
+        state.rewound_ticks + 1
+    } else {
+        0
+    };
+    match state.rewound_ticks {
+        0 | 1 => {}
+        2 => {
+            if packet.has_pos {
+                packet.y += 0.003;
+            }
+        }
+        _ => {
+            if packet.has_pos {
+                packet.y += (0.001 - 1e-10 * state.rewound_ticks as f64).max(0.0);
+            }
+        }
+    }
+    packet.on_ground = false;
+}
+
+#[cfg(test)]
+mod criticals_tests {
+    use super::*;
+
+    struct CritSim {
+        /// The tick the simulated player lands on; None never lands.
+        land_on_tick: Option<i32>,
+        next_tick: i32,
+    }
+
+    impl FallingPlayerSim for CritSim {
+        fn tick_on_ground(&mut self) -> bool {
+            let t = self.next_tick;
+            self.next_tick += 1;
+            self.land_on_tick == Some(t)
+        }
+    }
+
+    struct CritMock {
+        fly: bool,
+        liquid_walk: bool,
+        cooldown_progress: f32,
+        cooldown_ticks: i32,
+        tick_speed: f32,
+        enemy: bool,
+        enemy_visible: bool,
+        killaura: bool,
+        autoclicker: bool,
+        triggerbot: bool,
+        timer_requests: Vec<f32>,
+        sent_packets: Vec<(MovePacketType, f64, bool)>,
+        stop_sprints: u32,
+        blink_above_time: bool,
+        sim: CritSim,
+    }
+
+    impl Default for CritMock {
+        fn default() -> Self {
+            CritMock {
+                fly: false,
+                liquid_walk: false,
+                cooldown_progress: 1.0,
+                cooldown_ticks: 0,
+                tick_speed: 1.0,
+                enemy: false,
+                enemy_visible: false,
+                killaura: false,
+                autoclicker: false,
+                triggerbot: false,
+                timer_requests: Vec::new(),
+                sent_packets: Vec::new(),
+                stop_sprints: 0,
+                blink_above_time: false,
+                sim: CritSim { land_on_tick: None, next_tick: 0 },
+            }
+        }
+    }
+
+    impl CritHooks for CritMock {
+        fn fly_running(&self) -> bool {
+            self.fly
+        }
+        fn liquid_walk_standing_on_water(&self) -> bool {
+            self.liquid_walk
+        }
+        fn attack_cooldown_progress(&self) -> f32 {
+            self.cooldown_progress
+        }
+        fn attack_cooldown_ticks(&self) -> i32 {
+            self.cooldown_ticks
+        }
+        fn server_tick_speed(&self) -> f32 {
+            self.tick_speed
+        }
+        fn find_enemy(&self, _max_range: f32) -> bool {
+            self.enemy
+        }
+        fn find_enemy_with_visibility(&self, _max_range: f32, require_line_of_sight: bool) -> bool {
+            !require_line_of_sight || self.enemy_visible
+        }
+        fn killaura_running(&self) -> bool {
+            self.killaura
+        }
+        fn autoclicker_running(&self) -> bool {
+            self.autoclicker
+        }
+        fn triggerbot_running(&self) -> bool {
+            self.triggerbot
+        }
+        fn request_timer_speed(&mut self, speed: f32) {
+            self.timer_requests.push(speed);
+        }
+        fn send_move_packet(&mut self, packet_type: MovePacketType, y_delta: f64, on_ground: bool) {
+            self.sent_packets.push((packet_type, y_delta, on_ground));
+        }
+        fn send_stop_sprinting(&mut self) {
+            self.stop_sprints += 1;
+        }
+        fn blink_is_above_time(&self, _delay_ms: u64) -> bool {
+            self.blink_above_time
+        }
+        fn falling_player_sim(&mut self) -> &mut dyn FallingPlayerSim {
+            &mut self.sim
+        }
+    }
+
+    fn falling_player() -> CritPlayer {
+        CritPlayer {
+            on_ground: false,
+            fall_distance: 1.0,
+            ..Default::default()
+        }
+    }
+
+    fn living_event() -> CritAttackEvent {
+        CritAttackEvent { is_living_entity: true }
+    }
+
+    fn move_packet(y: f64, on_ground: bool) -> CritPacketEvent {
+        CritPacketEvent {
+            origin: TransferOrigin::Outgoing,
+            packet: Some(CritMovePlayerPacket { has_pos: true, y, on_ground }),
+        }
+    }
+
+    #[test]
+    fn allows_critical_hit_blocks_conditions() {
+        let module = criticals();
+        let hooks = CritMock::default();
+        let mut player = CritPlayer::default();
+
+        assert!(criticals_allows_critical_hit(&module, &hooks, &player, true));
+        // On ground blocks unless ignored.
+        assert!(!criticals_allows_critical_hit(&module, &hooks, &player, false));
+        player.on_ground = false;
+        assert!(criticals_allows_critical_hit(&module, &hooks, &player, false));
+
+        player.is_in_liquid = true;
+        assert!(!criticals_allows_critical_hit(&module, &hooks, &player, true));
+        player.is_in_liquid = false;
+
+        player.in_web = true;
+        assert!(!criticals_allows_critical_hit(&module, &hooks, &player, true));
+        player.in_web = false;
+
+        player.has_blindness = true;
+        assert!(!criticals_allows_critical_hit(&module, &hooks, &player, true));
+        player.has_blindness = false;
+
+        player.abilities_flying = true;
+        assert!(!criticals_allows_critical_hit(&module, &hooks, &player, true));
+
+        let mut hooks = CritMock::default();
+        hooks.fly = true;
+        assert!(!criticals_allows_critical_hit(&module, &hooks, &player, true));
+
+        let mut hooks = CritMock::default();
+        hooks.liquid_walk = true;
+        assert!(!criticals_allows_critical_hit(&module, &hooks, &player, true));
+    }
+
+    #[test]
+    fn can_do_and_would_do_critical_hit() {
+        let module = criticals();
+        let hooks = CritMock::default();
+        let mut player = falling_player();
+
+        assert!(criticals_can_do_critical_hit(&module, &hooks, &player, false, false));
+        assert!(criticals_would_do_critical_hit(&module, &hooks, &player, false));
+
+        // Cooldown gate (progress <= 0.9).
+        let mut hooks = CritMock::default();
+        hooks.cooldown_progress = 0.9;
+        assert!(!criticals_can_do_critical_hit(&module, &hooks, &player, false, false));
+
+        // Sprint gate.
+        let hooks = CritMock::default();
+        player.is_sprinting = true;
+        assert!(!criticals_can_do_critical_hit(&module, &hooks, &player, false, false));
+        assert!(criticals_can_do_critical_hit(&module, &hooks, &player, false, true));
+        player.is_sprinting = false;
+
+        // Fall distance gate.
+        player.fall_distance = 0.0;
+        assert!(criticals_can_do_critical_hit(&module, &hooks, &player, false, false));
+        assert!(!criticals_would_do_critical_hit(&module, &hooks, &player, false));
+    }
+
+    #[test]
+    fn packet_mode_ncp_sends_offsets() {
+        let module = criticals();
+        let mut hooks = CritMock::default();
+        let player = falling_player();
+
+        let request = criticals_packet_attack_handler(&module, &mut hooks, &player, &living_event());
+        assert!(request.is_some());
+
+        assert_eq!(
+            hooks.sent_packets,
+            vec![
+                (MovePacketType::Full, 0.11, false),
+                (MovePacketType::Full, 0.1100013579, false),
+                (MovePacketType::Full, 0.0000013579, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn packet_mode_vanilla_low_down_grim_blocksmc() {
+        let mut module = criticals();
+        let player = falling_player();
+
+        module_setting_choice(&mut module, "PacketMode", "Vanilla");
+        let mut hooks = CritMock::default();
+        criticals_packet_attack_handler(&module, &mut hooks, &player, &living_event());
+        assert_eq!(
+            hooks.sent_packets,
+            vec![(MovePacketType::Full, 0.2, false), (MovePacketType::Full, 0.01, false)]
+        );
+
+        module_setting_choice(&mut module, "PacketMode", "Low");
+        let mut hooks = CritMock::default();
+        criticals_packet_attack_handler(&module, &mut hooks, &player, &living_event());
+        assert_eq!(hooks.sent_packets[0], (MovePacketType::Full, 1e-9, false));
+        assert_eq!(hooks.sent_packets[1], (MovePacketType::Full, 0.0, false));
+
+        module_setting_choice(&mut module, "PacketMode", "Down");
+        let mut hooks = CritMock::default();
+        criticals_packet_attack_handler(&module, &mut hooks, &player, &living_event());
+        assert_eq!(hooks.sent_packets, vec![(MovePacketType::Full, -1e-9, false)]);
+
+        module_setting_choice(&mut module, "PacketMode", "Grim-2.3.59");
+        // On the ground Grim sends nothing.
+        let mut hooks = CritMock::default();
+        criticals_packet_attack_handler(&module, &mut hooks, &CritPlayer::default(), &living_event());
+        assert!(hooks.sent_packets.is_empty());
+        let mut hooks = CritMock::default();
+        criticals_packet_attack_handler(&module, &mut hooks, &player, &living_event());
+        assert_eq!(hooks.sent_packets, vec![(MovePacketType::Full, -0.000001, false)]);
+
+        module_setting_choice(&mut module, "PacketMode", "BlocksMC");
+        let mut hooks = CritMock::default();
+        criticals_packet_attack_handler(&module, &mut hooks, &player, &living_event());
+        // tickCount 0 is a multiple of 4: 0.0011, then 0.0 with onGround = true.
+        assert_eq!(
+            hooks.sent_packets,
+            vec![(MovePacketType::Full, 0.0011, false), (MovePacketType::Full, 0.0, true)]
+        );
+        // tickCount 1 is not.
+        let mut player_tick1 = player;
+        player_tick1.tick_count = 1;
+        let mut hooks = CritMock::default();
+        let request = criticals_packet_attack_handler(&module, &mut hooks, &player_tick1, &living_event());
+        assert!(request.is_none());
+        assert!(hooks.sent_packets.is_empty());
+    }
+
+    fn module_setting_choice(module: &mut Module, name: &str, sel: &str) {
+        for value in &mut module.settings {
+            if value.name == name {
+                value.kind = ValueKind::Choice(sel.to_string(), Vec::new());
+            }
+        }
+    }
+
+    #[test]
+    fn no_ground_clears_on_ground() {
+        let mut event = move_packet(1.0, true);
+        criticals_no_ground_packet_handler(&mut event);
+        let packet = event.packet.unwrap();
+        assert!(packet.has_pos);
+        assert!(!packet.on_ground);
+    }
+
+    #[test]
+    fn rewound_progression_and_reset() {
+        let mut state = CriticalsState::default();
+        let mut player = CritPlayer { y: 5.0, yo: 5.0, ..Default::default() };
+
+        // Tick 1: no offset yet, onGround cleared.
+        let mut event = move_packet(5.0, true);
+        criticals_rewound_packet_handler(&player, &mut state, &mut event);
+        assert_eq!(state.rewound_ticks, 1);
+        assert_eq!(event.packet.unwrap().y, 5.0);
+
+        // Tick 2: +0.003.
+        let mut event = move_packet(5.0, true);
+        criticals_rewound_packet_handler(&player, &mut state, &mut event);
+        assert_eq!(state.rewound_ticks, 2);
+        assert_eq!(event.packet.unwrap().y, 5.003);
+
+        // Tick 3: shrinking offset (0.001 - 3e-10).
+        let mut event = move_packet(5.0, true);
+        criticals_rewound_packet_handler(&player, &mut state, &mut event);
+        assert_eq!(state.rewound_ticks, 3);
+        assert!((event.packet.unwrap().y - (5.0 + 0.001 - 3e-10)).abs() < 1e-12);
+
+        // Rising (y > yo) resets the streak.
+        player.y = 5.01;
+        let mut event = move_packet(5.01, true);
+        criticals_rewound_packet_handler(&player, &mut state, &mut event);
+        assert_eq!(state.rewound_ticks, 0);
+
+        // Incoming packets are untouched.
+        let mut event = CritPacketEvent {
+            origin: TransferOrigin::Incoming,
+            packet: Some(CritMovePlayerPacket { has_pos: true, y: 1.0, on_ground: true }),
+        };
+        criticals_rewound_packet_handler(&player, &mut state, &mut event);
+        assert_eq!(event.packet.unwrap().y, 1.0);
+    }
+
+    #[test]
+    fn jump_movement_input_sets_jump() {
+        let mut module = criticals();
+        module.running = true;
+        let mut hooks = CritMock::default();
+        hooks.enemy_visible = true;
+        let player = CritPlayer::default();
+        let mut state = CriticalsState::default();
+
+        let jump = criticals_jump_movement_input_handler(&module, &mut hooks, &player, &mut state);
+        assert!(jump);
+
+        let mut event = MovementInputEvent { directional_input: DirectionalInput::None, jump: false };
+        criticals_jump_apply_movement_input(jump, &mut event);
+        assert!(event.jump);
+
+        // No enemy in reach: no jump.
+        let mut hooks = CritMock::default();
+        let jump = criticals_jump_movement_input_handler(&module, &mut hooks, &player, &mut state);
+        assert!(!jump);
+    }
+
+    #[test]
+    fn jump_handler_adjusts_normal_jump_once() {
+        let mut module = criticals();
+        module_setting_choice(&mut module, "Mode", "Jump");
+        module.settings.retain(|v| v.name != "Height");
+        module.settings.push(float("Height", 0.3, 0.1, 0.42));
+
+        let mut state = CriticalsState::default();
+        state.jump_adjust_next_jump = true;
+
+        let mut event = PlayerJumpEvent { motion: CRIT_BASE_JUMP_POWER as f64 };
+        criticals_jump_jump_handler(&module, &mut state, &mut event);
+        assert_eq!(event.motion, 0.3);
+        assert!(!state.jump_adjust_next_jump);
+
+        // Small jumps (honey blocks) are never touched.
+        state.jump_adjust_next_jump = true;
+        let mut event = PlayerJumpEvent { motion: 0.2 };
+        criticals_jump_jump_handler(&module, &mut state, &mut event);
+        assert_eq!(event.motion, 0.2);
+    }
+
+    #[test]
+    fn should_wait_for_crit_falling_branches() {
+        let module = criticals();
+        let state = CriticalsState::default();
+
+        // Already able to crit right now: don't wait.
+        let player = falling_player();
+        let mut hooks = CritMock::default();
+        assert!(!criticals_jump_should_wait_for_crit(&module, &mut hooks, &player, &state, true));
+
+        // Cooldown not ready and no collision in sight: wait.
+        let mut player = falling_player();
+        player.fall_distance = 0.0;
+        player.delta_movement = Vec3 { x: 0.0, y: -0.2, z: 0.0 };
+        player.attack_strength_delay = 12.0;
+        let mut hooks = CritMock::default();
+        assert!(criticals_jump_should_wait_for_crit(&module, &mut hooks, &player, &state, true));
+
+        // Rising from a held jump on the ground: landing before the cooldown
+        // recovers means waiting buys nothing.
+        let mut player = CritPlayer { jump_pressed: true, attack_strength_delay: 12.0, ..Default::default() };
+        let mut hooks = CritMock::default();
+        hooks.sim.land_on_tick = Some(2);
+        assert!(!criticals_jump_should_wait_for_crit(&module, &mut hooks, &player, &state, true));
+    }
+
+    #[test]
+    fn should_wait_for_crit_dispatches_to_blink_state() {
+        let module = criticals();
+        let mut hooks = CritMock::default();
+        let player = CritPlayer::default();
+        let mut state = CriticalsState::default();
+
+        // Jump would not wait here (on ground, not jumping).
+        assert!(!criticals_should_wait_for_crit(&module, &mut hooks, &player, &state, false, true));
+
+        // Blink holding packets in state short-circuits to false.
+        state.blink_is_in_state = true;
+        assert!(!criticals_should_wait_for_crit(&module, &mut hooks, &player, &state, true, true));
+    }
+
+    #[test]
+    fn blink_handler_queues_and_passes() {
+        let module = criticals();
+        let mut hooks = CritMock::default();
+        // A grounded player cannot crit, so the hold branch is live.
+        let player = CritPlayer::default();
+        let mut state = CriticalsState::default();
+        state.blink_enemy_in_range = true;
+
+        // The player cannot crit on the ground: hold attack packets.
+        let mut event = BlinkPacketEvent {
+            origin: TransferOrigin::Outgoing,
+            packet: FakeLagPacket::Attack,
+            action: None,
+        };
+        criticals_blink_fake_lag_handler(&module, &mut hooks, &player, &mut state, &mut event);
+        assert_eq!(event.action, Some(BlinkAction::Pass));
+        assert!(state.blink_is_in_state);
+
+        // Non-attack packets queue.
+        let mut event = BlinkPacketEvent {
+            origin: TransferOrigin::Outgoing,
+            packet: FakeLagPacket::Other,
+            action: None,
+        };
+        criticals_blink_fake_lag_handler(&module, &mut hooks, &player, &mut state, &mut event);
+        assert_eq!(event.action, Some(BlinkAction::Queue));
+
+        // Incoming traffic never holds.
+        let mut event = BlinkPacketEvent {
+            origin: TransferOrigin::Incoming,
+            packet: FakeLagPacket::Attack,
+            action: None,
+        };
+        criticals_blink_fake_lag_handler(&module, &mut hooks, &player, &mut state, &mut event);
+        assert_eq!(event.action, None);
+        assert!(!state.blink_is_in_state);
+
+        // Above the delay: draw the next delay and leave the event unset.
+        let mut hooks = CritMock::default();
+        hooks.blink_above_time = true;
+        let mut event = BlinkPacketEvent {
+            origin: TransferOrigin::Outgoing,
+            packet: FakeLagPacket::Attack,
+            action: None,
+        };
+        criticals_blink_fake_lag_handler(&module, &mut hooks, &player, &mut state, &mut event);
+        assert_eq!(event.action, None);
+        assert_eq!(state.blink_next_delay, criticals_blink_delay_random(&module, 0.5));
+    }
+
+    #[test]
+    fn timer_requests_speed_when_would_crit() {
+        let module = criticals();
+        let mut hooks = CritMock::default();
+        hooks.enemy = true;
+        let player = falling_player();
+
+        criticals_timer_tick_handler(&module, &mut hooks, &player);
+        assert_eq!(hooks.timer_requests, vec![0.8]);
+
+        // No enemy in range: no request.
+        let mut hooks = CritMock::default();
+        criticals_timer_tick_handler(&module, &mut hooks, &player);
+        assert!(hooks.timer_requests.is_empty());
+    }
+
+    #[test]
+    fn when_sprinting_sprint_handler_sources() {
+        let mut module = criticals();
+
+        // Legit (default): movement tick and input only.
+        let mut event = SprintEvent { source: SprintEventSource::MovementTick, sprint: true };
+        criticals_when_sprinting_sprint_handler(&module, &mut event);
+        assert!(!event.sprint);
+        let mut event = SprintEvent { source: SprintEventSource::Input, sprint: true };
+        criticals_when_sprinting_sprint_handler(&module, &mut event);
+        assert!(!event.sprint);
+        let mut event = SprintEvent { source: SprintEventSource::Network, sprint: true };
+        criticals_when_sprinting_sprint_handler(&module, &mut event);
+        assert!(event.sprint);
+
+        // OnNetwork: network and input only.
+        module_setting_choice(&mut module, "StopSprinting", "OnNetwork");
+        let mut event = SprintEvent { source: SprintEventSource::Network, sprint: true };
+        criticals_when_sprinting_sprint_handler(&module, &mut event);
+        assert!(!event.sprint);
+        let mut event = SprintEvent { source: SprintEventSource::MovementTick, sprint: true };
+        criticals_when_sprinting_sprint_handler(&module, &mut event);
+        assert!(event.sprint);
+    }
+
+    #[test]
+    fn when_sprinting_on_attack_stops_sprinting() {
+        let mut module = criticals();
+        module_setting_choice(&mut module, "StopSprinting", "OnAttack");
+        let mut hooks = CritMock::default();
+        let mut player = falling_player();
+        player.was_sprinting = true;
+
+        criticals_when_sprinting_attack_handler(
+            &module,
+            &mut hooks,
+            &mut player,
+            &living_event(),
+        );
+        assert_eq!(hooks.stop_sprints, 1);
+        assert!(!player.was_sprinting);
+    }
+
+    #[test]
+    fn selection_mode_stop_sprinting() {
+        let hooks = CritMock::default();
+        let player = falling_player();
+
+        assert!(!criticals_selection_mode_should_stop_sprinting(
+            CriticalsSelectionMode::Ignore, &hooks, &player, true, true
+        ));
+        assert!(criticals_selection_mode_should_stop_sprinting(
+            CriticalsSelectionMode::Smart, &hooks, &player, true, true
+        ));
+        // On ground we cannot crit anyway.
+        assert!(!criticals_selection_mode_should_stop_sprinting(
+            CriticalsSelectionMode::Smart, &hooks, &CritPlayer::default(), true, true
+        ));
+        assert!(!criticals_selection_mode_should_stop_sprinting(
+            CriticalsSelectionMode::Smart, &hooks, &player, false, true
+        ));
+    }
+
+    #[test]
+    fn visuals_follow_fake_and_would_crit() {
+        let mut module = criticals();
+        for value in &mut module.settings {
+            if value.name == "Visuals" {
+                value.kind = ValueKind::Bool(true);
+            }
+        }
+        let hooks = CritMock::default();
+        let player = falling_player();
+
+        // Would crit: show the configured repeats.
+        assert_eq!(
+            criticals_visuals_attack_handler(&module, &hooks, &player, &living_event()),
+            Some(CritVisualsRequest { critical: 1, magic: 0 })
+        );
+
+        // Not a living entity: nothing.
+        assert_eq!(
+            criticals_visuals_attack_handler(
+                &module,
+                &hooks,
+                &player,
+                &CritAttackEvent { is_living_entity: false }
+            ),
+            None
+        );
+
+        // Fake shows criticals even without a real crit.
+        for value in &mut module.settings {
+            if value.name == "Fake" {
+                value.kind = ValueKind::Bool(true);
+            }
+        }
+        let grounded = CritPlayer::default();
+        assert!(criticals_visuals_attack_handler(&module, &hooks, &grounded, &living_event()).is_some());
     }
 }

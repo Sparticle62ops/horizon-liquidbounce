@@ -19879,3 +19879,1639 @@ mod tp_aura_tests {
         assert_eq!(state.engagement.as_ref().unwrap().target, 7);
     }
 }
+
+// ----- Seams + ModuleKillAura.kt -----
+
+/// Upstream `ModuleKillAura.RaycastMode`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum KaRaycast {
+    TraceNone,
+    TraceOnlyEnemy,
+    TraceAll,
+}
+
+fn ka_raycast(module: &Module) -> KaRaycast {
+    match module.setting("Raycast").map(|v| &v.kind) {
+        Some(ValueKind::Choice(sel, _)) if sel == "Enemy" => KaRaycast::TraceOnlyEnemy,
+        Some(ValueKind::Choice(sel, _)) if sel == "None" => KaRaycast::TraceNone,
+        _ => KaRaycast::TraceAll,
+    }
+}
+
+/// Upstream `KillAuraRotationsValueGroup.KillAuraRotationTiming`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum KaRotationTiming {
+    Normal,
+    Snap,
+    OnTick,
+}
+
+fn ka_rotation_timing(module: &Module) -> KaRotationTiming {
+    match module.setting("RotationTiming").map(|v| &v.kind) {
+        Some(ValueKind::Choice(sel, _)) if sel == "Snap" => KaRotationTiming::Snap,
+        Some(ValueKind::Choice(sel, _)) if sel == "OnTick" => KaRotationTiming::OnTick,
+        _ => KaRotationTiming::Normal,
+    }
+}
+
+/// A candidate from `targetTracker.targets()` flattened to its entity id and
+/// `entity.squaredBoxedDistanceTo(player)`.
+#[derive(Clone, Copy, Debug)]
+pub struct KaCandidate {
+    pub entity: u64,
+    pub squared_dist: f64,
+}
+
+/// Upstream `KillAuraNotifyWhenFail` failed-hit record flattened.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct KaFailedHit {
+    pub entity: u64,
+    pub location: Vec3,
+    pub time_ms: i64,
+}
+
+/// Upstream object state: `targetTracker` (target + closestSquaredEnemyDistance),
+/// `waitTicks`, `failedHits`, `KillAuraNotifyWhenFail.failedHitsIncrement`,
+/// `KillAuraRange.currentScanRangeAddition`.
+#[derive(Clone, Debug)]
+pub struct KaState {
+    pub target: Option<u64>,
+    pub closest_squared_enemy_distance: f64,
+    pub wait_ticks: i64,
+    pub failed_hits: Vec<KaFailedHit>,
+    pub failed_hits_increment: i64,
+    pub scan_range_addition: f64,
+}
+
+impl Default for KaState {
+    fn default() -> Self {
+        KaState {
+            target: None,
+            closest_squared_enemy_distance: 0.0,
+            wait_ticks: 0,
+            failed_hits: Vec::new(),
+            failed_hits_increment: 0,
+            scan_range_addition: 2.5,
+        }
+    }
+}
+
+/// The engine surfaces `ModuleKillAura` and its killaura feature trees read:
+/// player/inventory state, target selection, rotation finding, the clicker,
+/// AutoBlock, FailSwing, FightBot, network and the renderer. Feature-tree
+/// settings (`KillAuraRange`, `AutoBlock`, clicker, tracker) are flattened
+/// into the module tree; only their live behavior stays on the hooks.
+pub trait KaHooks {
+    // player state
+    fn ka_is_dead_or_dying(&self) -> bool {
+        false
+    }
+    fn ka_is_spectator(&self) -> bool {
+        false
+    }
+    fn ka_player_rotation(&self) -> (f32, f32) {
+        (0.0, 0.0)
+    }
+    /// `player.eyePosition`.
+    fn ka_player_eye_position(&self) -> Vec3 {
+        Vec3 { x: 0.0, y: 1.62, z: 0.0 }
+    }
+    /// `player.getAttributeValue(ENTITY_INTERACTION_RANGE)` (3.0 fallback).
+    fn ka_entity_interaction_range(&self) -> f64 {
+        3.0
+    }
+    /// `player.cannotAttackWithItem(itemStack, 0)`.
+    fn ka_main_hand_cannot_attack(&self) -> bool {
+        false
+    }
+    /// `itemStack.isItemEnabled(world.enabledFeatures())`.
+    fn ka_main_hand_item_enabled(&self) -> bool {
+        true
+    }
+    /// `ItemStack.isWeapon()`: sword, post-1.8 axe, MaceItem or Knockback > 0.
+    fn ka_main_hand_is_weapon(&self) -> bool {
+        false
+    }
+    fn ka_main_hand_is_empty(&self) -> bool {
+        false
+    }
+    /// `player.mainHandItem.customName == null`.
+    fn ka_main_hand_name_is_vanilla(&self) -> bool {
+        true
+    }
+    /// `player.squaredBoxedDistanceTo(entity)`.
+    fn ka_player_squared_boxed_distance_to(&self, target: u64) -> f64 {
+        0.0
+    }
+    fn ka_player_is_using_item(&self) -> bool {
+        false
+    }
+    fn ka_player_is_blocking_serverside(&self) -> bool {
+        false
+    }
+    fn ka_player_on_ground(&self) -> bool {
+        true
+    }
+    /// `player.isFallFlying`.
+    fn ka_player_is_fall_flying(&self) -> bool {
+        false
+    }
+
+    // inventory screens
+    fn ka_is_inventory_open(&self) -> bool {
+        false
+    }
+    /// `mc.gui.screen() is ContainerScreen`.
+    fn ka_is_in_container_screen(&self) -> bool {
+        false
+    }
+
+    // KillAuraRequirements
+    /// `mc.options.keyAttack.isPressedOnAny || wasPressedRecently(250)`.
+    fn ka_requirement_click(&self) -> bool {
+        false
+    }
+    /// `wasMouseMovedRecently(100)`.
+    fn ka_requirement_mouse_movement(&self) -> bool {
+        false
+    }
+    /// `mc.gameMode?.isDestroying == false`.
+    fn ka_requirement_not_breaking(&self) -> bool {
+        true
+    }
+
+    // target tracker / world
+    /// `targetTracker.targets()`: validated candidates with their squared
+    /// distance to the player.
+    fn ka_selector_targets(&self) -> Vec<KaCandidate> {
+        Vec::new()
+    }
+    /// `crosshairTarget.shouldBeAttacked()`.
+    fn ka_should_be_attacked(&self, entity: u64) -> bool {
+        false
+    }
+
+    // rotations
+    /// `RotationManager.currentRotation`.
+    fn ka_current_rotation(&self) -> Option<(f32, f32)> {
+        None
+    }
+    /// `pointTracker.findPoint(eyes, entity)` + `raytraceBox` with the
+    /// `LeastDifferencePreference`, plus the `aimThroughWalls` retry when
+    /// `aim_through_walls` is set (wallsRange = range there).
+    fn ka_find_rotation_point(&self, entity: u64, range: f64, walls: f64, aim_through_walls: bool) -> Option<(f32, f32, Vec3)> {
+        None
+    }
+    /// `isLookingAtEntity(from = player, to = entity, rotation, range, throughWallsRange)`.
+    fn ka_is_looking_at_entity(&self, entity: u64, rotation: (f32, f32), range: f64, walls: f64) -> Option<Vec3> {
+        None
+    }
+    /// `findEntityInCrosshair(range, rotation, predicate)` flattened to its
+    /// RaycastMode predicate flags.
+    fn ka_find_entity_in_crosshair(&self, range: f64, rotation: (f32, f32), trace_enemy: bool, trace_all: bool) -> Option<u64> {
+        None
+    }
+    /// `rotations.calculateTicks(rotation)`.
+    fn ka_calculate_ticks(&self, rotation: (f32, f32)) -> i64 {
+        0
+    }
+    /// `RotationManager.setRotationTarget(..., IMPORTANT_FOR_USAGE_2, this)`;
+    /// `entity: None` is the FightBot movement rotation.
+    fn ka_set_rotation_target(&mut self, rotation: (f32, f32), entity: Option<u64>, consider_inventory: bool);
+
+    // clicker
+    /// `KillAuraClicker` (Clicker with keyAttack).
+    fn ka_is_click_tick(&self) -> bool {
+        false
+    }
+    fn ka_will_click_at(&self, tick: i64) -> bool {
+        false
+    }
+    fn ka_ticks_since_last_click(&self) -> i64 {
+        0
+    }
+    /// `KillAuraClicker.canExecuteClickNow()`: the click-scheduler gate.
+    fn ka_can_execute_click_now(&self) -> bool {
+        false
+    }
+
+    // AutoBlock (KillAuraAutoBlock)
+    fn ka_autoblock_enabled(&self) -> bool {
+        false
+    }
+    fn ka_autoblock_on_scan_range(&self) -> bool {
+        true
+    }
+    fn ka_autoblock_reblock_ticks(&self) -> i64 {
+        0
+    }
+    fn ka_autoblock_pause_on_unblock_ticks(&self) -> i64 {
+        0
+    }
+    fn ka_autoblock_should_unblock_to_hit(&self) -> bool {
+        false
+    }
+    fn ka_autoblock_is_prioritizing_blocking(&self) -> bool {
+        false
+    }
+    fn ka_autoblock_enforced_blocking_hand(&self) -> bool {
+        false
+    }
+    fn ka_autoblock_make_seem_block(&mut self);
+    fn ka_autoblock_start_blocking(&mut self);
+    /// `KillAuraAutoBlock.stopBlocking(pauses)`; returns whether it unblocked.
+    fn ka_autoblock_stop_blocking(&mut self, pauses: bool) -> bool {
+        false
+    }
+    fn ka_autoblock_set_has_blocked_since_attack(&mut self, blocked: bool);
+
+    // FailSwing / FightBot / ElytraTarget / AutoWeapon / MultiActions
+    fn ka_fail_swing_enabled(&self) -> bool {
+        false
+    }
+    /// `ModuleKillAura.dealWithFakeSwing(target)` (KillAuraFailSwing).
+    fn ka_deal_with_fake_swing(&mut self, target: Option<u64>);
+    fn ka_fightbot_enabled(&self) -> bool {
+        false
+    }
+    fn ka_fightbot_update_target(&mut self);
+    fn ka_fightbot_movement_rotation(&self) -> (f32, f32) {
+        (0.0, 0.0)
+    }
+    fn ka_elytra_running(&self) -> bool {
+        false
+    }
+    fn ka_elytra_can_ignore_rotations(&self) -> bool {
+        false
+    }
+    fn ka_auto_weapon_on_target(&mut self, target: Option<u64>);
+    /// `ModuleMultiActions.mayAttackWhileUsing()`.
+    fn ka_may_attack_while_using(&self) -> bool {
+        false
+    }
+
+    // criticals selection mode
+    /// `ModuleCriticals.shouldWaitForCrit(ignoreState = true)`.
+    fn ka_criticals_should_wait_for_crit(&self) -> bool {
+        false
+    }
+    /// `ModuleCriticals.wouldDoCriticalHit()` for the ALWAYS selection.
+    fn ka_criticals_would_do_critical_hit(&self) -> bool {
+        false
+    }
+
+    // combat manager
+    /// `CombatManager.shouldPauseCombat`.
+    fn ka_should_pause_combat(&self) -> bool {
+        false
+    }
+
+    // range (KillAuraRange)
+    /// `KillAuraRange.isInRange(pos)`.
+    fn ka_range_is_in_range(&self, pos: Vec3) -> bool {
+        false
+    }
+    /// `KillAuraRange.ScanRangeIncrease` random sample (range.update()).
+    fn ka_scan_range_random(&self, from: f64, to: f64) -> f64 {
+        from
+    }
+
+    // network
+    fn ka_send_close_inventory(&mut self);
+    /// `network.send(PosRot(x, y, z, yaw, pitch, onGround, horizontalCollision))`.
+    fn ka_send_pos_rot(&mut self, yaw: f32, pitch: f32, fixed_yaw: Option<f32>);
+    fn ka_send_open_inventory_1_11_1(&mut self);
+
+    // attack
+    fn ka_attack_entity(&mut self, target: u64, keep_sprint: bool);
+
+    // render (WorldRenderEvent: failed hits + range indicator)
+    fn ka_render_world(&mut self, partial_ticks: f32);
+}
+
+/// Upstream `ModuleKillAura.moduleRange` (`KillAuraRange`):
+/// interactionRange = ENTITY_INTERACTION_RANGE + maxRangeIncrease (default 1.0).
+fn ka_interaction_range(module: &Module, hooks: &dyn KaHooks) -> f64 {
+    hooks.ka_entity_interaction_range() + crit_float(module, "RangeIncrease", 1.0)
+}
+
+/// Upstream `KillAuraRange.interactionThroughWallsRange` (default 3.0).
+fn ka_through_walls_range(module: &Module) -> f64 {
+    crit_float(module, "ThroughWallsRange", 3.0)
+}
+
+/// Upstream `KillAuraRange.scanRange`:
+/// `maxOf(interactionRange, interactionThroughWallsRange) + currentScanRangeAddition`.
+fn ka_scan_range(module: &Module, hooks: &dyn KaHooks, state: &KaState) -> f64 {
+    ka_interaction_range(module, hooks).max(ka_through_walls_range(module)) + state.scan_range_addition
+}
+
+/// Upstream `KillAuraRange.update()`: reroll `currentScanRangeAddition` from
+/// the `ScanRangeIncrease` float range (default 2.0..3.0).
+fn ka_range_update(module: &Module, hooks: &mut dyn KaHooks, state: &mut KaState) {
+    let (from, to) = setting_int_range(module, "ScanRangeIncrease", (2, 3));
+    state.scan_range_addition = hooks.ka_scan_range_random(from as f64, to as f64);
+}
+
+/// Upstream `ModuleKillAura.requirementsMet`.
+fn ka_requirements_met(module: &Module, hooks: &dyn KaHooks) -> bool {
+    let requires = match module.setting("Requires").map(|v| &v.kind) {
+        Some(ValueKind::MultiChoice(selected, _)) => selected.clone(),
+        _ => Vec::new(),
+    };
+    requires
+        .iter()
+        .all(|tag| match tag.as_str() {
+            "Click" => hooks.ka_requirement_click(),
+            "MouseMovement" => hooks.ka_requirement_mouse_movement(),
+            "Weapon" => hooks.ka_main_hand_is_weapon(),
+            "EmptyHand" => hooks.ka_main_hand_is_empty(),
+            "VanillaName" => hooks.ka_main_hand_name_is_vanilla(),
+            "NotBreaking" => hooks.ka_requirement_not_breaking(),
+            _ => false,
+        })
+}
+
+/// Upstream `Rotation.normalize()` flattened (yaw/pitch into their ranges).
+fn ka_normalize(rotation: (f32, f32)) -> (f32, f32) {
+    let (mut yaw, mut pitch) = rotation;
+    yaw = yaw.rem_euclid(360.0);
+    if yaw > 180.0 {
+        yaw -= 360.0;
+    }
+    pitch = pitch.clamp(-90.0, 90.0);
+    (yaw, pitch)
+}
+
+/// Upstream `ModuleKillAura` — attacks the best enemy around the player.
+/// KillAuraClicker / KillAuraRange / KillAuraTargetTracker / KillAuraRotationsValueGroup
+/// / PointTracker / AutoBlock / FailSwing / FightBot trees are flattened into
+/// the module tree; their live behavior sits on the hooks.
+pub fn kill_aura() -> Module {
+    Module::new(
+        "KillAura",
+        COMBAT,
+        vec![
+            // KillAuraRange (RangeValueGroup("Range", 1f, 3f) + ScanRangeIncrease)
+            float("RangeIncrease", 1.0, 0.0, 5.0),
+            float("ThroughWallsRange", 3.0, 0.0, 8.0),
+            float_range("ScanRangeIncrease", 2.0, 3.0, 0.0, 7.0),
+            // Requires (multiEnumChoice, none by default)
+            multi_choice("Requires", &[], &["Click", "MouseMovement", "Weapon", "EmptyHand", "VanillaName", "NotBreaking"]),
+            // Bypass techniques
+            choice("Raycast", "All", &["None", "Enemy", "All"]),
+            choice("Criticals", "Smart", &["Smart", "Ignore", "Always"]),
+            boolean("KeepSprint", true),
+            // Inventory handling
+            boolean("IgnoreOpenInventory", true),
+            boolean("SimulateInventoryClosing", true),
+            // KillAuraRotationsValueGroup
+            choice("RotationTiming", "Normal", &["Normal", "Snap", "OnTick"]),
+            boolean("ThroughWalls", false),
+            boolean("LazyRotation", false),
+            // KillAuraTargetTracker (TargetTracker default HEALTH)
+            multi_choice("Priority", &["Type", "Health"], &["Type", "Distance", "Health", "Direction", "Fov"]),
+            float("FOV", 180.0, 0.0, 180.0),
+            int("HurtTime", 10, 0, 10),
+            boolean("IgnoreShield", true),
+            // KillAuraClicker (Clicker with keyAttack, maxCps 30)
+            choice("Technique", "Human", &["Human", "Constant"]),
+            int_range("CPS", 11, 14, 1, 30),
+            int("MaxPerTick", 2, 1, 5),
+            boolean("MissCooldown", true),
+            // KillAuraAutoBlock (ToggleableValueGroup default false)
+            boolean("AutoBlocking", false),
+            boolean("OnScanRange", true),
+            boolean("PrioritizeBlocking", true),
+            int_range("Reblock", 0, 0, 0, 3),
+            int_range("PauseOnUnblock", 0, 0, 0, 3),
+            int("Blink", 0, 0, 10),
+            boolean("FailSwing", false),
+            boolean("FightBot", false),
+        ],
+    )
+}
+
+/// The value of a `choice(...)` setting as a string (its selection or default).
+fn ka_choice(module: &Module, name: &str, default: &str) -> String {
+    match module.setting(name).map(|v| &v.kind) {
+        Some(ValueKind::Choice(sel, _)) if !sel.is_empty() => sel.clone(),
+        _ => default.to_string(),
+    }
+}
+
+/// Upstream `ModuleKillAura.shouldBlockSprinting` +
+/// `ModuleCriticals.CriticalsSelectionMode.shouldStopSprinting(clicker, target)`.
+fn ka_should_block_sprinting(module: &Module, hooks: &dyn KaHooks, state: &KaState) -> bool {
+    if hooks.ka_elytra_running() {
+        return false;
+    }
+    match CriticalsSelectionMode::from_tag(&ka_choice(module, "Criticals", "Smart")) {
+        CriticalsSelectionMode::Ignore => false,
+        _ => {
+            if hooks.ka_player_on_ground() {
+                false
+            } else {
+                state.target.is_some() && hooks.ka_will_click_at(1)
+            }
+        }
+    }
+}
+
+/// Upstream `ModuleKillAura.onDisabled()`.
+pub fn ka_on_disabled(hooks: &mut dyn KaHooks, state: &mut KaState) {
+    state.target = None;
+    state.closest_squared_enemy_distance = 0.0;
+    state.failed_hits.clear();
+    state.failed_hits_increment = 0;
+}
+
+/// Upstream `ModuleKillAura.renderHandler` (`handler<WorldRenderEvent>`).
+pub fn ka_render_handler(hooks: &mut dyn KaHooks, state: &mut KaState) {
+    hooks.ka_render_world(0.0);
+}
+
+/// Upstream `ModuleKillAura.rotationUpdateHandler` (`handler<RotationUpdateEvent>`).
+pub fn ka_rotation_update_handler(module: &Module, hooks: &mut dyn KaHooks, state: &mut KaState) {
+    if state.wait_ticks > 0 {
+        state.wait_ticks -= 1;
+    }
+
+    // Make sure killaura-logic is not running while inventory is open
+    let is_in_inventory_screen = hooks.ka_is_inventory_open() || hooks.ka_is_in_container_screen();
+    let should_reset_target = hooks.ka_is_spectator() || hooks.ka_is_dead_or_dying() || !ka_requirements_met(module, hooks);
+
+    if (is_in_inventory_screen && !setting_bool(module, "IgnoreOpenInventory", true)) || should_reset_target {
+        // Reset current target
+        state.target = None;
+        state.closest_squared_enemy_distance = 0.0;
+        return;
+    }
+
+    // Update the current target tracker to make sure you attack the best enemy
+    ka_update_target(module, hooks, state);
+
+    // Update Auto Weapon
+    hooks.ka_auto_weapon_on_target(state.target);
+}
+
+/// Upstream `ModuleKillAura.gameHandler` (`tickHandler`).
+pub fn ka_tick_handler(module: &Module, hooks: &mut dyn KaHooks, state: &mut KaState) {
+    if hooks.ka_is_dead_or_dying() || hooks.ka_is_spectator() {
+        return;
+    }
+
+    // Check if there is target to attack
+    let target = state.target;
+
+    if hooks.ka_should_pause_combat() {
+        hooks.ka_autoblock_stop_blocking(false);
+        return;
+    }
+
+    let Some(target) = target else {
+        let has_unblocked = hooks.ka_autoblock_stop_blocking(false);
+
+        // Deal with fake swing when there is no target
+        if hooks.ka_fail_swing_enabled() && ka_requirements_met(module, hooks) {
+            if has_unblocked && hooks.ka_autoblock_pause_on_unblock_ticks() > 0 {
+                state.wait_ticks = hooks.ka_autoblock_pause_on_unblock_ticks();
+            } else {
+                hooks.ka_deal_with_fake_swing(None);
+            }
+        }
+        return;
+    };
+
+    // Check if the module should (not) continue after the blocking state is updated
+    if !ka_requirements_met(module, hooks) {
+        return;
+    }
+
+    let ir = ka_interaction_range(module, hooks);
+    let twr = ka_through_walls_range(module);
+    let found = if ka_rotation_timing(module) == KaRotationTiming::OnTick {
+        ka_find_rotation(module, hooks, state, target, ir, twr).map(|(rotation, _)| rotation)
+    } else {
+        None
+    };
+    let rotation = ka_normalize(
+        found
+            .or_else(|| hooks.ka_current_rotation())
+            .unwrap_or_else(|| hooks.ka_player_rotation()),
+    );
+
+    let crosshair_target = match ka_raycast(module) {
+        KaRaycast::TraceAll => hooks
+            .ka_find_entity_in_crosshair(ir, rotation, false, true)
+            .unwrap_or(target),
+        KaRaycast::TraceOnlyEnemy => hooks
+            .ka_find_entity_in_crosshair(ir, rotation, true, false)
+            .filter(|entity| hooks.ka_should_be_attacked(*entity))
+            .unwrap_or(target),
+        KaRaycast::TraceNone => target,
+    };
+
+    if crosshair_target != target && hooks.ka_should_be_attacked(crosshair_target) {
+        state.target = Some(crosshair_target);
+    }
+
+    ka_attack_target(module, hooks, state, crosshair_target, rotation);
+}
+
+/// Upstream `ModuleKillAura.attackTarget(target, rotation)`.
+fn ka_attack_target(module: &Module, hooks: &mut dyn KaHooks, state: &mut KaState, target: u64, rotation: (f32, f32)) {
+    // Make it seem like we are blocking
+    hooks.ka_autoblock_make_seem_block();
+
+    let ir = ka_interaction_range(module, hooks);
+    let twr = ka_through_walls_range(module);
+    let attack_hit_result = hooks.ka_is_looking_at_entity(target, rotation, ir, twr);
+
+    let is_in_range = hooks.ka_elytra_can_ignore_rotations()
+        || attack_hit_result
+            .is_some_and(|location| hooks.ka_range_is_in_range(location));
+
+    // Check if our target is in range, otherwise deal with auto block
+    if !is_in_range {
+        if hooks.ka_autoblock_enabled()
+            && hooks.ka_autoblock_on_scan_range()
+            && hooks.ka_player_squared_boxed_distance_to(target) <= ka_scan_range(module, hooks, state).powi(2)
+        {
+            if hooks.ka_ticks_since_last_click() >= hooks.ka_autoblock_reblock_ticks() {
+                hooks.ka_autoblock_start_blocking();
+            }
+            return;
+        }
+
+        // Make sure we are not blocking
+        let has_unblocked = hooks.ka_autoblock_stop_blocking(false);
+        if has_unblocked && hooks.ka_autoblock_pause_on_unblock_ticks() > 0 {
+            state.wait_ticks = hooks.ka_autoblock_pause_on_unblock_ticks();
+        } else if hooks.ka_fail_swing_enabled() {
+            hooks.ka_deal_with_fake_swing(Some(target));
+        }
+        return;
+    }
+
+    // Attack enemy, according to the attack scheduler
+    if hooks.ka_is_click_tick() && ka_can_attack_now(module, hooks, Some(target)) && !hooks.ka_autoblock_is_prioritizing_blocking() {
+        let keep_sprint = setting_bool(module, "KeepSprint", true);
+        let should_block = ka_should_block_sprinting(module, hooks, state);
+        let prep = ka_prepare_for_attack(module, hooks, state, Some(rotation));
+        match prep {
+            KaPrepare::Proceed { was_sim_inv } => {
+                // On each click, we check if we are still ready to attack
+                if ka_can_attack_now(module, hooks, Some(target)) {
+                    // Attack enemy
+                    hooks.ka_attack_entity(target, keep_sprint && !should_block);
+                    ka_range_update(module, hooks, state);
+                    state.failed_hits_increment = 0;
+                    hooks.ka_autoblock_set_has_blocked_since_attack(false);
+                }
+                ka_finish_attack(module, hooks, Some(rotation), was_sim_inv);
+            }
+            _ => {}
+        }
+    } else if hooks.ka_ticks_since_last_click() >= hooks.ka_autoblock_reblock_ticks() {
+        hooks.ka_autoblock_start_blocking();
+    }
+}
+
+/// Upstream `ModuleKillAura.updateTarget()`.
+fn ka_update_target(module: &Module, hooks: &mut dyn KaHooks, state: &mut KaState) {
+    // Calculate maximum range based on enemy distance
+    let ir = ka_interaction_range(module, hooks);
+    let twr = ka_through_walls_range(module);
+    let maximum_range = if state.closest_squared_enemy_distance > ir.powi(2) {
+        ka_scan_range(module, hooks, state)
+    } else {
+        ir
+    };
+    let squared_max_range = maximum_range.powi(2);
+    let squared_normal_range = ir.powi(2);
+
+    // Find a suitable target
+    let mut candidates: Vec<KaCandidate> = hooks
+        .ka_selector_targets()
+        .into_iter()
+        .filter(|candidate| candidate.squared_dist <= squared_max_range)
+        .collect();
+    // sortedBy (stable): outside the normal range last
+    candidates.sort_by_key(|candidate| if candidate.squared_dist <= squared_normal_range { 0 } else { 1 });
+
+    let target = candidates
+        .into_iter()
+        .find(|candidate| ka_process_target(module, hooks, state, candidate.entity, maximum_range, twr));
+
+    match target {
+        Some(target) => state.target = Some(target.entity),
+        None if hooks.ka_fightbot_enabled() => {
+            hooks.ka_fightbot_update_target();
+            let rotation = hooks.ka_fightbot_movement_rotation();
+            hooks.ka_set_rotation_target(
+                rotation,
+                None,
+                !setting_bool(module, "IgnoreOpenInventory", true),
+            );
+        }
+        None => {
+            state.target = None;
+            state.closest_squared_enemy_distance = 0.0;
+        }
+    }
+}
+
+/// Upstream `ModuleKillAura.processTarget(entity, range, wallsRange)`.
+fn ka_process_target(module: &Module, hooks: &mut dyn KaHooks, state: &mut KaState, entity: u64, range: f64, walls_range: f64) -> bool {
+    let Some((rotation, _)) = ka_find_rotation(module, hooks, state, entity, range, walls_range) else {
+        return false;
+    };
+    let ticks = hooks.ka_calculate_ticks(rotation);
+
+    match ka_rotation_timing(module) {
+        // If our click scheduler is not going to click the moment we reach the target,
+        // we should not start aiming towards the target just yet.
+        KaRotationTiming::Snap => {
+            if !hooks.ka_will_click_at(ticks.max(1)) {
+                return true;
+            }
+        }
+        // [ON_TICK] will always instantly aim onto the target on attack, however, if
+        // our rotation is unable to be ready in time, we can at least start aiming
+        // towards the target.
+        KaRotationTiming::OnTick => {
+            if ticks <= 1 {
+                return true;
+            }
+        }
+        // Continue with regular aiming
+        KaRotationTiming::Normal => {}
+    }
+
+    hooks.ka_set_rotation_target(rotation, Some(entity), !setting_bool(module, "IgnoreOpenInventory", true));
+    true
+}
+
+/// Upstream `ModuleKillAura.findRotation(entity, range, wallsRange)`.
+fn ka_find_rotation(module: &Module, hooks: &dyn KaHooks, state: &mut KaState, entity: u64, range: f64, walls_range: f64) -> Option<((f32, f32), Vec3)> {
+    if setting_bool(module, "LazyRotation", false) {
+        let current_rotation = hooks.ka_current_rotation().unwrap_or_else(|| hooks.ka_player_rotation());
+        if let Some(location) = hooks.ka_is_looking_at_entity(entity, current_rotation, range, walls_range) {
+            return Some((current_rotation, location));
+        }
+    }
+
+    let aim_through_walls = setting_bool(module, "ThroughWalls", false);
+    hooks
+        .ka_find_rotation_point(entity, range, walls_range, aim_through_walls)
+        .map(|(yaw, pitch, location)| ((yaw, pitch), location))
+}
+
+/// Upstream `ModuleKillAura.canAttackNow(target, itemStack)`.
+fn ka_can_attack_now(module: &Module, hooks: &dyn KaHooks, target: Option<u64>) -> bool {
+    if !hooks.ka_main_hand_item_enabled() {
+        return false;
+    }
+
+    if hooks.ka_main_hand_cannot_attack() {
+        return false;
+    }
+
+    let critical_hit_allowed = target.is_none()
+        || hooks.ka_player_is_fall_flying()
+        || match CriticalsSelectionMode::from_tag(&ka_choice(module, "Criticals", "Smart")) {
+            CriticalsSelectionMode::Ignore => true,
+            CriticalsSelectionMode::Smart => !hooks.ka_criticals_should_wait_for_crit(),
+            CriticalsSelectionMode::Always => hooks.ka_criticals_would_do_critical_hit(),
+        };
+    if !critical_hit_allowed {
+        return false;
+    }
+
+    let is_inventory_blocking_attack = (hooks.ka_is_inventory_open() || hooks.ka_is_in_container_screen())
+        && !setting_bool(module, "IgnoreOpenInventory", true)
+        && !setting_bool(module, "SimulateInventoryClosing", true);
+    !is_inventory_blocking_attack
+}
+
+/// Upstream `KillAuraClicker.prepareForAttack(rotation, attack)` flattened to
+/// its prepare/finish halves; the click body runs between them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum KaPrepare {
+    /// `canExecuteClickNow()` said no click, so nothing is prepared.
+    NotClicking,
+    /// Blocked from attacking (using item / blocking without unblock).
+    Abort,
+    /// Stopped blocking and the pause set `waitTicks`.
+    Wait,
+    Proceed {
+        was_sim_inv: bool,
+    },
+}
+
+fn ka_prepare_for_attack(module: &Module, hooks: &mut dyn KaHooks, state: &mut KaState, rotation: Option<(f32, f32)>) -> KaPrepare {
+    if !hooks.ka_can_execute_click_now() {
+        // If we are not going to click, we don't need to prepare the environment
+        return KaPrepare::NotClicking;
+    }
+
+    // 1. Stop blocking
+    if hooks.ka_player_is_blocking_serverside() || hooks.ka_autoblock_enforced_blocking_hand() {
+        if !hooks.ka_autoblock_enabled() && !hooks.ka_may_attack_while_using() {
+            return KaPrepare::Abort;
+        }
+
+        if hooks.ka_autoblock_enabled() && hooks.ka_autoblock_should_unblock_to_hit() {
+            if hooks.ka_autoblock_stop_blocking(true) && hooks.ka_autoblock_pause_on_unblock_ticks() > 0 {
+                state.wait_ticks = hooks.ka_autoblock_pause_on_unblock_ticks();
+                return KaPrepare::Wait;
+            }
+        }
+    } else if hooks.ka_player_is_using_item() && !hooks.ka_may_attack_while_using() {
+        // Since we are not allowed to attack while the player is using another item,
+        // we will return here.
+        return KaPrepare::Abort;
+    }
+
+    let was_simulated_inventory_close =
+        setting_bool(module, "SimulateInventoryClosing", true) && hooks.ka_is_inventory_open();
+
+    // 2. Close Inventory
+    if was_simulated_inventory_close {
+        hooks.ka_send_close_inventory();
+    }
+
+    // 3. Rotate to target (if we have on-tick enabled)
+    if ka_rotation_timing(module) == KaRotationTiming::OnTick {
+        if let Some((yaw, pitch)) = rotation {
+            hooks.ka_send_pos_rot(yaw, pitch, None);
+        }
+    }
+
+    KaPrepare::Proceed { was_sim_inv: was_simulated_inventory_close }
+}
+
+/// Upstream `KillAuraClicker.prepareForAttack`'s tail: rotate back, block
+/// again, reopen the inventory.
+fn ka_finish_attack(module: &Module, hooks: &mut dyn KaHooks, rotation: Option<(f32, f32)>, was_sim_inv: bool) {
+    // 1. Rotate back
+    if ka_rotation_timing(module) == KaRotationTiming::OnTick {
+        if let Some((yaw, pitch)) = rotation {
+            hooks.ka_send_pos_rot(yaw, pitch, Some(yaw));
+        }
+    }
+
+    // 2. Start blocking again
+    if hooks.ka_autoblock_reblock_ticks() == 0 {
+        hooks.ka_autoblock_start_blocking();
+    }
+
+    // 3. Open inventory again
+    if was_sim_inv {
+        hooks.ka_send_open_inventory_1_11_1();
+    }
+}
+
+/// Upstream `ModuleKillAura.sprintHandler` (`handler<SprintEvent>`): returns
+/// whether the event keeps sprinting (`event.sprint = !blocked`).
+fn ka_sprint_event(module: &Module, hooks: &dyn KaHooks, state: &KaState, source_movement_tick_or_input: bool) -> bool {
+    !(ka_should_block_sprinting(module, hooks, state) && source_movement_tick_or_input)
+}
+
+#[cfg(test)]
+mod kill_aura_tests {
+    use super::*;
+
+    struct KaMock {
+        dead: bool,
+        spectator: bool,
+        player_rotation: (f32, f32),
+        eye: Vec3,
+        interaction_range: f64,
+        cannot_attack: bool,
+        item_enabled: bool,
+        is_weapon: bool,
+        is_empty: bool,
+        vanilla_name: bool,
+        squared_dist: f64,
+        using_item: bool,
+        blocking_serverside: bool,
+        on_ground: bool,
+        fall_flying: bool,
+        inventory_open: bool,
+        container_screen: bool,
+        req_click: bool,
+        req_mouse: bool,
+        req_not_breaking: bool,
+        targets: Vec<KaCandidate>,
+        should_attack: bool,
+        current_rotation: Option<(f32, f32)>,
+        find_rotation_point: Option<(f32, f32, Vec3)>,
+        looking_at: Option<Vec3>,
+        crosshair: Option<u64>,
+        calculate_ticks: i64,
+        rotation_targets: Vec<((f32, f32), Option<u64>, bool)>,
+        is_click_tick: bool,
+        will_click: bool,
+        ticks_since_last_click: i64,
+        can_execute_click: bool,
+        autoblock_enabled: bool,
+        autoblock_on_scan_range: bool,
+        autoblock_reblock_ticks: i64,
+        autoblock_pause_on_unblock_ticks: i64,
+        autoblock_should_unblock: bool,
+        autoblock_is_prioritizing: bool,
+        autoblock_enforced_hand: bool,
+        autoblock_has_blocked: bool,
+        autoblock_starts: u32,
+        autoblock_unblocks: u32,
+        seem_blocks: u32,
+        fail_swing: bool,
+        fake_swings: Vec<Option<u64>>,
+        fightbot_enabled: bool,
+        fightbot_updates: u32,
+        fightbot_rotation: (f32, f32),
+        elytra_running: bool,
+        elytra_can_ignore: bool,
+        auto_weapon_calls: Vec<Option<u64>>,
+        may_attack_while_using: bool,
+        crits_should_wait: bool,
+        crits_would_crit: bool,
+        should_pause_combat: bool,
+        range_is_in_range: bool,
+        scan_random: f64,
+        close_inventory: u32,
+        pos_rots: Vec<(f32, f32, bool)>,
+        open_inventory: u32,
+        attacks: Vec<(u64, bool)>,
+        renders: u32,
+    }
+
+    impl Default for KaMock {
+        fn default() -> Self {
+            KaMock {
+                dead: false,
+                spectator: false,
+                player_rotation: (0.0, 0.0),
+                eye: Vec3 { x: 0.0, y: 1.62, z: 0.0 },
+                interaction_range: 3.0,
+                cannot_attack: false,
+                item_enabled: true,
+                is_weapon: false,
+                is_empty: false,
+                vanilla_name: true,
+                squared_dist: 0.0,
+                using_item: false,
+                blocking_serverside: false,
+                on_ground: true,
+                fall_flying: false,
+                inventory_open: false,
+                container_screen: false,
+                req_click: false,
+                req_mouse: false,
+                req_not_breaking: true,
+                targets: Vec::new(),
+                should_attack: true,
+                current_rotation: None,
+                find_rotation_point: None,
+                looking_at: None,
+                crosshair: None,
+                calculate_ticks: 0,
+                rotation_targets: Vec::new(),
+                is_click_tick: false,
+                will_click: false,
+                ticks_since_last_click: 0,
+                can_execute_click: false,
+                autoblock_enabled: false,
+                autoblock_on_scan_range: true,
+                autoblock_reblock_ticks: 0,
+                autoblock_pause_on_unblock_ticks: 0,
+                autoblock_should_unblock: false,
+                autoblock_is_prioritizing: false,
+                autoblock_enforced_hand: false,
+                autoblock_has_blocked: false,
+                autoblock_starts: 0,
+                autoblock_unblocks: 0,
+                seem_blocks: 0,
+                fail_swing: false,
+                fake_swings: Vec::new(),
+                fightbot_enabled: false,
+                fightbot_updates: 0,
+                fightbot_rotation: (10.0, 20.0),
+                elytra_running: false,
+                elytra_can_ignore: false,
+                auto_weapon_calls: Vec::new(),
+                may_attack_while_using: false,
+                crits_should_wait: false,
+                crits_would_crit: false,
+                should_pause_combat: false,
+                range_is_in_range: false,
+                scan_random: 2.5,
+                close_inventory: 0,
+                pos_rots: Vec::new(),
+                open_inventory: 0,
+                attacks: Vec::new(),
+                renders: 0,
+            }
+        }
+    }
+
+    impl KaHooks for KaMock {
+        fn ka_is_dead_or_dying(&self) -> bool {
+            self.dead
+        }
+        fn ka_is_spectator(&self) -> bool {
+            self.spectator
+        }
+        fn ka_player_rotation(&self) -> (f32, f32) {
+            self.player_rotation
+        }
+        fn ka_player_eye_position(&self) -> Vec3 {
+            self.eye
+        }
+        fn ka_entity_interaction_range(&self) -> f64 {
+            self.interaction_range
+        }
+        fn ka_main_hand_cannot_attack(&self) -> bool {
+            self.cannot_attack
+        }
+        fn ka_main_hand_item_enabled(&self) -> bool {
+            self.item_enabled
+        }
+        fn ka_main_hand_is_weapon(&self) -> bool {
+            self.is_weapon
+        }
+        fn ka_main_hand_is_empty(&self) -> bool {
+            self.is_empty
+        }
+        fn ka_main_hand_name_is_vanilla(&self) -> bool {
+            self.vanilla_name
+        }
+        fn ka_player_squared_boxed_distance_to(&self, _target: u64) -> f64 {
+            self.squared_dist
+        }
+        fn ka_player_is_using_item(&self) -> bool {
+            self.using_item
+        }
+        fn ka_player_is_blocking_serverside(&self) -> bool {
+            self.blocking_serverside
+        }
+        fn ka_player_on_ground(&self) -> bool {
+            self.on_ground
+        }
+        fn ka_player_is_fall_flying(&self) -> bool {
+            self.fall_flying
+        }
+        fn ka_is_inventory_open(&self) -> bool {
+            self.inventory_open
+        }
+        fn ka_is_in_container_screen(&self) -> bool {
+            self.container_screen
+        }
+        fn ka_requirement_click(&self) -> bool {
+            self.req_click
+        }
+        fn ka_requirement_mouse_movement(&self) -> bool {
+            self.req_mouse
+        }
+        fn ka_requirement_not_breaking(&self) -> bool {
+            self.req_not_breaking
+        }
+        fn ka_selector_targets(&self) -> Vec<KaCandidate> {
+            self.targets.clone()
+        }
+        fn ka_should_be_attacked(&self, _entity: u64) -> bool {
+            self.should_attack
+        }
+        fn ka_current_rotation(&self) -> Option<(f32, f32)> {
+            self.current_rotation
+        }
+        fn ka_find_rotation_point(&self, _entity: u64, _range: f64, _walls: f64, _aim_through_walls: bool) -> Option<(f32, f32, Vec3)> {
+            self.find_rotation_point
+        }
+        fn ka_is_looking_at_entity(&self, _entity: u64, _rotation: (f32, f32), _range: f64, _walls: f64) -> Option<Vec3> {
+            self.looking_at
+        }
+        fn ka_find_entity_in_crosshair(&self, _range: f64, _rotation: (f32, f32), _trace_enemy: bool, _trace_all: bool) -> Option<u64> {
+            self.crosshair
+        }
+        fn ka_calculate_ticks(&self, _rotation: (f32, f32)) -> i64 {
+            self.calculate_ticks
+        }
+        fn ka_set_rotation_target(&mut self, rotation: (f32, f32), entity: Option<u64>, consider_inventory: bool) {
+            self.rotation_targets.push((rotation, entity, consider_inventory));
+        }
+        fn ka_is_click_tick(&self) -> bool {
+            self.is_click_tick
+        }
+        fn ka_will_click_at(&self, _tick: i64) -> bool {
+            self.will_click
+        }
+        fn ka_ticks_since_last_click(&self) -> i64 {
+            self.ticks_since_last_click
+        }
+        fn ka_can_execute_click_now(&self) -> bool {
+            self.can_execute_click
+        }
+        fn ka_autoblock_enabled(&self) -> bool {
+            self.autoblock_enabled
+        }
+        fn ka_autoblock_on_scan_range(&self) -> bool {
+            self.autoblock_on_scan_range
+        }
+        fn ka_autoblock_reblock_ticks(&self) -> i64 {
+            self.autoblock_reblock_ticks
+        }
+        fn ka_autoblock_pause_on_unblock_ticks(&self) -> i64 {
+            self.autoblock_pause_on_unblock_ticks
+        }
+        fn ka_autoblock_should_unblock_to_hit(&self) -> bool {
+            self.autoblock_should_unblock
+        }
+        fn ka_autoblock_is_prioritizing_blocking(&self) -> bool {
+            self.autoblock_is_prioritizing
+        }
+        fn ka_autoblock_enforced_blocking_hand(&self) -> bool {
+            self.autoblock_enforced_hand
+        }
+        fn ka_autoblock_make_seem_block(&mut self) {
+            self.seem_blocks += 1;
+        }
+        fn ka_autoblock_start_blocking(&mut self) {
+            self.autoblock_starts += 1;
+        }
+        fn ka_autoblock_stop_blocking(&mut self, _pauses: bool) -> bool {
+            self.autoblock_unblocks += 1;
+            true
+        }
+        fn ka_autoblock_set_has_blocked_since_attack(&mut self, blocked: bool) {
+            self.autoblock_has_blocked = blocked;
+        }
+        fn ka_fail_swing_enabled(&self) -> bool {
+            self.fail_swing
+        }
+        fn ka_deal_with_fake_swing(&mut self, target: Option<u64>) {
+            self.fake_swings.push(target);
+        }
+        fn ka_fightbot_enabled(&self) -> bool {
+            self.fightbot_enabled
+        }
+        fn ka_fightbot_update_target(&mut self) {
+            self.fightbot_updates += 1;
+        }
+        fn ka_fightbot_movement_rotation(&self) -> (f32, f32) {
+            self.fightbot_rotation
+        }
+        fn ka_elytra_running(&self) -> bool {
+            self.elytra_running
+        }
+        fn ka_elytra_can_ignore_rotations(&self) -> bool {
+            self.elytra_can_ignore
+        }
+        fn ka_auto_weapon_on_target(&mut self, target: Option<u64>) {
+            self.auto_weapon_calls.push(target);
+        }
+        fn ka_may_attack_while_using(&self) -> bool {
+            self.may_attack_while_using
+        }
+        fn ka_criticals_should_wait_for_crit(&self) -> bool {
+            self.crits_should_wait
+        }
+        fn ka_criticals_would_do_critical_hit(&self) -> bool {
+            self.crits_would_crit
+        }
+        fn ka_should_pause_combat(&self) -> bool {
+            self.should_pause_combat
+        }
+        fn ka_range_is_in_range(&self, _pos: Vec3) -> bool {
+            self.range_is_in_range
+        }
+        fn ka_scan_range_random(&self, _from: f64, _to: f64) -> f64 {
+            self.scan_random
+        }
+        fn ka_send_close_inventory(&mut self) {
+            self.close_inventory += 1;
+        }
+        fn ka_send_pos_rot(&mut self, yaw: f32, pitch: f32, fixed_yaw: Option<f32>) {
+            self.pos_rots.push((yaw, pitch, fixed_yaw.is_some()));
+        }
+        fn ka_send_open_inventory_1_11_1(&mut self) {
+            self.open_inventory += 1;
+        }
+        fn ka_attack_entity(&mut self, target: u64, keep_sprint: bool) {
+            self.attacks.push((target, keep_sprint));
+        }
+        fn ka_render_world(&mut self, _partial_ticks: f32) {
+            self.renders += 1;
+        }
+    }
+
+    fn ka_candidate(entity: u64, squared_dist: f64) -> KaCandidate {
+        KaCandidate { entity, squared_dist }
+    }
+
+    #[test]
+    fn rotation_update_targets_and_resets() {
+        let module = kill_aura();
+
+        // Picks the target and hands it to Auto Weapon.
+        let mut hooks = KaMock::default();
+        let mut state = KaState::default();
+        hooks.targets = vec![ka_candidate(7, 4.0)];
+        hooks.find_rotation_point = Some((30.0, -10.0, Vec3 { x: 1.0, y: 1.0, z: 1.0 }));
+        ka_rotation_update_handler(&module, &mut hooks, &mut state);
+        assert_eq!(state.target, Some(7));
+        assert_eq!(hooks.auto_weapon_calls, vec![Some(7)]);
+        assert_eq!(hooks.rotation_targets, vec![((30.0, -10.0), Some(7), false)]);
+
+        // Inventory open + IgnoreOpenInventory false: reset, no Auto Weapon.
+        let mut module = kill_aura();
+        // (kept mutable)
+        for value in &mut module.settings {
+            if value.name == "IgnoreOpenInventory" {
+                value.kind = ValueKind::Bool(false);
+            }
+        }
+        let mut hooks = KaMock::default();
+        let mut state = KaState::default();
+        state.target = Some(7);
+        hooks.inventory_open = true;
+        ka_rotation_update_handler(&module, &mut hooks, &mut state);
+        assert_eq!(state.target, None);
+        assert_eq!(hooks.auto_weapon_calls, vec![]);
+
+        // Spectator: reset.
+        let module = kill_aura();
+        let mut hooks = KaMock::default();
+        let mut state = KaState::default();
+        state.target = Some(7);
+        hooks.spectator = true;
+        ka_rotation_update_handler(&module, &mut hooks, &mut state);
+        assert_eq!(state.target, None);
+
+        // No candidates and no FightBot: reset.
+        let module = kill_aura();
+        let mut hooks = KaMock::default();
+        let mut state = KaState::default();
+        ka_rotation_update_handler(&module, &mut hooks, &mut state);
+        assert_eq!(state.target, None);
+
+        // No candidates with FightBot: movement rotation is targeted.
+        let module = kill_aura();
+        let mut hooks = KaMock::default();
+        let mut state = KaState::default();
+        hooks.fightbot_enabled = true;
+        ka_rotation_update_handler(&module, &mut hooks, &mut state);
+        assert_eq!(hooks.fightbot_updates, 1);
+        assert_eq!(hooks.rotation_targets, vec![((10.0, 20.0), None, false)]);
+        assert_eq!(state.target, None);
+    }
+
+    #[test]
+    fn process_target_respects_rotation_timing() {
+        let module = kill_aura();
+
+        // Normal: always aims once a rotation is found.
+        let mut hooks = KaMock::default();
+        let mut state = KaState::default();
+        hooks.find_rotation_point = Some((1.0, 2.0, Vec3 { x: 0.0, y: 0.0, z: 0.0 }));
+        hooks.calculate_ticks = 5;
+        assert!(ka_process_target(&module, &mut hooks, &mut state, 7, 4.0, 3.0));
+        assert_eq!(hooks.rotation_targets, vec![((1.0, 2.0), Some(7), false)]);
+
+        // No rotation found: not processed.
+        let mut hooks = KaMock::default();
+        let mut state = KaState::default();
+        assert!(!ka_process_target(&module, &mut hooks, &mut state, 7, 4.0, 3.0));
+
+        // Snap with no click planned at that tick: skip aiming.
+        let mut module = kill_aura();
+        for value in &mut module.settings {
+            if value.name == "RotationTiming" {
+                value.kind = ValueKind::Choice("Snap".to_string(), Vec::new());
+            }
+        }
+        let mut hooks = KaMock::default();
+        let mut state = KaState::default();
+        hooks.find_rotation_point = Some((1.0, 2.0, Vec3 { x: 0.0, y: 0.0, z: 0.0 }));
+        hooks.calculate_ticks = 5;
+        hooks.will_click = false;
+        assert!(ka_process_target(&module, &mut hooks, &mut state, 7, 4.0, 3.0));
+        assert!(hooks.rotation_targets.is_empty());
+
+        // Snap with a click planned at tick 5: aims.
+        hooks.will_click = true;
+        assert!(ka_process_target(&module, &mut hooks, &mut state, 7, 4.0, 3.0));
+        assert_eq!(hooks.rotation_targets, vec![((1.0, 2.0), Some(7), false)]);
+
+        // OnTick with ticks <= 1: skip aiming (attack handles it).
+        let mut module = kill_aura();
+        for value in &mut module.settings {
+            if value.name == "RotationTiming" {
+                value.kind = ValueKind::Choice("OnTick".to_string(), Vec::new());
+            }
+        }
+        let mut hooks = KaMock::default();
+        let mut state = KaState::default();
+        hooks.find_rotation_point = Some((1.0, 2.0, Vec3 { x: 0.0, y: 0.0, z: 0.0 }));
+        hooks.calculate_ticks = 1;
+        assert!(ka_process_target(&module, &mut hooks, &mut state, 7, 4.0, 3.0));
+        assert!(hooks.rotation_targets.is_empty());
+    }
+
+    #[test]
+    fn update_target_prefers_normal_range() {
+        let module = kill_aura();
+
+        // Two candidates: one inside the normal range, one only inside the scan range.
+        // The inside one is processed first.
+        let mut hooks = KaMock::default();
+        let mut state = KaState::default();
+        state.closest_squared_enemy_distance = 30.0; // > ir^2 = 16: widen to scan range
+        state.scan_range_addition = 3.0; // scan range = max(4, 3) + 3 = 7, squared 49
+        hooks.targets = vec![ka_candidate(11, 25.0), ka_candidate(12, 5.0)];
+        hooks.find_rotation_point = Some((0.0, 0.0, Vec3 { x: 0.0, y: 0.0, z: 0.0 }));
+        ka_rotation_update_handler(&module, &mut hooks, &mut state);
+        assert_eq!(state.target, Some(12));
+
+        // Only out-of-normal candidates: stable order still processes the first.
+        let mut hooks = KaMock::default();
+        let mut state = KaState::default();
+        state.closest_squared_enemy_distance = 30.0;
+        state.scan_range_addition = 3.0;
+        hooks.targets = vec![ka_candidate(11, 25.0), ka_candidate(12, 35.0)];
+        hooks.find_rotation_point = Some((0.0, 0.0, Vec3 { x: 0.0, y: 0.0, z: 0.0 }));
+        ka_rotation_update_handler(&module, &mut hooks, &mut state);
+        assert_eq!(state.target, Some(11));
+    }
+
+    #[test]
+    fn attack_target_in_range_clicks() {
+        let module = kill_aura();
+
+        // Click tick, in range, item ready: attack with keepSprint.
+        let mut hooks = KaMock::default();
+        let mut state = KaState::default();
+        state.target = Some(7);
+        hooks.is_click_tick = true;
+        hooks.can_execute_click = true;
+        hooks.range_is_in_range = true;
+        hooks.looking_at = Some(Vec3 { x: 1.0, y: 1.0, z: 1.0 });
+        ka_tick_handler(&module, &mut hooks, &mut state);
+        assert_eq!(hooks.attacks, vec![(7, true)]);
+        assert_eq!(hooks.seem_blocks, 1);
+        assert_eq!(state.failed_hits_increment, 0);
+        assert!(!hooks.autoblock_has_blocked);
+        assert_eq!(hooks.pos_rots.len(), 0); // Normal timing: no pos-rot packets
+
+        // Not a click tick: no attack, reblock fallback (reblockTicks 0 >= 0).
+        let mut hooks = KaMock::default();
+        let mut state = KaState::default();
+        state.target = Some(7);
+        hooks.looking_at = Some(Vec3 { x: 1.0, y: 1.0, z: 1.0 });
+        hooks.range_is_in_range = true;
+        ka_tick_handler(&module, &mut hooks, &mut state);
+        assert!(hooks.attacks.is_empty());
+        assert_eq!(hooks.autoblock_starts, 1);
+
+        // Out of range: no attack.
+        let mut hooks = KaMock::default();
+        let mut state = KaState::default();
+        state.target = Some(7);
+        hooks.looking_at = None;
+        ka_tick_handler(&module, &mut hooks, &mut state);
+        assert!(hooks.attacks.is_empty());
+    }
+
+    #[test]
+    fn attack_target_out_of_range_blocks_and_fakes() {
+        let module = kill_aura();
+
+        // AutoBlock on and target within scan range: start blocking.
+        let mut hooks = KaMock::default();
+        let mut state = KaState::default();
+        state.target = Some(7);
+        state.scan_range_addition = 0.0;
+        hooks.autoblock_enabled = true;
+        hooks.squared_dist = 9.0;
+        ka_tick_handler(&module, &mut hooks, &mut state);
+        assert_eq!(hooks.autoblock_starts, 1);
+        assert!(hooks.attacks.is_empty());
+
+        // AutoBlock off: unblock, then FailSwing handles it.
+        let mut module = kill_aura();
+        for value in &mut module.settings {
+            if value.name == "FailSwing" {
+                value.kind = ValueKind::Bool(true);
+            }
+        }
+        let mut hooks = KaMock::default();
+        let mut state = KaState::default();
+        state.target = Some(7);
+        hooks.fail_swing = true;
+        ka_tick_handler(&module, &mut hooks, &mut state);
+        assert_eq!(hooks.autoblock_unblocks, 1);
+        assert_eq!(hooks.fake_swings, vec![Some(7)]);
+
+        // Unblocking with a pause: waitTicks set instead.
+        let mut hooks = KaMock::default();
+        let mut state = KaState::default();
+        state.target = Some(7);
+        hooks.fail_swing = true;
+        hooks.autoblock_pause_on_unblock_ticks = 3;
+        ka_tick_handler(&module, &mut hooks, &mut state);
+        assert_eq!(state.wait_ticks, 3);
+        assert!(hooks.fake_swings.is_empty());
+
+        // No target: unblock and fake swing with None.
+        let mut module = kill_aura();
+        for value in &mut module.settings {
+            if value.name == "FailSwing" {
+                value.kind = ValueKind::Bool(true);
+            }
+        }
+        let mut hooks = KaMock::default();
+        let mut state = KaState::default();
+        hooks.fail_swing = true;
+        ka_tick_handler(&module, &mut hooks, &mut state);
+        assert_eq!(hooks.fake_swings, vec![None]);
+        assert_eq!(hooks.autoblock_unblocks, 1);
+
+        // Combat paused: stop blocking, nothing else.
+        let mut hooks = KaMock::default();
+        let mut state = KaState::default();
+        state.target = Some(7);
+        hooks.should_pause_combat = true;
+        ka_tick_handler(&module, &mut hooks, &mut state);
+        assert_eq!(hooks.autoblock_unblocks, 1);
+        assert!(hooks.fake_swings.is_empty());
+        assert!(hooks.attacks.is_empty());
+    }
+
+    #[test]
+    fn dead_player_and_pause_gate() {
+        let module = kill_aura();
+
+        // Dead: tick handler returns before anything.
+        let mut hooks = KaMock::default();
+        let mut state = KaState::default();
+        state.target = Some(7);
+        hooks.dead = true;
+        ka_tick_handler(&module, &mut hooks, &mut state);
+        assert_eq!(hooks.seem_blocks, 0);
+        assert!(hooks.attacks.is_empty());
+
+        // Spectator: same.
+        let mut hooks = KaMock::default();
+        let mut state = KaState::default();
+        hooks.spectator = true;
+        ka_tick_handler(&module, &mut hooks, &mut state);
+        assert_eq!(hooks.seem_blocks, 0);
+    }
+
+    #[test]
+    fn requirements_gate_the_attack() {
+        let mut module = kill_aura();
+        let mut hooks = KaMock::default();
+        let mut state = KaState::default();
+
+        // Requires [Weapon] with no weapon: rotation update resets, tick does nothing.
+        for value in &mut module.settings {
+            if value.name == "Requires" {
+                value.kind = ValueKind::MultiChoice(vec!["Weapon".to_string()], Vec::new());
+            }
+        }
+        state.target = Some(7);
+        ka_tick_handler(&module, &mut hooks, &mut state);
+        assert!(hooks.attacks.is_empty());
+
+        // With a weapon: attack goes through on a click tick.
+        hooks.is_weapon = true;
+        hooks.is_click_tick = true;
+        hooks.can_execute_click = true;
+        hooks.range_is_in_range = true;
+        hooks.looking_at = Some(Vec3 { x: 1.0, y: 1.0, z: 1.0 });
+        ka_tick_handler(&module, &mut hooks, &mut state);
+        assert_eq!(hooks.attacks, vec![(7, true)]);
+    }
+
+    #[test]
+    fn prepare_attack_steps() {
+        let module = kill_aura();
+        let mut hooks = KaMock::default();
+        let mut state = KaState::default();
+
+        // No click scheduled: NotClicking.
+        assert_eq!(ka_prepare_for_attack(&module, &mut hooks, &mut state, None), KaPrepare::NotClicking);
+
+        // Click scheduled, player using an item and MultiActions not allowed: Abort.
+        hooks.can_execute_click = true;
+        hooks.using_item = true;
+        assert_eq!(ka_prepare_for_attack(&module, &mut hooks, &mut state, None), KaPrepare::Abort);
+
+        // Blocking serverside without AutoBlock: Abort.
+        hooks.using_item = false;
+        hooks.blocking_serverside = true;
+        assert_eq!(ka_prepare_for_attack(&module, &mut hooks, &mut state, None), KaPrepare::Abort);
+
+        // Blocking with AutoBlock + unblock-to-hit and a pause: Wait sets waitTicks.
+        hooks.autoblock_enabled = true;
+        hooks.autoblock_should_unblock = true;
+        hooks.autoblock_pause_on_unblock_ticks = 4;
+        assert_eq!(ka_prepare_for_attack(&module, &mut hooks, &mut state, None), KaPrepare::Wait);
+        assert_eq!(state.wait_ticks, 4);
+
+        // No pause: proceeds and closes the (open) inventory.
+        hooks.autoblock_pause_on_unblock_ticks = 0;
+        hooks.inventory_open = true;
+        match ka_prepare_for_attack(&module, &mut hooks, &mut state, None) {
+            KaPrepare::Proceed { was_sim_inv } => assert!(was_sim_inv),
+            other => panic!("expected Proceed, got {:?}", other),
+        }
+        assert_eq!(hooks.close_inventory, 1);
+
+        // OnTick rotation timing sends the pos-rot packet.
+        let mut module = kill_aura();
+        for value in &mut module.settings {
+            if value.name == "RotationTiming" {
+                value.kind = ValueKind::Choice("OnTick".to_string(), Vec::new());
+            }
+        }
+        let mut hooks = KaMock::default();
+        let mut state = KaState::default();
+        hooks.can_execute_click = true;
+        match ka_prepare_for_attack(&module, &mut hooks, &mut state, Some((45.0, 15.0))) {
+            KaPrepare::Proceed { was_sim_inv } => assert!(!was_sim_inv),
+            other => panic!("expected Proceed, got {:?}", other),
+        }
+        assert_eq!(hooks.pos_rots, vec![(45.0, 15.0, false)]);
+        // Finish sends the fixed-yaw pos-rot.
+        ka_finish_attack(&module, &mut hooks, Some((45.0, 15.0)), false);
+        assert_eq!(hooks.pos_rots, vec![(45.0, 15.0, false), (45.0, 15.0, true)]);
+        // Reblock 0: start blocking again on finish.
+        assert_eq!(hooks.autoblock_starts, 1);
+    }
+
+    #[test]
+    fn can_attack_now_gates() {
+        let module = kill_aura();
+
+        // Item enabled, no cooldown, Smart with no wait, inventory closed: ok.
+        let hooks = KaMock::default();
+        assert!(ka_can_attack_now(&module, &hooks, Some(7)));
+
+        // Item disabled: no.
+        let mut hooks = KaMock::default();
+        hooks.item_enabled = false;
+        assert!(!ka_can_attack_now(&module, &hooks, Some(7)));
+
+        // Cooldown: no.
+        let mut hooks = KaMock::default();
+        hooks.cannot_attack = true;
+        assert!(!ka_can_attack_now(&module, &hooks, Some(7)));
+
+        // Smart waiting for a crit: no.
+        let mut hooks = KaMock::default();
+        hooks.crits_should_wait = true;
+        assert!(!ka_can_attack_now(&module, &hooks, Some(7)));
+
+        // Always crits: would-crit decides.
+        let mut module = kill_aura();
+        for value in &mut module.settings {
+            if value.name == "Criticals" {
+                value.kind = ValueKind::Choice("Always".to_string(), Vec::new());
+            }
+        }
+        let hooks = KaMock::default();
+        assert!(!ka_can_attack_now(&module, &hooks, Some(7)));
+        let mut hooks = KaMock::default();
+        hooks.crits_would_crit = true;
+        assert!(ka_can_attack_now(&module, &hooks, Some(7)));
+
+        // Ignore: crit check passes.
+        let mut module = kill_aura();
+        for value in &mut module.settings {
+            if value.name == "Criticals" {
+                value.kind = ValueKind::Choice("Ignore".to_string(), Vec::new());
+            }
+        }
+        let hooks = KaMock::default();
+        assert!(ka_can_attack_now(&module, &hooks, Some(7)));
+
+        // No target: critical check skipped entirely.
+        let hooks = KaMock::default();
+        assert!(ka_can_attack_now(&module, &hooks, None));
+
+        // Inventory open without ignore or simulated closing: blocked.
+        let mut module = kill_aura();
+        for value in &mut module.settings {
+            if value.name == "IgnoreOpenInventory" {
+                value.kind = ValueKind::Bool(false);
+            }
+            if value.name == "SimulateInventoryClosing" {
+                value.kind = ValueKind::Bool(false);
+            }
+        }
+        let mut hooks = KaMock::default();
+        hooks.inventory_open = true;
+        assert!(!ka_can_attack_now(&module, &hooks, Some(7)));
+    }
+
+    #[test]
+    fn crosshair_target_swap_and_sprint_blocking() {
+        let module = kill_aura();
+
+        // Crosshair finds another enemy: target switches before attacking.
+        let mut hooks = KaMock::default();
+        let mut state = KaState::default();
+        state.target = Some(7);
+        hooks.crosshair = Some(9);
+        hooks.is_click_tick = true;
+        hooks.can_execute_click = true;
+        hooks.range_is_in_range = true;
+        hooks.looking_at = Some(Vec3 { x: 1.0, y: 1.0, z: 1.0 });
+        ka_tick_handler(&module, &mut hooks, &mut state);
+        assert_eq!(hooks.attacks, vec![(9, true)]);
+        assert_eq!(state.target, Some(9));
+
+        // Raycast None: attacks the tracked target.
+        let mut module = kill_aura();
+        for value in &mut module.settings {
+            if value.name == "Raycast" {
+                value.kind = ValueKind::Choice("None".to_string(), Vec::new());
+            }
+        }
+        let mut hooks = KaMock::default();
+        let mut state = KaState::default();
+        state.target = Some(7);
+        hooks.is_click_tick = true;
+        hooks.can_execute_click = true;
+        hooks.range_is_in_range = true;
+        hooks.looking_at = Some(Vec3 { x: 1.0, y: 1.0, z: 1.0 });
+        ka_tick_handler(&module, &mut hooks, &mut state);
+        assert_eq!(hooks.attacks, vec![(7, true)]);
+
+        // Sprint blocking: on ground -> not blocked; in air with a click -> blocked.
+        let mut hooks = KaMock::default();
+        let mut state = KaState::default();
+        state.target = Some(7);
+        hooks.will_click = true;
+        assert!(ka_sprint_event(&module, &hooks, &state, true));
+        hooks.on_ground = false;
+        assert!(!ka_sprint_event(&module, &hooks, &state, true));
+        assert!(ka_sprint_event(&module, &hooks, &state, false));
+        // Ignore mode never blocks sprinting.
+        let mut module = kill_aura();
+        for value in &mut module.settings {
+            if value.name == "Criticals" {
+                value.kind = ValueKind::Choice("Ignore".to_string(), Vec::new());
+            }
+        }
+        hooks.on_ground = false;
+        assert!(ka_sprint_event(&module, &hooks, &state, true));
+    }
+
+    #[test]
+    fn on_disabled_and_render_clear_state() {
+        let module = kill_aura();
+        let mut hooks = KaMock::default();
+        let mut state = KaState::default();
+        state.target = Some(7);
+        state.closest_squared_enemy_distance = 100.0;
+        state.failed_hits.push(KaFailedHit {
+            entity: 7,
+            location: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            time_ms: 0,
+        });
+        state.failed_hits_increment = 3;
+        ka_on_disabled(&mut hooks, &mut state);
+        assert_eq!(state.target, None);
+        assert_eq!(state.closest_squared_enemy_distance, 0.0);
+        assert!(state.failed_hits.is_empty());
+        assert_eq!(state.failed_hits_increment, 0);
+
+        ka_render_handler(&mut hooks, &mut state);
+        assert_eq!(hooks.renders, 1);
+    }
+
+    #[test]
+    fn range_math_follows_upstream() {
+        let module = kill_aura();
+        let hooks = KaMock::default();
+        let mut state = KaState::default();
+
+        // interactionRange = 3.0 (attribute) + 1.0 (RangeIncrease) = 4.0
+        assert!((ka_interaction_range(&module, &hooks) - 4.0).abs() < 1e-9);
+        assert!((ka_through_walls_range(&module) - 3.0).abs() < 1e-9);
+        // scanRange = max(4, 3) + addition
+        state.scan_range_addition = 2.5;
+        assert!((ka_scan_range(&module, &hooks, &state) - 6.5).abs() < 1e-9);
+
+        // range.update() rerolls from the ScanRangeIncrease setting.
+        let mut hooks = KaMock::default();
+        hooks.scan_random = 3.0;
+        ka_range_update(&module, &mut hooks, &mut state);
+        assert_eq!(state.scan_range_addition, 3.0);
+    }
+}

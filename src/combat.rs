@@ -339,6 +339,464 @@ pub fn mace_kill_attack_handler(module: &Module, player: &MaceKillPlayer) -> Opt
     Some(calls)
 }
 
+// ----- Seams: use-item packet + ModuleSwordBlock.kt -----
+
+/// Upstream `InteractionHand`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Hand {
+    MainHand,
+    OffHand,
+}
+
+/// Item identity the module's logic reads (`isSword`, `is ShieldItem`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ItemKind {
+    Sword,
+    Shield,
+    Other,
+}
+
+/// Upstream `ItemUseAnimation`; the module only distinguishes `!= BLOCK`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ItemUseAnimation {
+    None,
+    Eat,
+    Drink,
+    Block,
+    Bow,
+    Spear,
+    Crossbow,
+    Spyglass,
+    TootHorn,
+    Brush,
+}
+
+/// An item stack the module reads.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ItemStack {
+    pub item_kind: ItemKind,
+    pub use_animation: ItemUseAnimation,
+}
+
+impl ItemStack {
+    /// Upstream `isSword`.
+    fn is_sword(&self) -> bool {
+        self.item_kind == ItemKind::Sword
+    }
+
+    /// Upstream `item is ShieldItem`.
+    fn is_shield(&self) -> bool {
+        self.item_kind == ItemKind::Shield
+    }
+}
+
+/// Upstream `ServerboundUseItemPacket` (the fields the module touches).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct ServerboundUseItemPacket {
+    pub hand: Hand,
+    pub sequence: i32,
+    pub y_rot: f32,
+    pub x_rot: f32,
+}
+
+/// Upstream event `PacketEvent`.
+pub struct PacketEvent {
+    pub packet: Packet,
+    pub cancelled: bool,
+}
+
+pub enum Packet {
+    UseItem(ServerboundUseItemPacket),
+    Other,
+}
+
+/// The slice of the upstream `player` (or a rendered entity) this module reads.
+#[derive(Clone, Copy, Debug)]
+pub struct SwordBlockEntity {
+    pub is_player: bool,
+    pub main_hand_item: ItemStack,
+    pub off_hand_item: ItemStack,
+    pub y_rot: f32,
+    pub x_rot: f32,
+    /// `usingItemOrNull` paired with the hand that holds it (`isInHand`).
+    pub using_item: Option<(ItemStack, Hand)>,
+    /// `InputTracker.isPressedOnAny` on `mc.options.keyUse`.
+    pub key_use_pressed: bool,
+}
+
+fn setting_bool(module: &Module, name: &str, default: bool) -> bool {
+    match module.setting(name).map(|v| &v.kind) {
+        Some(ValueKind::Bool(v)) => *v,
+        _ => default,
+    }
+}
+
+/// Upstream: `ModuleSwordBlock` — shows blocking with a shield as 1.8 sword
+/// blocking. A sword that cannot block by itself (1.9 to 1.21.3) uses the
+/// shield as well, which ViaVersion puts into the offhand for 1.8 servers.
+/// Upstream aliases: ["OldBlocking"]. Upstream marks FakeOnPressing,
+/// HideShieldSlot, ApplyToThirdPersonView and AlwaysHideShield
+/// `doNotIncludeAlways` (config-export metadata only).
+pub fn sword_block() -> Module {
+    Module::new(
+        "SwordBlock",
+        COMBAT,
+        vec![
+            boolean("OnlyVisual", false),
+            boolean("FakeOnPressing", false),
+            boolean("HideShieldSlot", false),
+            boolean("ApplyToThirdPersonView", true),
+            boolean("AlwaysHideShield", false),
+        ],
+    )
+}
+
+/// Upstream extension `LivingEntity.shouldApplySwordBlockAnimation`:
+/// `if (this === player && fakeOnPressing && mc.options.keyUse.isPressedOnAny)
+/// true; usingItemOrNull ?: false; (isInHand(OFF_HAND) && shield) ||
+/// (isInHand(MAIN_HAND) && !isBlocksAttacksExisting)`.
+pub fn should_apply_sword_block_animation(
+    module: &Module,
+    entity: &SwordBlockEntity,
+    blocks_attacks_existing: bool,
+) -> bool {
+    if entity.is_player
+        && setting_bool(module, "FakeOnPressing", false)
+        && entity.key_use_pressed
+    {
+        return true;
+    }
+
+    let Some((using_item, hand)) = entity.using_item else {
+        return false;
+    };
+    (hand == Hand::OffHand && using_item.is_shield())
+        || (hand == Hand::MainHand && !blocks_attacks_existing)
+}
+
+/// Upstream `shouldAnimateSwordBlock(entity, mainHandItem = entity.mainHandItem)`:
+/// whether the sword in the main hand of `entity` is drawn blocking — while
+/// AutoBlock shows the block pose, or while SwordBlock draws the shield it
+/// blocks with as the sword. `shows_block_pose` is upstream
+/// `KillAuraAutoBlock.showsBlockPose`.
+pub fn should_animate_sword_block(
+    module: &Module,
+    entity: &SwordBlockEntity,
+    shows_block_pose: bool,
+    blocks_attacks_existing: bool,
+    main_hand_item: ItemStack,
+) -> bool {
+    if !main_hand_item.is_sword() {
+        return false;
+    }
+
+    (shows_block_pose && entity.is_player)
+        || (module.running
+            && should_apply_sword_block_animation(module, entity, blocks_attacks_existing))
+}
+
+/// Upstream `shouldHideOffhand(offHandStack = player.offhandItem,
+/// mainHandStack = player.mainHandItem)`.
+pub fn should_hide_offhand(module: &Module, off_hand_stack: ItemStack, main_hand_stack: ItemStack) -> bool {
+    if !module.running {
+        return false;
+    }
+
+    if !off_hand_stack.is_shield() {
+        return false;
+    }
+
+    main_hand_stack.is_sword() || setting_bool(module, "AlwaysHideShield", false)
+}
+
+/// What the upstream packet-handler does with a use-item packet. The
+/// `sequenceHandler` coroutine side (`waitTicks(1)` +
+/// `interaction.startPrediction`) stays engine-side; the action carries
+/// exactly what upstream sends.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum SwordBlockPacketAction {
+    /// `waitTicks(1)` then `interaction.startPrediction(world) { sequence ->
+    /// ServerboundUseItemPacket(InteractionHand.OFF_HAND, sequence, player.yRot,
+    /// player.xRot) }`
+    SendOffHandAfterPrediction,
+    /// `event.cancelEvent()` then send
+    /// `ServerboundUseItemPacket(InteractionHand.OFF_HAND, packet.sequence,
+    /// player.yRot, player.xRot)`.
+    CancelAndSendOffHandSameSequence { sequence: i32 },
+}
+
+/// Upstream `packetHandler` (`sequenceHandler<PacketEvent>`): swap the
+/// main-hand sword use for an off-hand shield use, so ViaVersion shows 1.8
+/// sword blocking on the old combat protocol.
+pub fn sword_block_packet_handler(
+    module: &Module,
+    event: &mut PacketEvent,
+    player: &SwordBlockEntity,
+    blocks_attacks_existing: bool,
+) -> Option<SwordBlockPacketAction> {
+    if setting_bool(module, "OnlyVisual", false) {
+        return None; // return@sequenceHandler
+    }
+
+    // If we are already on the old combat protocol or anything blockable protocol,
+    // we don't need to do anything
+    if blocks_attacks_existing {
+        return None;
+    }
+
+    let packet = match event.packet {
+        Packet::UseItem(p) => p,
+        Packet::Other => return None,
+    };
+
+    if packet.hand == Hand::MainHand {
+        let item_in_hand = player.main_hand_item; // or activeItem
+
+        if item_in_hand.is_sword() && item_in_hand.use_animation != ItemUseAnimation::Block {
+            let off_hand_item = player.off_hand_item;
+            if !off_hand_item.is_shield() {
+                // Until "now" we should get a shield from the server
+                Some(SwordBlockPacketAction::SendOffHandAfterPrediction)
+            } else {
+                event.cancelled = true;
+                // We use the old sequence
+                Some(SwordBlockPacketAction::CancelAndSendOffHandSameSequence {
+                    sequence: packet.sequence,
+                })
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
+/// The `interaction.startPrediction` body: the packet the prediction sends once
+/// its sequence is known.
+pub fn sword_block_prediction_packet(
+    sequence: i32,
+    player: &SwordBlockEntity,
+) -> ServerboundUseItemPacket {
+    ServerboundUseItemPacket {
+        hand: Hand::OffHand,
+        sequence,
+        y_rot: player.y_rot,
+        x_rot: player.x_rot,
+    }
+}
+
+#[cfg(test)]
+mod tests3 {
+    use super::*;
+
+    fn stack(kind: ItemKind, anim: ItemUseAnimation) -> ItemStack {
+        ItemStack { item_kind: kind, use_animation: anim }
+    }
+
+    fn sword(anim: ItemUseAnimation) -> ItemStack {
+        stack(ItemKind::Sword, anim)
+    }
+
+    fn other() -> ItemStack {
+        stack(ItemKind::Other, ItemUseAnimation::None)
+    }
+
+    fn entity(main: ItemStack, off: ItemStack) -> SwordBlockEntity {
+        SwordBlockEntity {
+            is_player: false,
+            main_hand_item: main,
+            off_hand_item: off,
+            y_rot: 12.5,
+            x_rot: -3.25,
+            using_item: None,
+            key_use_pressed: false,
+        }
+    }
+
+    fn module() -> Module {
+        sword_block()
+    }
+
+    #[test]
+    fn no_shield_offhand_takes_over_with_fresh_prediction() {
+        let m = module();
+        let mut e = entity(sword(ItemUseAnimation::None), other());
+        e.is_player = true;
+        let mut ev = PacketEvent {
+            packet: Packet::UseItem(ServerboundUseItemPacket {
+                hand: Hand::MainHand,
+                sequence: 7,
+                y_rot: 1.0,
+                x_rot: 2.0,
+            }),
+            cancelled: false,
+        };
+        let action = sword_block_packet_handler(&m, &mut ev, &e, false);
+        assert_eq!(action, Some(SwordBlockPacketAction::SendOffHandAfterPrediction));
+        assert!(!ev.cancelled);
+    }
+
+    #[test]
+    fn prediction_packet_is_offhand_with_new_sequence_and_player_rotation() {
+        let e = entity(sword(ItemUseAnimation::None), other());
+        let p = sword_block_prediction_packet(99, &e);
+        assert_eq!(p.hand, Hand::OffHand);
+        assert_eq!(p.sequence, 99);
+        assert_eq!(p.y_rot, 12.5);
+        assert_eq!(p.x_rot, -3.25);
+    }
+
+    #[test]
+    fn shield_offhand_cancels_and_reuses_the_old_sequence() {
+        let m = module();
+        let e = entity(sword(ItemUseAnimation::None), stack(ItemKind::Shield, ItemUseAnimation::Block));
+        let mut ev = PacketEvent {
+            packet: Packet::UseItem(ServerboundUseItemPacket {
+                hand: Hand::MainHand,
+                sequence: 42,
+                y_rot: 0.0,
+                x_rot: 0.0,
+            }),
+            cancelled: false,
+        };
+        let action = sword_block_packet_handler(&m, &mut ev, &e, false);
+        assert_eq!(
+            action,
+            Some(SwordBlockPacketAction::CancelAndSendOffHandSameSequence { sequence: 42 })
+        );
+        assert!(ev.cancelled);
+    }
+
+    #[test]
+    fn only_visual_and_blocks_attacks_short_circuit() {
+        let mut m = module();
+        m.setting_mut("OnlyVisual").unwrap().kind = ValueKind::Bool(true);
+        let e = entity(sword(ItemUseAnimation::None), other());
+        let mut ev = PacketEvent {
+            packet: Packet::UseItem(ServerboundUseItemPacket {
+                hand: Hand::MainHand,
+                sequence: 1,
+                y_rot: 0.0,
+                x_rot: 0.0,
+            }),
+            cancelled: false,
+        };
+        assert_eq!(sword_block_packet_handler(&m, &mut ev, &e, false), None);
+
+        m.setting_mut("OnlyVisual").unwrap().kind = ValueKind::Bool(false);
+        assert_eq!(sword_block_packet_handler(&m, &mut ev, &e, true), None);
+    }
+
+    #[test]
+    fn block_animation_or_offhand_use_passes_through() {
+        let m = module();
+        let e = entity(sword(ItemUseAnimation::Block), other());
+        let mut ev = PacketEvent {
+            packet: Packet::UseItem(ServerboundUseItemPacket {
+                hand: Hand::MainHand,
+                sequence: 3,
+                y_rot: 0.0,
+                x_rot: 0.0,
+            }),
+            cancelled: false,
+        };
+        assert_eq!(sword_block_packet_handler(&m, &mut ev, &e, false), None);
+
+        let mut ev2 = PacketEvent {
+            packet: Packet::UseItem(ServerboundUseItemPacket {
+                hand: Hand::OffHand,
+                sequence: 3,
+                y_rot: 0.0,
+                x_rot: 0.0,
+            }),
+            cancelled: false,
+        };
+        assert_eq!(sword_block_packet_handler(&m, &mut ev2, &e, false), None);
+    }
+
+    #[test]
+    fn animate_sword_block_gates() {
+        let m = module();
+
+        // Not a sword in the main hand: never.
+        assert!(!should_animate_sword_block(&m, &entity(other(), other()), false, false, other()));
+
+        // KillAuraAutoBlock.showsBlockPose && entity === player.
+        let mut e = entity(sword(ItemUseAnimation::None), other());
+        e.is_player = true;
+        assert!(should_animate_sword_block(&m, &e, true, false, e.main_hand_item));
+
+        // running && shouldApplySwordBlockAnimation: off-hand shield in use.
+        let mut m2 = module();
+        m2.running = true;
+        let mut e2 = entity(sword(ItemUseAnimation::None), other());
+        e2.using_item = Some((stack(ItemKind::Shield, ItemUseAnimation::Block), Hand::OffHand));
+        assert!(should_animate_sword_block(&m2, &e2, false, false, e2.main_hand_item));
+
+        // Not running and no kill-aura block pose: false.
+        assert!(!should_animate_sword_block(&m, &e, false, false, e.main_hand_item));
+
+        // Main-hand use animates on a pre-blocks-attacks protocol, but not
+        // once the protocol has blocks attacks itself.
+        let mut e3 = entity(sword(ItemUseAnimation::None), other());
+        e3.using_item = Some((sword(ItemUseAnimation::None), Hand::MainHand));
+        assert!(should_animate_sword_block(&m2, &e3, false, false, e3.main_hand_item));
+        assert!(!should_animate_sword_block(&m2, &e3, false, true, e3.main_hand_item));
+    }
+
+    #[test]
+    fn fake_on_pressing_applies_to_the_player_only() {
+        let mut m = module();
+        m.setting_mut("FakeOnPressing").unwrap().kind = ValueKind::Bool(true);
+        m.running = true;
+
+        let mut e = entity(sword(ItemUseAnimation::None), other());
+        e.is_player = true;
+        assert!(!should_apply_sword_block_animation(&m, &e, false));
+        e.key_use_pressed = true;
+        assert!(should_apply_sword_block_animation(&m, &e, false));
+
+        // Another entity with the same state: no fake-on-pressing shortcut.
+        let mut e2 = e;
+        e2.is_player = false;
+        e2.using_item = None;
+        assert!(!should_apply_sword_block_animation(&m, &e2, false));
+    }
+
+    #[test]
+    fn hide_offhand_gates() {
+        let mut m = module();
+
+        // Not running: never.
+        assert!(!should_hide_offhand(
+            &m,
+            stack(ItemKind::Shield, ItemUseAnimation::None),
+            sword(ItemUseAnimation::None)
+        ));
+
+        m.running = true;
+
+        // Off hand not a shield: never.
+        assert!(!should_hide_offhand(&m, other(), sword(ItemUseAnimation::None)));
+
+        // Shield off hand with a sword main hand.
+        assert!(should_hide_offhand(
+            &m,
+            stack(ItemKind::Shield, ItemUseAnimation::None),
+            sword(ItemUseAnimation::None)
+        ));
+
+        // AlwaysHideShield covers a non-sword main hand.
+        m.setting_mut("AlwaysHideShield").unwrap().kind = ValueKind::Bool(true);
+        assert!(should_hide_offhand(
+            &m,
+            stack(ItemKind::Shield, ItemUseAnimation::None),
+            other()
+        ));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

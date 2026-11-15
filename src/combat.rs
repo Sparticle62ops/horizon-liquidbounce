@@ -21515,3 +21515,266 @@ mod kill_aura_tests {
         assert_eq!(state.scan_range_addition, 3.0);
     }
 }
+
+// ----- Seams + ModuleCrystalAura.kt -----
+
+/// The engine surfaces `ModuleCrystalAura` and its crystalaura trees read:
+/// the combat manager, the flattened target tracker and submodule toggles,
+/// and each submodule's live behavior (placer, destroyer, damage options,
+/// triggerer, base place, id predict, set dead, predict, rotation modes,
+/// target renderer). Submodule bodies are ported in later slices; their
+/// toggles and settings are flattened into the module tree now.
+pub trait CaHooks {
+    /// `CombatManager.shouldPauseCombat`.
+    fn ca_should_pause_combat(&self) -> bool {
+        false
+    }
+    /// `targetTracker.selectFirst()` (TargetTracker with Range 4.5 1..12).
+    fn ca_target_select_first(&mut self);
+
+    // SubmoduleCrystalPlacer
+    /// `SubmoduleCrystalPlacer.placementRenderer.clearSilently()`.
+    fn ca_placer_clear_silently(&mut self);
+
+    // SubmoduleCrystalDestroyer
+    /// `postAttackHandlers.forEach(CrystalPostAttackTracker::onToggle)`.
+    fn ca_destroyer_toggle_post_attack_handlers(&mut self);
+
+    // CrystalAuraDamageOptions
+    /// `CrystalAuraDamageOptions.cacheMap.clear()`.
+    fn ca_damage_cache_clear(&mut self);
+
+    // CrystalAuraTriggerer
+    /// `CrystalAuraTriggerer.terminateRunningTasks()`.
+    fn ca_terminate_running_tasks(&mut self);
+
+    // SubmoduleBasePlace
+    fn ca_base_place_on_disabled(&mut self);
+
+    // TargetRenderer
+    fn ca_render(&mut self);
+}
+
+/// Upstream `ModuleCrystalAura` — automatically places and explodes end
+/// crystals (alias "AutoCrystal", disableOnQuit). Submodule bodies
+/// (place/, destroy/, trigger/, post/, PredictFeature, SubmoduleIdPredict)
+/// are later slices; this is the orchestrator 1:1.
+pub fn crystal_aura() -> Module {
+    Module::new(
+        "CrystalAura",
+        COMBAT,
+        vec![
+            // TargetTracker (rangeValue FloatValueProvider("Range", 4.5f, 1f..12f))
+            float("Range", 4.5, 1.0, 12.0),
+            multi_choice("Priority", &["Type", "Health"], &["Type", "Distance", "Health", "Direction", "Fov"]),
+            float("FOV", 180.0, 0.0, 180.0),
+            int("HurtTime", 10, 0, 10),
+            boolean("IgnoreShield", true),
+            // SubmoduleCrystalPlacer (ToggleableValueGroup "Place", true)
+            boolean("Place", true),
+            choice("PlaceSwing", "DoNotHide", &["DoNotHide"]),
+            choice("Switch", "Silent", &["Silent", "None"]),
+            boolean("1_12_2", false),
+            int("PlaceDelay", 0, 0, 1000),
+            float("PlaceRange", 4.5, 1.0, 6.0),
+            float("PlaceWallsRange", 4.5, 0.0, 6.0),
+            boolean("OnlyAbove", false),
+            boolean("Sequenced", false),
+            boolean("NotFacingAway", false),
+            boolean("Jitter", false),
+            // SubmoduleCrystalDestroyer (ToggleableValueGroup "Destroy", true)
+            boolean("Destroy", true),
+            choice("DestroySwing", "DoNotHide", &["DoNotHide"]),
+            int("DestroyDelay", 0, 0, 1000),
+            float("DestroyRange", 4.5, 1.0, 6.0),
+            float("DestroyWallsRange", 4.5, 0.0, 6.0),
+            boolean("PrioritizeVisibleFaces", false),
+            // SubmoduleBasePlace (ToggleableValueGroup "BasePlace", true)
+            boolean("BasePlace", true),
+            int("CalcDelay", 120, 0, 1000),
+            int("TimeOut", 240, 0, 5000),
+            boolean("PlatformOnly", false),
+            boolean("OnlyAboveSelf", false),
+            boolean("Terrain", true),
+            // SubmoduleSetDead (ToggleableValueGroup "SetDead", true)
+            boolean("SetDead", true),
+            // SubmoduleIdPredict (ToggleableValueGroup "IDPredict", false)
+            boolean("IDPredict", false),
+            // RotationMode modes(): NormalRotationMode (priority
+            // IMPORTANT_FOR_USAGE_2) / NoRotationMode
+            choice("RotationMode", "Normal", &["Normal", "None"]),
+        ],
+    )
+}
+
+/// Upstream `ModuleCrystalAura.onDisabled()`.
+pub fn ca_on_disabled(hooks: &mut dyn CaHooks) {
+    hooks.ca_terminate_running_tasks();
+    hooks.ca_placer_clear_silently();
+    hooks.ca_destroyer_toggle_post_attack_handlers();
+    hooks.ca_base_place_on_disabled();
+    hooks.ca_damage_cache_clear();
+}
+
+/// Upstream `ModuleCrystalAura.onEnabled()`.
+pub fn ca_on_enabled(hooks: &mut dyn CaHooks) {
+    hooks.ca_destroyer_toggle_post_attack_handlers();
+}
+
+/// Upstream `ModuleCrystalAura.simulatedTickHandler` (`handler<RotationUpdateEvent>`,
+/// priority 1).
+pub fn ca_rotation_update_handler(hooks: &mut dyn CaHooks) {
+    hooks.ca_damage_cache_clear();
+    if hooks.ca_should_pause_combat() {
+        return;
+    }
+
+    hooks.ca_target_select_first();
+}
+
+/// Upstream `ModuleCrystalAura` render handler (TargetRenderer tree).
+pub fn ca_render_handler(hooks: &mut dyn CaHooks) {
+    hooks.ca_render();
+}
+
+#[cfg(test)]
+mod crystal_aura_tests {
+    use super::*;
+
+    struct CaMock {
+        should_pause: bool,
+        select_first: u32,
+        placer_clears: u32,
+        destroyer_toggles: u32,
+        cache_clears: u32,
+        terminated: u32,
+        base_place_disabled: u32,
+        renders: u32,
+    }
+
+    impl Default for CaMock {
+        fn default() -> Self {
+            CaMock {
+                should_pause: false,
+                select_first: 0,
+                placer_clears: 0,
+                destroyer_toggles: 0,
+                cache_clears: 0,
+                terminated: 0,
+                base_place_disabled: 0,
+                renders: 0,
+            }
+        }
+    }
+
+    impl CaHooks for CaMock {
+        fn ca_should_pause_combat(&self) -> bool {
+            self.should_pause
+        }
+        fn ca_target_select_first(&mut self) {
+            self.select_first += 1;
+        }
+        fn ca_placer_clear_silently(&mut self) {
+            self.placer_clears += 1;
+        }
+        fn ca_destroyer_toggle_post_attack_handlers(&mut self) {
+            self.destroyer_toggles += 1;
+        }
+        fn ca_damage_cache_clear(&mut self) {
+            self.cache_clears += 1;
+        }
+        fn ca_terminate_running_tasks(&mut self) {
+            self.terminated += 1;
+        }
+        fn ca_base_place_on_disabled(&mut self) {
+            self.base_place_disabled += 1;
+        }
+        fn ca_render(&mut self) {
+            self.renders += 1;
+        }
+    }
+
+    #[test]
+    fn on_disabled_runs_all_cleanup_in_order() {
+        let mut hooks = CaMock::default();
+        ca_on_disabled(&mut hooks);
+        assert_eq!(hooks.terminated, 1);
+        assert_eq!(hooks.placer_clears, 1);
+        assert_eq!(hooks.destroyer_toggles, 1);
+        assert_eq!(hooks.base_place_disabled, 1);
+        assert_eq!(hooks.cache_clears, 1);
+    }
+
+    #[test]
+    fn on_enabled_toggles_post_attack_handlers() {
+        let mut hooks = CaMock::default();
+        ca_on_enabled(&mut hooks);
+        assert_eq!(hooks.destroyer_toggles, 1);
+        assert_eq!(hooks.terminated, 0);
+    }
+
+    #[test]
+    fn rotation_update_clears_cache_and_selects() {
+        // Normal: cache cleared, target selected.
+        let mut hooks = CaMock::default();
+        ca_rotation_update_handler(&mut hooks);
+        assert_eq!(hooks.cache_clears, 1);
+        assert_eq!(hooks.select_first, 1);
+
+        // Combat paused: cache still cleared, no selection.
+        let mut hooks = CaMock::default();
+        hooks.should_pause = true;
+        ca_rotation_update_handler(&mut hooks);
+        assert_eq!(hooks.cache_clears, 1);
+        assert_eq!(hooks.select_first, 0);
+    }
+
+    #[test]
+    fn render_handler_renders() {
+        let mut hooks = CaMock::default();
+        ca_render_handler(&mut hooks);
+        assert_eq!(hooks.renders, 1);
+    }
+
+    #[test]
+    fn settings_match_upstream_defaults() {
+        let module = crystal_aura();
+
+        let cases: &[(&str, &str)] = &[
+            ("Range", "Float(4.5, 1, 12)"),
+            ("Place", "Bool(true)"),
+            ("Destroy", "Bool(true)"),
+            ("BasePlace", "Bool(true)"),
+            ("SetDead", "Bool(true)"),
+            ("IDPredict", "Bool(false)"),
+            ("RotationMode", "Choice(Normal)"),
+            ("Switch", "Choice(Silent)"),
+            ("Terrain", "Bool(true)"),
+            ("CalcDelay", "Int(120, 0, 1000)"),
+            ("TimeOut", "Int(240, 0, 5000)"),
+            ("DestroyRange", "Float(4.5, 1, 6)"),
+            ("PlaceWallsRange", "Float(4.5, 0, 6)"),
+            ("PrioritizeVisibleFaces", "Bool(false)"),
+        ];
+        for (name, expected) in cases {
+            let value = module.setting(name).map(|v| format!("{:?}", v.kind)).unwrap_or_default();
+            assert!(value.starts_with(expected.split('(').next().unwrap()), "{} = {}", name, value);
+            let head = expected.split('(').next().unwrap();
+            assert!(value.starts_with(&format!("{}(", head)), "{} = {}", name, value);
+        }
+
+        // The exact defaults:
+        let range = module.setting("Range").unwrap();
+        match &range.kind {
+            ValueKind::Float(v, lo, hi) => {
+                assert_eq!((*v, *lo, *hi), (4.5, 1.0, 12.0));
+            }
+            other => panic!("Range = {:?}", other),
+        }
+        let id_predict = module.setting("IDPredict").unwrap();
+        match &id_predict.kind {
+            ValueKind::Bool(v) => assert!(!v),
+            other => panic!("IDPredict = {:?}", other),
+        }
+    }
+}

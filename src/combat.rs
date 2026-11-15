@@ -23375,3 +23375,570 @@ mod crystal_place_tests {
         assert_eq!(crystal_placer_max_range(&settings), 4.5);
     }
 }
+
+// ----- SubmoduleBasePlace.kt -----
+
+/// Flattened `BasePlace` settings (ported into the orchestrator tree),
+/// including the nested `SimulateMovement` group.
+#[derive(Clone, Copy, Debug)]
+pub struct BasePlaceSettings {
+    pub enabled: bool,
+    /// `CalcDelay` 120 0..1000 (ms): how long to wait before starting a new
+    /// calculation.
+    pub calc_delay_ms: i64,
+    /// `TimeOut` 240 0..5000 (ms): after how many ms the placer gets cleared.
+    pub timeout_ms: i64,
+    /// `PlatformOnly` false: only places below the enemy when this is true.
+    pub platform_only: bool,
+    /// `OnlyAboveSelf` false: only places above our y level to not help the
+    /// enemy.
+    pub only_above_self: bool,
+    /// `Terrain` true: excludes terrain for base place placements.
+    pub terrain: bool,
+    /// `MinAdvantage` 2.0 0.1..10
+    pub min_advantage: f32,
+    // SimulateMovement
+    /// `SimulateMovement` enabled true
+    pub simulate_movement_enabled: bool,
+    /// `Ticks` 3 1..20: how many ticks the player movement is simulated.
+    pub simulate_ticks: i32,
+    /// `Error` 0.1 0..2: how much the player's bounding box grows per tick.
+    pub simulate_error: f32,
+    /// `ErrorStep` 0.05 0..1
+    pub simulate_error_step: f32,
+    /// `DownError` false
+    pub simulate_down_error: bool,
+    /// `AntiPlatformSimulate` true: exclude y levels we might enter.
+    pub anti_platform: bool,
+}
+
+impl Default for BasePlaceSettings {
+    fn default() -> Self {
+        BasePlaceSettings {
+            enabled: true,
+            calc_delay_ms: 120,
+            timeout_ms: 240,
+            platform_only: false,
+            only_above_self: false,
+            terrain: true,
+            min_advantage: 2.0,
+            simulate_movement_enabled: true,
+            simulate_ticks: 3,
+            simulate_error: 0.1,
+            simulate_error_step: 0.05,
+            simulate_down_error: false,
+            anti_platform: true,
+        }
+    }
+}
+
+/// `SubmoduleBasePlace` state: `currentTarget`, the calculations and trying
+/// chronometers.
+#[derive(Debug, Default)]
+pub struct BasePlaceState {
+    pub current_target: Option<PlacementPositionCandidate>,
+    pub calculations: Chronometer,
+    pub trying: Chronometer,
+}
+
+/// The engine surfaces the base place side reads: the player, the world
+/// (solids, replaceable states, obstruction), the movement simulation and the
+/// block placer.
+pub trait CaBasePlaceHooks {
+    /// `player.blockPosition().y`.
+    fn ca_player_block_y(&self) -> i32;
+    /// `player.boundingBox` as (minX, minY, minZ, maxX, maxY, maxZ).
+    fn ca_player_bounding_box(&self) -> (f64, f64, f64, f64, f64, f64);
+    /// `PlayerSimulationCache.getSimulationForLocalPlayer().getSnapshotsBetween(1..ticks)`
+    /// as the simulated player positions, one per snapshot.
+    fn ca_sim_snapshots(&self, ticks: i32) -> Vec<(f64, f64, f64)>;
+    /// `pos.stateOrEmpty.isSolid`.
+    fn ca_is_solid(&self, pos: CaBlockPos) -> bool;
+    /// `state.canBeReplaced()` for the block at `pos`.
+    fn ca_can_be_replaced(&self, pos: CaBlockPos) -> bool;
+    /// `pos.isUnobstructed()`.
+    fn ca_is_unobstructed(&self, pos: CaBlockPos) -> bool;
+    /// `pos.getCenterDistanceSquared()` against the local player.
+    fn ca_center_distance_sq(&self, pos: CaBlockPos) -> f64;
+    /// `BlockPlacer.range`.
+    fn ca_placer_range(&self) -> f32;
+    /// `BlockPlacer.wallRange`.
+    fn ca_placer_wall_range(&self) -> f32;
+    /// `placer.support.blockedPositions` clear/add.
+    fn ca_blocked_positions_clear(&mut self);
+    fn ca_blocked_positions_add(&mut self, pos: CaBlockPos);
+    /// `placer.update(setOf(it.pos))`.
+    fn ca_placer_update(&mut self, pos: CaBlockPos);
+    /// `placer.clear()`.
+    fn ca_placer_clear(&mut self);
+    /// `placer.disable()`.
+    fn ca_placer_disable(&mut self);
+    /// `SubmoduleCrystalPlacer.oldVersion`.
+    fn ca_old_version(&self) -> bool;
+}
+
+/// Upstream `currentTarget` setter: keeps the placer from building up the
+/// position and starts the placement (or clears it).
+pub fn ca_base_place_set_current_target(
+    hooks: &mut dyn CaBasePlaceHooks,
+    state: &mut BasePlaceState,
+    settings: &BasePlaceSettings,
+    value: Option<PlacementPositionCandidate>,
+    now_ms: u64,
+) {
+    state.current_target = value.clone();
+    hooks.ca_blocked_positions_clear();
+    match value {
+        Some(target) => {
+            // make sure the placer won't build up the position
+            hooks.ca_blocked_positions_add((target.pos.0, target.pos.1 + 1, target.pos.2));
+            if settings_only_above_version(settings, hooks) {
+                hooks.ca_blocked_positions_add((target.pos.0, target.pos.1 + 2, target.pos.2));
+            }
+
+            hooks.ca_placer_update(target.pos);
+            state.trying.reset(now_ms);
+        }
+        None => hooks.ca_placer_clear(),
+    }
+}
+
+fn settings_only_above_version(settings: &BasePlaceSettings, hooks: &dyn CaBasePlaceHooks) -> bool {
+    let _ = settings;
+    hooks.ca_old_version()
+}
+
+/// Upstream `tickHandler` on `GameTickEvent`.
+pub fn ca_base_place_tick(
+    hooks: &mut dyn CaBasePlaceHooks,
+    state: &mut BasePlaceState,
+    settings: &BasePlaceSettings,
+    now_ms: u64,
+) {
+    if state.current_target.is_some() && state.trying.has_elapsed(now_ms, settings.timeout_ms as u64) {
+        hooks.ca_placer_clear();
+        state.current_target = None;
+    }
+}
+
+/// Upstream `SubmoduleBasePlace.onDisabled()`.
+pub fn ca_base_place_on_disabled(hooks: &mut dyn CaBasePlaceHooks, state: &mut BasePlaceState) {
+    hooks.ca_placer_disable();
+    state.current_target = None;
+}
+
+/// Returns whether base place should be calculated.
+pub fn ca_base_place_should_run(state: &mut BasePlaceState, settings: &BasePlaceSettings, now_ms: u64) -> bool {
+    if !settings.enabled {
+        return false;
+    }
+
+    if state.calculations.has_at_least_elapsed(settings.calc_delay_ms as u64, now_ms) {
+        state.calculations.reset(now_ms);
+        return true;
+    }
+
+    false
+}
+
+/// Returns a range of y levels the base place can be placed in (upstream
+/// `getBasePlaceLayers(targetY)`).
+pub fn ca_base_place_layers(target_y: f64, settings: &BasePlaceSettings) -> (i32, i32) {
+    let mut down = 3;
+    let mut max_y = if target_y.fract() > 0.2 {
+        down += 1;
+        target_y.ceil() as i32
+    } else {
+        target_y.floor() as i32
+    };
+
+    if settings.platform_only {
+        max_y -= 1;
+        down -= 1;
+    }
+
+    (max_y - down + 1, max_y)
+}
+
+/// Returns `true` if we can place a crystal base at the `pos` currently.
+pub fn ca_can_base_place(
+    hooks: &dyn CaBasePlaceHooks,
+    settings: &BasePlaceSettings,
+    running: bool,
+    pos: CaBlockPos,
+    layers: (i32, i32),
+) -> bool {
+    running
+        && (!settings.only_above_self || pos.1 >= hooks.ca_player_block_y())
+        && pos.1 >= layers.0
+        && pos.1 <= layers.1
+        && hooks.ca_center_distance_sq(pos) + 1.0 < f64::from(hooks.ca_placer_range().max(hooks.ca_placer_wall_range()) * hooks.ca_placer_range().max(hooks.ca_placer_wall_range()))
+        && hooks.ca_can_be_replaced(pos)
+        && hooks.ca_is_unobstructed(pos)
+        && ca_player_will_not_run_in(hooks, settings, pos)
+        && ca_will_not_trap(hooks, settings, pos)
+}
+
+/// Simulates player movement, so that we won't run into the position.
+fn ca_player_will_not_run_in(hooks: &dyn CaBasePlaceHooks, settings: &BasePlaceSettings, pos: CaBlockPos) -> bool {
+    if !settings.simulate_movement_enabled {
+        return true;
+    }
+
+    let snapshots = hooks.ca_sim_snapshots(settings.simulate_ticks);
+    // `FULL_BOX.move(pos)`
+    let pos_bb = (
+        pos.0 as f64,
+        pos.1 as f64,
+        pos.2 as f64,
+        pos.0 as f64 + 1.0,
+        pos.1 as f64 + 1.0,
+        pos.2 as f64 + 1.0,
+    );
+    let y = pos.1 as f64;
+    let error_step = settings.simulate_error_step as f64;
+    let error_down = settings.simulate_down_error;
+    let mut error_offset = settings.simulate_error as f64;
+
+    // check if the pos will intersect at any expected position
+    for snapshot in snapshots {
+        let simulated_pos = snapshot;
+        let error = error_offset;
+        let result = pos_bb.0 < simulated_pos.0 + 1.0 + error
+            && simulated_pos.0 - error < pos_bb.3
+            && pos_bb.1 < simulated_pos.1 + 1.8 + error
+            && simulated_pos.1 - if error_down { error } else { 0.0 } < pos_bb.4
+            && pos_bb.2 < simulated_pos.2 + 1.0 + error
+            && simulated_pos.2 - error < pos_bb.5;
+        error_offset += error_step;
+        let is_platform = settings.anti_platform && simulated_pos.1.floor() == y;
+        let is_below = settings.only_above_self && y < simulated_pos.1;
+        if result || is_platform || is_below {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Checks if the position traps the player.
+fn ca_will_not_trap(hooks: &dyn CaBasePlaceHooks, settings: &BasePlaceSettings, pos: CaBlockPos) -> bool {
+    let bb = hooks.ca_player_bounding_box();
+    let y_a = bb.1.ceil();
+    let y_b = bb.4.floor();
+
+    let corners: [(f64, f64); 4] = [
+        (bb.0, bb.2),
+        (bb.0, bb.5),
+        (bb.3, bb.2),
+        (bb.3, bb.5),
+    ];
+
+    // the block layer below the player, if the player is clipped in the
+    // ground block a bit, it doesn't matter
+    let floor: Vec<CaBlockPos> = corners
+        .iter()
+        .map(|c| ca_block_pos_containing(c.0, y_a - 1.0, c.1))
+        .collect();
+
+    // the first wall layer
+    let layer_a: Vec<CaBlockPos> = corners
+        .iter()
+        .map(|c| ca_block_pos_containing(c.0, y_a, c.1))
+        .collect();
+
+    // the second wall layer
+    let layer_b: Vec<CaBlockPos> = corners
+        .iter()
+        .map(|c| ca_block_pos_containing(c.0, y_b, c.1))
+        .collect();
+
+    // the blocks above the player
+    let ceiling: Vec<CaBlockPos> = corners
+        .iter()
+        .map(|c| ca_block_pos_containing(c.0, y_b + 1.0, c.1))
+        .collect();
+
+    let is_in_floor_or_ceiling = floor.contains(&pos) || ceiling.contains(&pos);
+    if is_in_floor_or_ceiling {
+        return ca_can_escape_through_sides(&layer_a, &layer_b, hooks);
+    }
+
+    let is_in_wall = layer_a.contains(&pos) || layer_b.contains(&pos);
+    if is_in_wall {
+        return ca_can_escape_through_floor_or_ceiling(&ceiling, &floor, hooks);
+    }
+
+    true
+}
+
+fn ca_can_escape_through_floor_or_ceiling(
+    ceiling: &[CaBlockPos],
+    floor: &[CaBlockPos],
+    hooks: &dyn CaBasePlaceHooks,
+) -> bool {
+    // Can we escape through the ceiling?
+    for pos1 in ceiling {
+        if !hooks.ca_is_solid(*pos1) && !hooks.ca_is_solid((pos1.0, pos1.1 + 1, pos1.2)) {
+            return true;
+        }
+    }
+
+    // Can we escape through the floor?
+    // For example, with this floor:
+    // o = air, x = a solid block
+    // o x
+    // x x
+    // we could escape
+    for pos1 in floor {
+        if !hooks.ca_is_solid(*pos1) && !hooks.ca_is_solid((pos1.0, pos1.1 - 1, pos1.2)) {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Upstream `BlockPos.containing(x, y, z)`.
+fn ca_block_pos_containing(x: f64, y: f64, z: f64) -> CaBlockPos {
+    (x.floor() as i32, y.floor() as i32, z.floor() as i32)
+}
+
+fn ca_can_escape_through_sides(layer_a: &[CaBlockPos], layer_b: &[CaBlockPos], hooks: &dyn CaBasePlaceHooks) -> bool {
+    // Do we find and escape side?
+    for (index, pos1) in layer_a.iter().enumerate() {
+        if !hooks.ca_is_solid(*pos1) && !hooks.ca_is_solid(layer_b[index]) {
+            return true;
+        }
+    }
+
+    false
+}
+
+#[cfg(test)]
+mod base_place_tests {
+    use super::*;
+
+    struct BaseMock {
+        player_block_y: i32,
+        bb: (f64, f64, f64, f64, f64, f64),
+        snapshots: Vec<(f64, f64, f64)>,
+        solids: Vec<CaBlockPos>,
+        can_be_replaced: bool,
+        unobstructed: bool,
+        center_distance_sq: f64,
+        placer_range: f32,
+        placer_wall_range: f32,
+        blocked_positions: Vec<CaBlockPos>,
+        placer_updated: Option<CaBlockPos>,
+        placer_cleared: u32,
+        placer_disabled: u32,
+        old_version: bool,
+    }
+
+    impl Default for BaseMock {
+        fn default() -> Self {
+            BaseMock {
+                player_block_y: 64,
+                bb: (0.0, 64.0, 0.0, 1.0, 65.9, 1.0),
+                snapshots: Vec::new(),
+                solids: Vec::new(),
+                can_be_replaced: true,
+                unobstructed: true,
+                center_distance_sq: 9.0,
+                placer_range: 4.5,
+                placer_wall_range: 4.5,
+                blocked_positions: Vec::new(),
+                placer_updated: None,
+                placer_cleared: 0,
+                placer_disabled: 0,
+                old_version: false,
+            }
+        }
+    }
+
+    impl CaBasePlaceHooks for BaseMock {
+        fn ca_player_block_y(&self) -> i32 { self.player_block_y }
+        fn ca_player_bounding_box(&self) -> (f64, f64, f64, f64, f64, f64) { self.bb }
+        fn ca_sim_snapshots(&self, _ticks: i32) -> Vec<(f64, f64, f64)> { self.snapshots.clone() }
+        fn ca_is_solid(&self, pos: CaBlockPos) -> bool { self.solids.contains(&pos) }
+        fn ca_can_be_replaced(&self, _pos: CaBlockPos) -> bool { self.can_be_replaced }
+        fn ca_is_unobstructed(&self, _pos: CaBlockPos) -> bool { self.unobstructed }
+        fn ca_center_distance_sq(&self, _pos: CaBlockPos) -> f64 { self.center_distance_sq }
+        fn ca_placer_range(&self) -> f32 { self.placer_range }
+        fn ca_placer_wall_range(&self) -> f32 { self.placer_wall_range }
+        fn ca_blocked_positions_clear(&mut self) { self.blocked_positions.clear(); }
+        fn ca_blocked_positions_add(&mut self, pos: CaBlockPos) { self.blocked_positions.push(pos); }
+        fn ca_placer_update(&mut self, pos: CaBlockPos) { self.placer_updated = Some(pos); }
+        fn ca_placer_clear(&mut self) { self.placer_cleared += 1; }
+        fn ca_placer_disable(&mut self) { self.placer_disabled += 1; }
+        fn ca_old_version(&self) -> bool { self.old_version }
+    }
+
+    #[test]
+    fn base_place_layers_match_upstream_math() {
+        let settings = BasePlaceSettings::default();
+
+        // target on an integer-ish y (fraction <= 0.2): down stays 3
+        assert_eq!(ca_base_place_layers(64.0, &settings), (62, 64));
+        // target with a big fraction: down becomes 4, maxY is the ceiling
+        assert_eq!(ca_base_place_layers(64.5, &settings), (62, 65));
+
+        // platform only shifts both down by one
+        let mut settings = settings;
+        settings.platform_only = true;
+        assert_eq!(ca_base_place_layers(64.0, &settings), (62, 63));
+        assert_eq!(ca_base_place_layers(64.5, &settings), (62, 64));
+    }
+
+    #[test]
+    fn should_base_place_run_gates_on_enabled_and_delay() {
+        let settings = BasePlaceSettings::default();
+        let mut state = BasePlaceState::default();
+
+        assert!(!ca_base_place_should_run(&mut state, &settings, 0));
+        assert!(ca_base_place_should_run(&mut state, &settings, 130));
+        // delay not elapsed again right away
+        assert!(!ca_base_place_should_run(&mut state, &settings, 140));
+        state.calculations.reset(1000);
+        assert!(!ca_base_place_should_run(&mut state, &settings, 1100));
+        assert!(ca_base_place_should_run(&mut state, &settings, 1130));
+
+        let mut settings = settings;
+        settings.enabled = false;
+        state.calculations.reset(0);
+        assert!(!ca_base_place_should_run(&mut state, &settings, 9999));
+    }
+
+    #[test]
+    fn current_target_setter_wires_the_placer() {
+        let mut hooks = BaseMock::default();
+        let mut state = BasePlaceState::default();
+        let settings = BasePlaceSettings::default();
+
+        let candidate = PlacementPositionCandidate::new((5, 64, 5), true, false, (5.5, 64.0, 5.5));
+        ca_base_place_set_current_target(&mut hooks, &mut state, &settings, Some(candidate.clone()), 1000);
+        // above() blocked; oldVersion false so no above(2)
+        assert_eq!(hooks.blocked_positions, vec![(5, 65, 5)]);
+        assert_eq!(hooks.placer_updated, Some((5, 64, 5)));
+        assert_eq!(state.trying.last_reset_ms, 1000);
+
+        // clearing the target clears the placer
+        ca_base_place_set_current_target(&mut hooks, &mut state, &settings, None, 2000);
+        assert!(hooks.blocked_positions.is_empty());
+        assert_eq!(hooks.placer_cleared, 1);
+
+        // oldVersion blocks above(2) too
+        let mut hooks = BaseMock::default();
+        hooks.old_version = true;
+        let mut state = BasePlaceState::default();
+        ca_base_place_set_current_target(&mut hooks, &mut state, &settings, Some(candidate.clone()), 1000);
+        assert_eq!(hooks.blocked_positions, vec![(5, 65, 5), (5, 66, 5)]);
+    }
+
+    #[test]
+    fn tick_handler_clears_after_timeout() {
+        let mut hooks = BaseMock::default();
+        let mut state = BasePlaceState::default();
+        let settings = BasePlaceSettings::default();
+        let candidate = PlacementPositionCandidate::new((5, 64, 5), true, false, (5.5, 64.0, 5.5));
+        state.current_target = Some(candidate);
+        state.trying.reset(1000);
+
+        ca_base_place_tick(&mut hooks, &mut state, &settings, 1200);
+        assert!(state.current_target.is_some());
+        assert_eq!(hooks.placer_cleared, 0);
+
+        ca_base_place_tick(&mut hooks, &mut state, &settings, 1300);
+        assert!(state.current_target.is_none());
+        assert_eq!(hooks.placer_cleared, 1);
+    }
+
+    #[test]
+    fn can_base_place_checks_every_gate() {
+        let hooks = BaseMock::default();
+        let settings = BasePlaceSettings::default();
+        let layers = ca_base_place_layers(64.5, &settings);
+
+        // all gates pass
+        assert!(ca_can_base_place(&hooks, &settings, true, (5, 63, 5), layers));
+        // not running
+        assert!(!ca_can_base_place(&hooks, &settings, false, (5, 63, 5), layers));
+        // y outside layers
+        assert!(!ca_can_base_place(&hooks, &settings, true, (5, 60, 5), layers));
+        // distance too far (9.0 + 1.0 vs 4.5^2 = 20.25 -> passes; use far pos)
+        let mut far = BaseMock::default();
+        far.center_distance_sq = 100.0;
+        assert!(!ca_can_base_place(&far, &settings, true, (5, 63, 5), layers));
+        // block cannot be replaced
+        let mut hooks = BaseMock::default();
+        hooks.can_be_replaced = false;
+        assert!(!ca_can_base_place(&hooks, &settings, true, (5, 63, 5), layers));
+        // obstructed
+        let mut hooks = BaseMock::default();
+        hooks.unobstructed = false;
+        assert!(!ca_can_base_place(&hooks, &settings, true, (5, 63, 5), layers));
+        // onlyAboveSelf: pos below the player is rejected
+        let mut settings = BasePlaceSettings::default();
+        settings.only_above_self = true;
+        let hooks = BaseMock::default();
+        assert!(!ca_can_base_place(&hooks, &settings, true, (5, 63, 5), layers));
+        assert!(ca_can_base_place(&hooks, &settings, true, (5, 64, 5), layers));
+    }
+
+    #[test]
+    fn player_will_not_run_in_uses_simulation() {
+        let mut hooks = BaseMock::default();
+        let settings = BasePlaceSettings::default();
+
+        // no movement -> no collision
+        assert!(ca_player_will_not_run_in(&hooks, &settings, (5, 63, 5)));
+
+        // simulated player walks into the block position
+        hooks.snapshots = vec![(5.0, 63.0, 5.0), (5.0, 63.5, 5.0), (5.0, 64.0, 5.0)];
+        assert!(!ca_player_will_not_run_in(&hooks, &settings, (5, 63, 5)));
+
+        // simulate disabled -> always true
+        let mut settings = BasePlaceSettings::default();
+        settings.simulate_movement_enabled = false;
+        assert!(ca_player_will_not_run_in(&hooks, &settings, (5, 63, 5)));
+    }
+
+    #[test]
+    fn will_not_trap_wall_and_ceiling_escapes() {
+        // player bb (0,64,0)-(1,65.9,1): corners (0,0),(0,1),(1,0),(1,1)
+        let mut hooks = BaseMock::default();
+        let settings = BasePlaceSettings::default();
+
+        // floor/ceiling: all air -> escape through sides possible (layerA air)
+        // a pos in the ceiling layer: y = floor(65.9)+1 = 66
+        hooks.solids = vec![];
+        assert!(ca_will_not_trap(&hooks, &settings, (0, 66, 0)));
+
+        // everything solid around -> no escape
+        hooks.solids = vec![
+            (0, 63, 0), (0, 63, 1), (1, 63, 0), (1, 63, 1),
+            (0, 64, 0), (0, 64, 1), (1, 64, 0), (1, 64, 1),
+            (0, 65, 0), (0, 65, 1), (1, 65, 0), (1, 65, 1),
+            (0, 66, 0), (0, 66, 1), (1, 66, 0), (1, 66, 1),
+            (-1, 65, 0), (-1, 65, 1),
+        ];
+        assert!(!ca_will_not_trap(&hooks, &settings, (0, 66, 0)));
+
+        // wall layer pos with an air side escape in layerB
+        let mut hooks = BaseMock::default();
+        hooks.solids = vec![(0, 64, 0), (0, 64, 1), (1, 64, 0), (1, 64, 1)];
+        assert!(ca_will_not_trap(&hooks, &settings, (0, 64, 0)));
+    }
+
+    #[test]
+    fn on_disabled_clears_state_and_disables_placer() {
+        let mut hooks = BaseMock::default();
+        let mut state = BasePlaceState::default();
+        state.current_target = Some(PlacementPositionCandidate::new((5, 64, 5), true, false, (5.5, 64.0, 5.5)));
+
+        ca_base_place_on_disabled(&mut hooks, &mut state);
+        assert!(state.current_target.is_none());
+        assert_eq!(hooks.placer_disabled, 1);
+    }
+}

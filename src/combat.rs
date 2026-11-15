@@ -11565,3 +11565,143 @@ mod velocity_grim2344_intave_tests {
         assert_eq!(state.current_delay, 3);
     }
 }
+
+// ----- velocity/mode/VelocityAAC442.kt (GPL-3.0, (c) 2015-2026 CCBlueX) -----
+//
+// Velocity for AAC4.4.2, pretty sure, it works on other versions
+
+/// Upstream `VelocityMode("AAC-4.4.2", aliases = listOf("AAC4.4.2"))`.
+pub const VELOCITY_AAC442_NAME: &str = "AAC-4.4.2";
+pub const VELOCITY_AAC442_ALIASES: [&str; 1] = ["AAC4.4.2"];
+
+pub fn velocity_aac442() -> Module {
+    Module::new("AAC442", COMBAT, vec![float("Reduce", 0.62, 0.0, 1.0)])
+}
+
+/// What the game-tick handler did on a `GameTickEvent`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum VelocityAac442TickOutcome {
+    /// The delta movement is untouched.
+    Untouched,
+    /// `player.deltaMovement.multiply(factorX = reduce, factorZ = reduce)`.
+    DeltaReduced { x: f64, z: f64 },
+}
+
+/// Upstream `repeatable`, a `handler` on `GameTickEvent`.
+pub fn velocity_aac442_game_tick_handler(
+    module: &Module,
+    hurt_time: i32,
+    on_ground: bool,
+    delta_x: f64,
+    delta_y: f64,
+    delta_z: f64,
+) -> VelocityAac442TickOutcome {
+    let _ = delta_y;
+    if hurt_time > 0 && !on_ground {
+        let reduce = tb_setting_f64(module, "Reduce", 0.62);
+        return VelocityAac442TickOutcome::DeltaReduced {
+            x: delta_x * reduce,
+            z: delta_z * reduce,
+        };
+    }
+
+    VelocityAac442TickOutcome::Untouched
+}
+
+// ----- velocity/mode/VelocityBlocksMC20241123.kt (GPL-3.0, (c) 2015-2026 CCBlueX) -----
+//
+// BlocksMC velocity
+// @author liquidsquid1
+
+// Deprecated upstream: will be removed with the release of 0.43.0 and
+// ported to LiquidBounce Legacy Add-on.
+
+/// Upstream `VelocityMode("BlocksMC")`.
+pub const VELOCITY_BLOCKSMC_NAME: &str = "BlocksMC";
+
+pub fn velocity_blocksmc() -> Module {
+    Module::new("BlocksMC", COMBAT, vec![])
+}
+
+/// What the packet handler did with a `PacketEvent`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum VelocityBlocksMcPacketOutcome {
+    /// Not a local `ClientboundSetEntityMotionPacket`: the event is untouched.
+    Untouched,
+    /// The velocity was cancelled, then the 1.21.5 start-sneaking and
+    /// stop-sneaking packets went out in that order.
+    CancelledAndSneaked,
+}
+
+/// Upstream `packetHandler`, a `handler` on `PacketEvent`. The
+/// `send1_21_5StartSneaking()` and `send1_21_5StopSneaking()` network sends
+/// are outcomes for the host to send in order.
+pub fn velocity_blocksmc_packet_handler(
+    is_set_entity_motion: bool,
+    packet_id_matches_player: bool,
+) -> VelocityBlocksMcPacketOutcome {
+    // Check if this is a regular velocity update
+    if is_set_entity_motion && packet_id_matches_player {
+        // event.cancelEvent()
+        // network.send1_21_5StartSneaking()
+        // network.send1_21_5StopSneaking()
+        return VelocityBlocksMcPacketOutcome::CancelledAndSneaked;
+    }
+
+    VelocityBlocksMcPacketOutcome::Untouched
+}
+
+#[cfg(test)]
+mod velocity_aac442_blocksmc_tests {
+    use super::*;
+
+    #[test]
+    fn velocity_aac442_reduces_the_air_hurt_delta() {
+        let module = velocity_aac442();
+
+        // hurtTime > 0 but on the ground: untouched
+        assert_eq!(
+            velocity_aac442_game_tick_handler(&module, 5, true, 0.5, 0.1, 0.9),
+            VelocityAac442TickOutcome::Untouched
+        );
+
+        // In the air with no hurt time: untouched
+        assert_eq!(
+            velocity_aac442_game_tick_handler(&module, 0, false, 0.5, 0.1, 0.9),
+            VelocityAac442TickOutcome::Untouched
+        );
+
+        // In the air hurt by the 0.62 factor
+        assert_eq!(
+            velocity_aac442_game_tick_handler(&module, 5, false, 0.5, 0.1, 0.9),
+            VelocityAac442TickOutcome::DeltaReduced { x: 0.31, z: 0.558 }
+        );
+
+        // A raised Reduce setting scales further
+        let mut module = velocity_aac442();
+        module.setting_mut("Reduce").unwrap().kind = ValueKind::Float(1.0, 0.0, 1.0);
+        assert_eq!(
+            velocity_aac442_game_tick_handler(&module, 5, false, 0.5, 0.1, 0.9),
+            VelocityAac442TickOutcome::DeltaReduced { x: 0.5, z: 0.9 }
+        );
+    }
+
+    #[test]
+    fn velocity_blocksmc_cancels_the_local_velocity_and_sneaks() {
+        // Not a SetEntityMotion, or another entity's: untouched
+        assert_eq!(
+            velocity_blocksmc_packet_handler(false, true),
+            VelocityBlocksMcPacketOutcome::Untouched
+        );
+        assert_eq!(
+            velocity_blocksmc_packet_handler(true, false),
+            VelocityBlocksMcPacketOutcome::Untouched
+        );
+
+        // The local velocity: cancelled, start- then stop-sneaking sent
+        assert_eq!(
+            velocity_blocksmc_packet_handler(true, true),
+            VelocityBlocksMcPacketOutcome::CancelledAndSneaked
+        );
+    }
+}

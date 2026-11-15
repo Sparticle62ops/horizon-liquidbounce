@@ -140,6 +140,205 @@ impl KeepSprint {
     }
 }
 
+
+// ----- ModuleKick.KickModeEnum + ModuleAutoLeave.kt -----
+
+/// Upstream `ModuleKick.KickModeEnum` (exploit/ModuleKick.kt), tags kept 1:1.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum KickMode {
+    Quit,
+    InvalidPacket,
+    SelfHurt,
+    IllegalChat,
+    IllegalSwitchitem,
+    IllegalInteract,
+}
+
+impl KickMode {
+    pub fn tag(&self) -> &'static str {
+        match self {
+            KickMode::Quit => "Quit",
+            KickMode::InvalidPacket => "InvalidPacket",
+            KickMode::SelfHurt => "SelfHurt",
+            KickMode::IllegalChat => "IllegalChat",
+            KickMode::IllegalSwitchitem => "IllegalSwitchitem",
+            KickMode::IllegalInteract => "IllegalInteract",
+        }
+    }
+    pub const ALL_TAGS: [&'static str; 6] = ["Quit", "InvalidPacket", "SelfHurt", "IllegalChat", "IllegalSwitchitem", "IllegalInteract"];
+}
+
+/// Upstream `tickConditional` (`event/CoroutineTicker.kt`):
+/// ticks == 0 -> !breakLoop; else counts ticks until breakLoop or count >= ticks,
+/// passing only when the count reached ticks without a break.
+fn tick_conditional_step(threshold: i64, break_loop: impl Fn() -> bool, count: i64) -> (i64, bool) {
+    // One game tick of upstream tickConditional. Returns (new_count, passed).
+    if break_loop() {
+        return (0, false);
+    }
+    // Don't wait if ticks is 0: passes immediately once the break is false.
+    if threshold == 0 {
+        return (0, true);
+    }
+    let count = count + 1;
+    (count, count >= threshold)
+}
+
+/// The slice of `player`/`mc` AutoLeave reads.
+pub struct AutoLeavePlayer {
+    pub instabuild: bool,
+    pub singleplayer: bool,
+    /// Either hand holds an item with DataComponents.DEATH_PROTECTION.
+    pub can_heal_death_protection: bool,
+    pub health: f32,
+}
+
+pub struct AutoLeave {
+    pub module: Module,
+    /// Upstream coroutine state: Some(running count) while counting, None fresh.
+    counting: Option<i64>,
+    /// The threshold drawn when the current counting started.
+    threshold: i64,
+}
+
+/// Upstream: `ModuleAutoLeave` — leaves the server when health is low.
+pub fn auto_leave() -> AutoLeave {
+    AutoLeave {
+        module: Module::new(
+            "AutoLeave",
+            COMBAT,
+            vec![
+                float("Health", 8.0, 0.0, 20.0),
+                int_range("Delay", 0, 0, 0, 60),
+                crate::value::choice("Mode", "Quit", &KickMode::ALL_TAGS),
+            ],
+        ),
+        counting: None,
+        threshold: 0,
+    }
+}
+
+impl AutoLeave {
+    fn health_threshold(&self) -> f32 {
+        match self.module.setting("Health").map(|v| &v.kind) {
+            Some(ValueKind::Float(v, _, _)) => *v as f32,
+            _ => 8.0,
+        }
+    }
+
+    /// One game tick. Returns the KickMode when the count passed (upstream then
+    /// calls ModuleKick.kick(mode) and sets enabled = false).
+    pub fn on_tick(
+        &mut self,
+        player: &AutoLeavePlayer,
+        delay_random: impl FnOnce() -> (i64, i64),
+    ) -> Option<KickMode> {
+        let mode = match self.module.setting("Mode").map(|v| &v.kind) {
+            Some(ValueKind::Choice(sel, _)) if sel == "InvalidPacket" => KickMode::InvalidPacket,
+            Some(ValueKind::Choice(sel, _)) if sel == "SelfHurt" => KickMode::SelfHurt,
+            Some(ValueKind::Choice(sel, _)) if sel == "IllegalChat" => KickMode::IllegalChat,
+            Some(ValueKind::Choice(sel, _)) if sel == "IllegalSwitchitem" => KickMode::IllegalSwitchitem,
+            Some(ValueKind::Choice(sel, _)) if sel == "IllegalInteract" => KickMode::IllegalInteract,
+            _ => KickMode::Quit,
+        };
+        // A fresh threshold is drawn every time the counting (re)starts.
+        if self.counting.is_none() {
+            let (from, to) = delay_random();
+            self.threshold = if to < from { from } else { fastrand_range(from, to) };
+            self.counting = Some(0);
+        }
+        let threshold = self.threshold;
+        // Upstream breakLoop: conditions that mean "do not leave".
+        let break_loop = || {
+            player.instabuild
+                || player.singleplayer
+                || player.can_heal_death_protection
+                || player.health >= self.health_threshold()
+        };
+        let (count, passed) = tick_conditional_step(threshold, break_loop, self.counting.unwrap_or(0));
+        if passed {
+            self.counting = None;
+            self.module.running = false;
+            Some(mode)
+        } else {
+            // A break restarts the coroutine fresh next tick (count reset inside
+            // the step); a quiet tick keeps counting.
+            self.counting = if count == 0 { None } else { Some(count) };
+            None
+        }
+    }
+}
+
+fn fastrand_range(from: i64, to: i64) -> i64 {
+    // IntRange.random(): inclusive [from, to]. Seed source is the engine seam.
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let span = (to - from + 1).max(1) as u64;
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.subsec_nanos() as u64).unwrap_or(0);
+    from + (nanos % span) as i64
+}
+
+// ----- ModuleMaceKill.kt -----
+
+pub struct MaceKillPlayer {
+    /// player.mainHandItem.item == Items.MACE
+    pub holding_mace: bool,
+    pub on_ground: bool,
+    /// player.boundingBox, as an offset-check function: true when the box moved
+    /// up by `offset` blocks would collide (world.getBlockCollisions not allEmpty).
+    pub collides_at: Box<dyn Fn(f64) -> bool>,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct WarpCall {
+    /// Some(dy) for a warp to position().add(0, height, 0); None for the
+    /// player's current position.
+    pub target_dy: Option<f64>,
+    pub on_ground: bool,
+}
+
+/// Upstream: `ModuleMaceKill` — fakes fall height before a mace hit.
+pub fn mace_kill() -> Module {
+    Module::new("MaceKill", COMBAT, vec![int("FallHeight", 22, 1, 170)])
+}
+
+fn determine_height(fall_height: i64, collides_at: &dyn Fn(f64) -> bool) -> i64 {
+    for i in 1..=fall_height {
+        let offset = (fall_height - i + 1) as f64;
+        if !collides_at(offset) {
+            return offset as i64;
+        }
+    }
+    0
+}
+
+/// Upstream `attackHandler`; returns the warp sequence for the engine seam.
+pub fn mace_kill_attack_handler(module: &Module, player: &MaceKillPlayer) -> Option<Vec<WarpCall>> {
+    if !player.holding_mace {
+        return None;
+    }
+    let fall_height = match module.setting("FallHeight").map(|v| &v.kind) {
+        Some(ValueKind::Int(v, _, _)) => *v,
+        _ => 22,
+    };
+    let height = determine_height(fall_height, player.collides_at.as_ref());
+    let mut calls = Vec::new();
+    if height > 10 {
+        // repeat(ceil(abs(height / 10.0)).toInt()) { player.warp(null, onGround = false) }
+        let times = (height as f64 / 10.0).abs().ceil() as i64;
+        for _ in 0..times {
+            calls.push(WarpCall { target_dy: None, on_ground: false });
+        }
+    } else {
+        // Do it at least twice to neutralize horizontal distance.
+        for _ in 0..2 {
+            calls.push(WarpCall { target_dy: None, on_ground: player.on_ground });
+        }
+    }
+    calls.push(WarpCall { target_dy: Some(height as f64), on_ground: false });
+    calls.push(WarpCall { target_dy: Some(0.0), on_ground: false });
+    Some(calls)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,5 +416,96 @@ mod tests {
         // Out-of-range input clamps like upstream deserializers.
         v.set_from_json(&crate::value::range_json(-5.0, 900.0)).unwrap();
         assert_eq!(v.kind, ValueKind::FloatRange(0.0, 100.0, 0.0, 100.0));
+    }
+}
+
+#[cfg(test)]
+mod tests2 {
+    use super::*;
+
+    fn low_player() -> AutoLeavePlayer {
+        AutoLeavePlayer { instabuild: false, singleplayer: false, can_heal_death_protection: false, health: 4.0 }
+    }
+
+    #[test]
+    fn auto_leave_passes_after_delay_ticks() {
+        let mut al = auto_leave();
+        // Delay 0..0 draws 0: passes immediately when breakLoop is false.
+        let r = al.on_tick(&low_player(), || (0, 0));
+        assert_eq!(r, Some(KickMode::Quit));
+        assert!(!al.module.running, "enabled = false after the kick");
+        // Delay 0..2: draws a threshold, then counts without breaking.
+        let mut al = auto_leave();
+        al.module.setting_mut("Delay").unwrap().set_from_json(&crate::value::range_json(2.0, 2.0)).unwrap();
+        let r = al.on_tick(&low_player(), || (2, 2));
+        assert_eq!(r, None, "first quiet tick keeps counting");
+        let r = al.on_tick(&low_player(), || (2, 2));
+        assert_eq!(r, Some(KickMode::Quit));
+    }
+
+    #[test]
+    fn auto_leave_breaks_on_heal_or_high_health() {
+        let mut al = auto_leave();
+        let heal = AutoLeavePlayer { instabuild: false, singleplayer: false, can_heal_death_protection: true, health: 4.0 };
+        assert_eq!(al.on_tick(&heal, || (0, 0)), None);
+        let healthy = AutoLeavePlayer { instabuild: false, singleplayer: false, can_heal_death_protection: false, health: 9.0 };
+        assert_eq!(al.on_tick(&healthy, || (0, 0)), None, "health >= threshold breaks");
+        let mut al = auto_leave();
+        let creative = AutoLeavePlayer { instabuild: true, singleplayer: false, can_heal_death_protection: false, health: 4.0 };
+        assert_eq!(al.on_tick(&creative, || (0, 0)), None);
+        let mut al = auto_leave();
+        let single = AutoLeavePlayer { instabuild: false, singleplayer: true, can_heal_death_protection: false, health: 4.0 };
+        assert_eq!(al.on_tick(&single, || (0, 0)), None);
+    }
+
+    #[test]
+    fn auto_leave_mode_maps_to_kick_enum() {
+        let mut al = auto_leave();
+        al.module.setting_mut("Mode").unwrap().set_from_json(&crate::value::Json::Str("SelfHurt".into())).unwrap();
+        let r = al.on_tick(&low_player(), || (0, 0));
+        assert_eq!(r, Some(KickMode::SelfHurt));
+    }
+
+    #[test]
+    fn mace_kill_ignores_non_mace_hands() {
+        let m = mace_kill();
+        let p = MaceKillPlayer { holding_mace: false, on_ground: true, collides_at: Box::new(|_| false) };
+        assert_eq!(mace_kill_attack_handler(&m, &p), None);
+    }
+
+    #[test]
+    fn mace_kill_low_height_warp_sequence() {
+        let m = mace_kill();
+        // Free space up to 4 blocks, collision above.
+        let p = MaceKillPlayer { holding_mace: true, on_ground: true, collides_at: Box::new(|o| o > 4.0) };
+        let calls = mace_kill_attack_handler(&m, &p).unwrap();
+        assert_eq!(calls, vec![
+            WarpCall { target_dy: None, on_ground: true },
+            WarpCall { target_dy: None, on_ground: true },
+            WarpCall { target_dy: Some(4.0), on_ground: false },
+            WarpCall { target_dy: Some(0.0), on_ground: false },
+        ]);
+    }
+
+    #[test]
+    fn mace_kill_high_height_repeats_ten_block_warps() {
+        let m = mace_kill();
+        // Free space up to 35 blocks: ceil(35/10) = 4 pre-warps.
+        let mut m = m;
+        m.setting_mut("FallHeight").unwrap().set_from_json(&crate::value::Json::Num(35.0)).unwrap();
+        let p = MaceKillPlayer { holding_mace: true, on_ground: false, collides_at: Box::new(|o| o > 35.0) };
+        let calls = mace_kill_attack_handler(&m, &p).unwrap();
+        assert_eq!(calls.len(), 4 + 2);
+        assert!(calls[..4].iter().all(|c| *c == WarpCall { target_dy: None, on_ground: false }));
+        assert_eq!(calls[4], WarpCall { target_dy: Some(35.0), on_ground: false });
+        assert_eq!(calls[5], WarpCall { target_dy: Some(0.0), on_ground: false });
+    }
+
+    #[test]
+    fn mace_kill_fully_blocked_height_is_zero() {
+        let m = mace_kill();
+        let p = MaceKillPlayer { holding_mace: true, on_ground: true, collides_at: Box::new(|_| true) };
+        let calls = mace_kill_attack_handler(&m, &p).unwrap();
+        assert_eq!(calls[2], WarpCall { target_dy: Some(0.0), on_ground: false });
     }
 }

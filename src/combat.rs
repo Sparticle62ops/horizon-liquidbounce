@@ -5,7 +5,7 @@
 
 use crate::category::COMBAT;
 use crate::module::Module;
-use crate::value::{boolean, float, float_range, int, int_range, ValueKind};
+use crate::value::{boolean, choice, float, float_range, int, int_range, multi_choice, ValueKind};
 
 // ----- ModuleNoMissCooldown.kt -----
 
@@ -797,6 +797,476 @@ mod tests3 {
     }
 }
 
+// ----- Seams: blink + packets + ModuleFakeLag.kt -----
+
+/// Upstream `net.minecraft.world.phys.Vec3` (the fields the module reads).
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub struct Vec3 {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+}
+
+impl Vec3 {
+    pub const ZERO: Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    pub fn distance_to(&self, other: Vec3) -> f64 {
+        ((self.x - other.x).powi(2)
+            + (self.y - other.y).powi(2)
+            + (self.z - other.z).powi(2))
+            .sqrt()
+    }
+}
+
+/// Two AABBs (min, max) intersect: every axis overlaps (`AABB.intersects`).
+fn box_intersects(a_min: Vec3, a_max: Vec3, b_min: Vec3, b_max: Vec3) -> bool {
+    a_min.x < b_max.x
+        && a_max.x > b_min.x
+        && a_min.y < b_max.y
+        && a_max.y > b_min.y
+        && a_min.z < b_max.z
+        && a_max.z > b_min.z
+}
+
+/// Upstream `TransferOrigin`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TransferOrigin {
+    Outgoing,
+    Incoming,
+}
+
+/// Upstream `BlinkManager.Action` (the variant this module sets).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BlinkAction {
+    Queue,
+}
+
+/// The packets FakeLag's logic distinguishes, flattened to their
+/// distinguishing fields (seam for `Packet<*>`).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum FakeLagPacket {
+    Interact,
+    Attack,
+    SpectatorAction,
+    Punch,
+    UseItemOn,
+    SignUpdate,
+    PlayerAction,
+    ServerboundResourcePack,
+    ClientboundPlayerPosition,
+    SetEntityMotion { id: i64, movement: Vec3 },
+    Explode { player_knockback: Option<Vec3> },
+    SetHealth,
+    Other,
+}
+
+/// Upstream event `BlinkPacketEvent`.
+pub struct BlinkPacketEvent {
+    pub origin: TransferOrigin,
+    pub packet: FakeLagPacket,
+    /// Upstream `BlinkManager.Action?`; None keeps the event unset.
+    pub action: Option<BlinkAction>,
+}
+
+/// Upstream `Chronometer` (utils/client/Chronometer.kt) with the clock
+/// injected: `reset()` records now, `hasAtLeastElapsed(ms)` is
+/// `now - lastReset >= ms`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Chronometer {
+    last_reset_ms: u64,
+}
+
+impl Chronometer {
+    pub fn reset(&mut self, now_ms: u64) {
+        self.last_reset_ms = now_ms;
+    }
+
+    pub fn has_at_least_elapsed(&self, ms: u64, now_ms: u64) -> bool {
+        now_ms.saturating_sub(self.last_reset_ms) >= ms
+    }
+}
+
+/// Upstream `EvadingPacket` (ModuleAutoDodge seam).
+#[derive(Clone, Copy, Debug)]
+pub struct EvadingPacket {
+    pub idx: usize,
+    pub ticks_to_impact: Option<u64>,
+}
+
+/// Upstream `ModuleAutoDodge` surface FakeLag reads.
+pub trait FakeLagAutoDodge {
+    fn enabled(&self) -> bool;
+    /// `getInflictedHit(position)` — None = no inflicted hit.
+    fn get_inflicted_hit(&self, position: Vec3) -> Option<()>;
+    fn find_avoiding_arrow_position(&self) -> Option<EvadingPacket>;
+}
+
+/// Upstream `BlinkManager` surface FakeLag reads (`positions`, `isAboveTime`,
+/// `flush`). `now_ms` stands in for `System.currentTimeMillis()`.
+pub trait FakeLagBlink {
+    fn positions(&self) -> &[Vec3];
+    /// `isAboveTime(delay)`: oldest queued packet's age is at least `delay`.
+    fn is_above_time(&self, delay: u64) -> bool;
+    fn flush_outgoing(&mut self);
+    fn flush_up_to(&mut self, idx: usize);
+}
+
+/// An entity snapshot as read by `getEntitiesBoxInRange`.
+#[derive(Clone, Copy, Debug)]
+pub struct FakeLagEntity {
+    pub position: Vec3,
+    /// Entity bounding box (only `intersects` is read).
+    pub box_min: Vec3,
+    pub box_max: Vec3,
+    /// Upstream `it != player && it.shouldBeAttacked()` was already applied.
+    pub matches_predicate: bool,
+}
+
+/// Upstream world surface FakeLag reads.
+pub trait FakeLagWorld {
+    /// `world.findEnemy(range)`: any attackable enemy in the range.
+    fn find_enemy(&self, min_range: f32, max_range: f32) -> bool;
+    /// `world.getEntitiesBoxInRange(position, range) { it != player && it.shouldBeAttacked() }`.
+    fn entities_box_in_range(&self, mid_pos: Vec3, range: f64) -> Vec<FakeLagEntity>;
+    /// `player.dimensions.makeBoundingBox(position)` as (min, max).
+    fn make_player_box(&self, position: Vec3) -> (Vec3, Vec3);
+}
+
+/// The slice of the upstream `player` this module reads.
+#[derive(Clone, Copy, Debug)]
+pub struct FakeLagPlayer {
+    pub id: i64,
+    pub position: Vec3,
+    pub is_dead_or_dying: bool,
+    pub is_in_water: bool,
+    pub is_using_item: bool,
+    /// `player.useItem.isConsumable` (has the CONSUMABLE component).
+    pub use_item_is_consumable: bool,
+}
+
+/// Upstream `FlushOn` tags with their `testPacket` predicates.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FlushOn {
+    EntityInteract,
+    BlockInteract,
+    Action,
+}
+
+impl FlushOn {
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Self::EntityInteract => "EntityInteract",
+            Self::BlockInteract => "BlockInteract",
+            Self::Action => "Action",
+        }
+    }
+
+    /// Upstream `testPacket`.
+    pub fn test(&self, packet: &FakeLagPacket) -> bool {
+        match self {
+            Self::EntityInteract => matches!(
+                packet,
+                FakeLagPacket::Interact
+                    | FakeLagPacket::Attack
+                    | FakeLagPacket::SpectatorAction
+                    | FakeLagPacket::Punch
+            ),
+            Self::BlockInteract => {
+                matches!(packet, FakeLagPacket::UseItemOn | FakeLagPacket::SignUpdate)
+            }
+            Self::Action => matches!(packet, FakeLagPacket::PlayerAction),
+        }
+    }
+}
+
+/// Upstream `Mode` tags.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FakeLagMode {
+    Constant,
+    Dynamic,
+}
+
+fn fake_lag_mode(module: &Module) -> Option<FakeLagMode> {
+    match module.setting("Mode").map(|v| &v.kind) {
+        Some(ValueKind::Choice(sel, _)) if sel == "Constant" => Some(FakeLagMode::Constant),
+        Some(ValueKind::Choice(sel, _)) if sel == "Dynamic" => Some(FakeLagMode::Dynamic),
+        _ => None,
+    }
+}
+
+fn flush_on_selected(module: &Module) -> Vec<FlushOn> {
+    match module.setting("FlushOn").map(|v| &v.kind) {
+        Some(ValueKind::MultiChoice(sel, _)) => sel
+            .iter()
+            .filter_map(|t| match t.as_str() {
+                "EntityInteract" => Some(FlushOn::EntityInteract),
+                "BlockInteract" => Some(FlushOn::BlockInteract),
+                "Action" => Some(FlushOn::Action),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Upstream `FlushOn.ENTITY_INTERACT in flushOn` etc.
+fn flush_on_contains(module: &Module, entry: FlushOn) -> bool {
+    flush_on_selected(module).contains(&entry)
+}
+
+/// Upstream `flushOn.matchesAny(packet)`: any selected entry's predicate
+/// tests the packet.
+fn flush_on_matches_any(module: &Module, packet: &FakeLagPacket) -> bool {
+    flush_on_selected(module).iter().any(|e| e.test(packet))
+}
+
+fn setting_int(module: &Module, name: &str, default: i64) -> i64 {
+    match module.setting(name).map(|v| &v.kind) {
+        Some(ValueKind::Int(v, _, _)) => *v,
+        _ => default,
+    }
+}
+
+fn setting_float_range(module: &Module, name: &str, default: (f64, f64)) -> (f64, f64) {
+    module.setting(name).and_then(|v| v.kind.float_range()).unwrap_or(default)
+}
+
+fn setting_int_range(module: &Module, name: &str, default: (i64, i64)) -> (i64, i64) {
+    module.setting(name).and_then(|v| v.kind.int_range()).unwrap_or(default)
+}
+
+/// Upstream: `ModuleFakeLag` — holds back packets to prevent you from being
+/// hit by an enemy.
+pub fn fake_lag() -> Module {
+    Module::new(
+        "FakeLag",
+        COMBAT,
+        vec![
+            float_range("Range", 2.0, 5.0, 0.0, 10.0),
+            int_range("Delay", 300, 600, 0, 1000), // "ms"
+            int("RecoilTime", 250, 0, 1000),       // "ms"
+            choice("Mode", "Dynamic", &["Constant", "Dynamic"]), // tagBy(this)
+            multi_choice(
+                "FlushOn",
+                &["EntityInteract", "BlockInteract", "Action"],
+                &["EntityInteract", "BlockInteract", "Action"],
+            ),
+        ],
+    )
+}
+
+/// Upstream module state: `nextDelay`, `chronometer`, `isEnemyNearby`.
+#[derive(Clone, Copy, Debug)]
+pub struct FakeLagState {
+    /// Upstream `var nextDelay = delay.random()`.
+    pub next_delay: i64,
+    pub chronometer: Chronometer,
+    pub is_enemy_nearby: bool,
+}
+
+pub fn fake_lag_state(initial_next_delay: i64) -> FakeLagState {
+    FakeLagState {
+        next_delay: initial_next_delay,
+        chronometer: Chronometer::default(),
+        is_enemy_nearby: false,
+    }
+}
+
+pub struct FakeLagHooks<'a, N: FnMut(String, String)> {
+    pub world: &'a mut dyn FakeLagWorld,
+    pub blink: &'a mut dyn FakeLagBlink,
+    pub auto_dodge: &'a mut dyn FakeLagAutoDodge,
+    /// Upstream `notification(title, message, NotificationEvent.Severity.INFO)`.
+    pub notify: &'a mut N,
+    /// Upstream `ModuleAutoShoot.constantLag`.
+    pub auto_shoot_constant_lag: bool,
+    /// Upstream `ModuleAutoShoot.targetTracker.target == null`.
+    pub auto_shoot_has_target: bool,
+    /// Upstream `mc.gui.screen() != null`.
+    pub screen_open: bool,
+}
+
+/// Upstream `gameTickHandler` (`handler<GameTickEvent>`): track whether an
+/// enemy is nearby, and let AutoDodge pick the blink flush when enabled.
+pub fn fake_lag_game_tick<N: FnMut(String, String)>(
+    module: &Module,
+    state: &mut FakeLagState,
+    hooks: &mut FakeLagHooks<N>,
+) {
+    let (from, to) = setting_float_range(module, "Range", (2.0, 5.0));
+    state.is_enemy_nearby = hooks.world.find_enemy(from as f32, to as f32);
+
+    if !hooks.auto_dodge.enabled() {
+        return;
+    }
+
+    let Some(&position) = hooks.blink.positions().first() else {
+        return;
+    };
+
+    if hooks.auto_dodge.get_inflicted_hit(position).is_none() {
+        return;
+    }
+
+    let evading = hooks.auto_dodge.find_avoiding_arrow_position();
+
+    // We have found no packet that avoids getting hit? Then we default to blinking.
+    // AutoDoge might save the situation...
+    let Some(evading_packet) = evading else {
+        (hooks.notify)(String::from("FakeLag"), String::from("Unable to evade arrow. Blinking."));
+        hooks.blink.flush_outgoing();
+        return;
+    };
+
+    if evading_packet.ticks_to_impact.is_some() {
+        (hooks.notify)(String::from("FakeLag"), String::from("Trying to evade arrow..."));
+    } else {
+        (hooks.notify)(String::from("FakeLag"), String::from("Arrow evaded."));
+    }
+    hooks.blink.flush_up_to(evading_packet.idx + 1);
+}
+
+/// Upstream `fakeLagHandler` (`handler<BlinkPacketEvent>`). `random_delay`
+/// stands in for `delay.random()`.
+pub fn fake_lag_blink_packet_handler<N: FnMut(String, String)>(
+    module: &Module,
+    state: &mut FakeLagState,
+    event: &mut BlinkPacketEvent,
+    player: &FakeLagPlayer,
+    hooks: &mut FakeLagHooks<N>,
+    now_ms: u64,
+    random_delay: fn(i64, i64) -> i64,
+) {
+    if event.origin != TransferOrigin::Outgoing
+        || player.is_dead_or_dying
+        || player.is_in_water
+        || hooks.screen_open
+    {
+        return;
+    }
+
+    if !state
+        .chronometer
+        .has_at_least_elapsed(setting_int(module, "RecoilTime", 250) as u64, now_ms)
+    {
+        return;
+    }
+
+    if hooks.blink.is_above_time(state.next_delay.max(0) as u64) {
+        let (lo, hi) = setting_int_range(module, "Delay", (300, 600));
+        state.next_delay = random_delay(lo, hi);
+        return;
+    }
+
+    if flush_on_matches_any(module, &event.packet) {
+        state.chronometer.reset(now_ms);
+        return;
+    }
+
+    match event.packet {
+        FakeLagPacket::ClientboundPlayerPosition | FakeLagPacket::ServerboundResourcePack => {
+            state.chronometer.reset(now_ms);
+            return;
+        }
+
+        FakeLagPacket::Interact
+        | FakeLagPacket::Attack
+        | FakeLagPacket::SpectatorAction
+        | FakeLagPacket::Punch => {
+            if flush_on_contains(module, FlushOn::EntityInteract) {
+                state.chronometer.reset(now_ms);
+                return;
+            }
+        }
+
+        // Flush on knockback
+        FakeLagPacket::SetEntityMotion { id, movement } => {
+            if id == player.id && movement != Vec3::ZERO {
+                state.chronometer.reset(now_ms);
+                return;
+            }
+        }
+
+        // Flush on explosion
+        FakeLagPacket::Explode { player_knockback } => {
+            if let Some(knockback) = player_knockback {
+                if knockback != Vec3::ZERO {
+                    state.chronometer.reset(now_ms);
+                    return;
+                }
+            }
+        }
+
+        // Flush on damage
+        FakeLagPacket::SetHealth => {
+            state.chronometer.reset(now_ms);
+            return;
+        }
+        _ => {}
+    }
+
+    // We don't want to lag when we are using an item that is not a food, milk bucket or potion.
+    if player.is_using_item && player.use_item_is_consumable {
+        return;
+    }
+
+    // Support auto shoot with fake lag
+    if module.running && hooks.auto_shoot_constant_lag && !hooks.auto_shoot_has_target {
+        event.action = Some(BlinkAction::Queue);
+        return;
+    }
+
+    match fake_lag_mode(module).unwrap_or(FakeLagMode::Dynamic) {
+        FakeLagMode::Constant => event.action = Some(BlinkAction::Queue),
+        FakeLagMode::Dynamic => {
+            // If there is an enemy in range, we want to lag.
+            if !state.is_enemy_nearby {
+                return;
+            }
+
+            let Some(&position) = hooks.blink.positions().first() else {
+                event.action = Some(BlinkAction::Queue);
+                return;
+            };
+            let (player_box_min, player_box_max) = hooks.world.make_player_box(position);
+
+            // todo: implement if enemy is facing old player position
+
+            let (from, to) = setting_float_range(module, "Range", (2.0, 5.0));
+            let entities = hooks.world.entities_box_in_range(position, to);
+
+            // If there are no entities, we don't want to lag.
+            if entities.is_empty() {
+                return;
+            }
+
+            let intersects = entities
+                .iter()
+                .any(|e| box_intersects(e.box_min, e.box_max, player_box_min, player_box_max));
+            let server_distance = entities
+                .iter()
+                .map(|e| e.position.distance_to(position))
+                .fold(f64::INFINITY, f64::min);
+            let client_distance = entities
+                .iter()
+                .map(|e| e.position.distance_to(player.position))
+                .fold(f64::INFINITY, f64::min);
+
+            // If the server position is not closer than the client position, we keep lagging.
+            // Also, we don't want to lag if the player is intersecting with an entity.
+            if server_distance < client_distance || intersects {
+                return;
+            }
+
+            event.action = Some(BlinkAction::Queue);
+        }
+    }
+}
+
+/// Upstream `onDisabled`: `isEnemyNearby = false`.
+pub fn fake_lag_on_disabled(state: &mut FakeLagState) {
+    state.is_enemy_nearby = false;
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -965,5 +1435,354 @@ mod tests2 {
         let p = MaceKillPlayer { holding_mace: true, on_ground: true, collides_at: Box::new(|_| true) };
         let calls = mace_kill_attack_handler(&m, &p).unwrap();
         assert_eq!(calls[2], WarpCall { target_dy: Some(0.0), on_ground: false });
+    }
+}
+
+
+
+#[cfg(test)]
+mod tests4 {
+    use super::*;
+
+    struct MockBlink {
+        positions: Vec<Vec3>,
+        oldest_age_ms: u64,
+        flushed_outgoing: bool,
+        flushed_up_to: Vec<usize>,
+    }
+
+    impl MockBlink {
+        fn with_positions(positions: Vec<Vec3>) -> Self {
+            Self { positions, oldest_age_ms: 0, flushed_outgoing: false, flushed_up_to: Vec::new() }
+        }
+    }
+
+    impl FakeLagBlink for MockBlink {
+        fn positions(&self) -> &[Vec3] { &self.positions }
+        fn is_above_time(&self, delay: u64) -> bool { self.oldest_age_ms >= delay }
+        fn flush_outgoing(&mut self) { self.flushed_outgoing = true; }
+        fn flush_up_to(&mut self, idx: usize) { self.flushed_up_to.push(idx); }
+    }
+
+    struct MockAutoDodge {
+        enabled: bool,
+        inflicted: Option<()>,
+        evading: Option<EvadingPacket>,
+    }
+
+    impl FakeLagAutoDodge for MockAutoDodge {
+        fn enabled(&self) -> bool { self.enabled }
+        fn get_inflicted_hit(&self, _position: Vec3) -> Option<()> { self.inflicted }
+        fn find_avoiding_arrow_position(&self) -> Option<EvadingPacket> { self.evading }
+    }
+
+    struct MockWorld {
+        enemy_found: bool,
+        entities: Vec<FakeLagEntity>,
+        player_box: (Vec3, Vec3),
+    }
+
+    impl FakeLagWorld for MockWorld {
+        fn find_enemy(&self, _min_range: f32, _max_range: f32) -> bool { self.enemy_found }
+        fn entities_box_in_range(&self, _mid_pos: Vec3, _range: f64) -> Vec<FakeLagEntity> {
+            self.entities.clone()
+        }
+        fn make_player_box(&self, _position: Vec3) -> (Vec3, Vec3) { self.player_box }
+    }
+
+    fn entity_at(position: Vec3) -> FakeLagEntity {
+        FakeLagEntity {
+            position,
+            box_min: Vec3 { x: position.x - 0.3, y: position.y, z: position.z - 0.3 },
+            box_max: Vec3 { x: position.x + 0.3, y: position.y + 1.8, z: position.z + 0.3 },
+            matches_predicate: true,
+        }
+    }
+
+    fn player() -> FakeLagPlayer {
+        FakeLagPlayer {
+            id: 7,
+            position: Vec3 { x: 0.0, y: 64.0, z: 0.0 },
+            is_dead_or_dying: false,
+            is_in_water: false,
+            is_using_item: false,
+            use_item_is_consumable: false,
+        }
+    }
+
+    fn hooks<'a, N: FnMut(String, String)>(
+        world: &'a mut MockWorld,
+        blink: &'a mut MockBlink,
+        dodge: &'a mut MockAutoDodge,
+        notify: &'a mut N,
+    ) -> FakeLagHooks<'a, N> {
+        FakeLagHooks {
+            world,
+            blink,
+            auto_dodge: dodge,
+            notify,
+            auto_shoot_constant_lag: false,
+            auto_shoot_has_target: false,
+            screen_open: false,
+        }
+    }
+
+    fn outgoing(packet: FakeLagPacket) -> BlinkPacketEvent {
+        BlinkPacketEvent { origin: TransferOrigin::Outgoing, packet, action: None }
+    }
+
+    #[test]
+    fn flush_on_multi_choice_round_trips_and_rejects_unknown_tags() {
+        let m = fake_lag();
+        let json = m.setting("FlushOn").unwrap().to_json();
+        assert!(matches!(json, crate::value::Json::Arr(_)));
+
+        let mut m2 = fake_lag();
+        let arr = crate::value::Json::Arr(vec![
+            crate::value::Json::Str("Action".into()),
+            crate::value::Json::Str("EntityInteract".into()),
+        ]);
+        m2.setting_mut("FlushOn").unwrap().set_from_json(&arr).unwrap();
+        assert!(flush_on_matches_any(&m2, &FakeLagPacket::PlayerAction));
+        assert!(flush_on_matches_any(&m2, &FakeLagPacket::Attack));
+        assert!(!flush_on_matches_any(&m2, &FakeLagPacket::UseItemOn));
+
+        let bad = crate::value::Json::Arr(vec![crate::value::Json::Str("Nope".into())]);
+        assert!(m2.setting_mut("FlushOn").unwrap().set_from_json(&bad).is_err());
+    }
+
+    #[test]
+    fn game_tick_tracks_enemy_and_flushes_for_auto_dodge() {
+        let m = fake_lag();
+        let mut state = fake_lag_state(400);
+
+        // Enemy tracking.
+        let mut world = MockWorld { enemy_found: true, entities: Vec::new(), player_box: (Vec3::ZERO, Vec3::ZERO) };
+        let mut blink = MockBlink::with_positions(vec![]);
+        let mut dodge = MockAutoDodge { enabled: false, inflicted: None, evading: None };
+        let mut notes: Vec<String> = Vec::new();
+        let mut notify = |t: String, msg: String| notes.push(format!("{t}: {msg}"));
+        fake_lag_game_tick(&m, &mut state, &mut hooks(&mut world, &mut blink, &mut dodge, &mut notify));
+        assert!(state.is_enemy_nearby);
+
+        // AutoDodge enabled but no blink positions: nothing more happens.
+        let mut dodge = MockAutoDodge { enabled: true, inflicted: Some(()), evading: None };
+        let mut notes: Vec<String> = Vec::new();
+        let mut notify = |t: String, msg: String| notes.push(format!("{t}: {msg}"));
+        fake_lag_game_tick(&m, &mut state, &mut hooks(&mut world, &mut blink, &mut dodge, &mut notify));
+        assert!(notes.is_empty());
+
+        // No evading packet: flush everything outgoing with the fallback notice.
+        let mut blink = MockBlink::with_positions(vec![Vec3 { x: 1.0, y: 64.0, z: 1.0 }]);
+        let mut notes: Vec<String> = Vec::new();
+        let mut notify = |t: String, msg: String| notes.push(format!("{t}: {msg}"));
+        fake_lag_game_tick(&m, &mut state, &mut hooks(&mut world, &mut blink, &mut dodge, &mut notify));
+        assert_eq!(notes, vec!["FakeLag: Unable to evade arrow. Blinking.".to_string()]);
+        assert!(blink.flushed_outgoing);
+
+        // Evading packet with ticks to impact: flush up to idx + 1.
+        let mut dodge = MockAutoDodge {
+            enabled: true,
+            inflicted: Some(()),
+            evading: Some(EvadingPacket { idx: 4, ticks_to_impact: Some(3) }),
+        };
+        let mut blink = MockBlink::with_positions(vec![Vec3 { x: 1.0, y: 64.0, z: 1.0 }]);
+        let mut notes: Vec<String> = Vec::new();
+        let mut notify = |t: String, msg: String| notes.push(format!("{t}: {msg}"));
+        fake_lag_game_tick(&m, &mut state, &mut hooks(&mut world, &mut blink, &mut dodge, &mut notify));
+        assert_eq!(notes, vec!["FakeLag: Trying to evade arrow...".to_string()]);
+        assert_eq!(blink.flushed_up_to, vec![5]);
+    }
+
+    #[test]
+    fn blink_handler_gates() {
+        let m = fake_lag();
+        let mut state = fake_lag_state(400);
+        let mut world = MockWorld { enemy_found: false, entities: Vec::new(), player_box: (Vec3::ZERO, Vec3::ZERO) };
+        let mut blink = MockBlink::with_positions(vec![]);
+        let mut dodge = MockAutoDodge { enabled: false, inflicted: None, evading: None };
+        let mut notes: Vec<String> = Vec::new();
+        let mut notify = |t: String, msg: String| notes.push(format!("{t}: {msg}"));
+        let p = player();
+
+        // Incoming origin: nothing.
+        let mut ev = BlinkPacketEvent { origin: TransferOrigin::Incoming, packet: FakeLagPacket::Other, action: None };
+        fake_lag_blink_packet_handler(&m, &mut state, &mut ev, &p, &mut hooks(&mut world, &mut blink, &mut dodge, &mut notify), 10_000, |lo, _| lo);
+        assert_eq!(ev.action, None);
+
+        // Dead player: nothing.
+        let mut dead = p;
+        dead.is_dead_or_dying = true;
+        let mut ev = outgoing(FakeLagPacket::Other);
+        fake_lag_blink_packet_handler(&m, &mut state, &mut ev, &dead, &mut hooks(&mut world, &mut blink, &mut dodge, &mut notify), 10_000, |lo, _| lo);
+        assert_eq!(ev.action, None);
+
+        // Recoil time not elapsed: nothing (last reset 10_000 - 100 = still fresh).
+        state.chronometer.reset(9_900);
+        let mut ev = outgoing(FakeLagPacket::Other);
+        fake_lag_blink_packet_handler(&m, &mut state, &mut ev, &p, &mut hooks(&mut world, &mut blink, &mut dodge, &mut notify), 10_000, |lo, _| lo);
+        assert_eq!(ev.action, None);
+
+        // Above time: nextDelay is re-rolled to the random pick, nothing queued.
+        state.chronometer.reset(9_000);
+        blink.oldest_age_ms = 500; // >= nextDelay (400)
+        let mut ev = outgoing(FakeLagPacket::Other);
+        fake_lag_blink_packet_handler(&m, &mut state, &mut ev, &p, &mut hooks(&mut world, &mut blink, &mut dodge, &mut notify), 10_000, |_, hi| hi);
+        assert_eq!(state.next_delay, 600); // hi picked
+        assert_eq!(ev.action, None);
+    }
+
+    #[test]
+    fn flush_triggers_reset_the_chronometer() {
+        let m = fake_lag();
+        let mut world = MockWorld { enemy_found: false, entities: Vec::new(), player_box: (Vec3::ZERO, Vec3::ZERO) };
+        let mut dodge = MockAutoDodge { enabled: false, inflicted: None, evading: None };
+        let p = player();
+
+        for packet in [
+            FakeLagPacket::PlayerAction,                      // selected FlushOn match
+            FakeLagPacket::ClientboundPlayerPosition,         // position packet
+            FakeLagPacket::ServerboundResourcePack,
+            FakeLagPacket::Attack,                            // EntityInteract family, selected
+            FakeLagPacket::SetEntityMotion { id: 7, movement: Vec3 { x: 0.1, y: 0.0, z: 0.0 } },
+            FakeLagPacket::Explode { player_knockback: Some(Vec3 { x: 0.0, y: 0.5, z: 0.0 }) },
+            FakeLagPacket::SetHealth,
+        ] {
+            let mut state = fake_lag_state(400);
+            state.chronometer.reset(9_000);
+            let mut blink = MockBlink::with_positions(vec![]);
+            let mut notes: Vec<String> = Vec::new();
+            let mut notify = |t: String, msg: String| notes.push(format!("{t}: {msg}"));
+            let mut ev = outgoing(packet);
+            fake_lag_blink_packet_handler(&m, &mut state, &mut ev, &p, &mut hooks(&mut world, &mut blink, &mut dodge, &mut notify), 10_000, |lo, _| lo);
+            // A reset happened at now: the recoil window is fresh again.
+            assert!(!state.chronometer.has_at_least_elapsed(250, 10_000), "no reset for {packet:?}");
+            assert_eq!(ev.action, None);
+        }
+    }
+
+    #[test]
+    fn knockback_for_someone_else_or_zero_does_not_flush_and_consumables_do_not_lag() {
+        let m = fake_lag();
+        let mut world = MockWorld { enemy_found: false, entities: Vec::new(), player_box: (Vec3::ZERO, Vec3::ZERO) };
+        let mut blink = MockBlink::with_positions(vec![]);
+        let mut dodge = MockAutoDodge { enabled: false, inflicted: None, evading: None };
+        let mut notes: Vec<String> = Vec::new();
+        let mut notify = |t: String, msg: String| notes.push(format!("{t}: {msg}"));
+        let mut p = player();
+
+        // Knockback for another entity: falls through, no reset (recoil still elapsed),
+        // and dynamic mode with no enemy nearby does not queue.
+        let mut state = fake_lag_state(400);
+        state.chronometer.reset(9_000);
+        let mut ev = outgoing(FakeLagPacket::SetEntityMotion { id: 99, movement: Vec3 { x: 1.0, y: 0.0, z: 0.0 } });
+        fake_lag_blink_packet_handler(&m, &mut state, &mut ev, &p, &mut hooks(&mut world, &mut blink, &mut dodge, &mut notify), 10_000, |lo, _| lo);
+        assert!(state.chronometer.has_at_least_elapsed(250, 10_000));
+        assert_eq!(ev.action, None);
+
+        // Using a consumable: no lag.
+        p.is_using_item = true;
+        p.use_item_is_consumable = true;
+        let mut state = fake_lag_state(400);
+        state.chronometer.reset(9_000);
+        let mut ev = outgoing(FakeLagPacket::Other);
+        fake_lag_blink_packet_handler(&m, &mut state, &mut ev, &p, &mut hooks(&mut world, &mut blink, &mut dodge, &mut notify), 10_000, |lo, _| lo);
+        assert_eq!(ev.action, None);
+    }
+
+    #[test]
+    fn constant_mode_and_auto_shoot_support_queue() {
+        let mut m = fake_lag();
+        let mut world = MockWorld { enemy_found: false, entities: Vec::new(), player_box: (Vec3::ZERO, Vec3::ZERO) };
+        let mut blink = MockBlink::with_positions(vec![]);
+        let mut dodge = MockAutoDodge { enabled: false, inflicted: None, evading: None };
+        let p = player();
+
+        // AutoShoot with constant lag and no target queues even with no enemy.
+        m.running = true;
+        let mut noop = |_: String, _: String| {};
+        let mut hk = hooks(&mut world, &mut blink, &mut dodge, &mut noop);
+        hk.auto_shoot_constant_lag = true;
+        let mut state = fake_lag_state(400);
+        state.chronometer.reset(9_000);
+        let mut ev = outgoing(FakeLagPacket::Other);
+        fake_lag_blink_packet_handler(&m, &mut state, &mut ev, &p, &mut hk, 10_000, |lo, _| lo);
+        assert_eq!(ev.action, Some(BlinkAction::Queue));
+
+        // Constant mode always queues.
+        let mut m2 = fake_lag();
+        m2.setting_mut("Mode").unwrap().kind = ValueKind::Choice("Constant".into(), vec!["Constant".into(), "Dynamic".into()]);
+        let mut noop = |_: String, _: String| {};
+        let mut hk = hooks(&mut world, &mut blink, &mut dodge, &mut noop);
+        let mut state = fake_lag_state(400);
+        state.chronometer.reset(9_000);
+        let mut ev = outgoing(FakeLagPacket::Other);
+        fake_lag_blink_packet_handler(&m2, &mut state, &mut ev, &p, &mut hk, 10_000, |lo, _| lo);
+        assert_eq!(ev.action, Some(BlinkAction::Queue));
+    }
+
+    #[test]
+    fn dynamic_mode_distance_and_intersection_rules() {
+        let m = fake_lag();
+        let mut dodge = MockAutoDodge { enabled: false, inflicted: None, evading: None };
+        let p = player();
+        let server_pos = Vec3 { x: 10.0, y: 64.0, z: 0.0 };
+
+        let run = |world: &mut MockWorld, blink: &mut MockBlink, dodge: &mut MockAutoDodge| {
+            let mut state = fake_lag_state(400);
+            state.chronometer.reset(9_000);
+            state.is_enemy_nearby = true;
+            let mut ev = outgoing(FakeLagPacket::Other);
+            fake_lag_blink_packet_handler(&m, &mut state, &mut ev, &p, &mut hooks(world, blink, dodge, &mut |_, _| {}), 10_000, |lo, _| lo);
+            ev.action
+        };
+
+        // No enemy nearby: no lag.
+        let mut world = MockWorld { enemy_found: false, entities: vec![entity_at(server_pos)], player_box: (Vec3::ZERO, Vec3::ZERO) };
+        let mut blink = MockBlink::with_positions(vec![server_pos]);
+        {
+            let mut state = fake_lag_state(400);
+            state.chronometer.reset(9_000);
+            let mut ev = outgoing(FakeLagPacket::Other);
+            fake_lag_blink_packet_handler(&m, &mut state, &mut ev, &p, &mut hooks(&mut world, &mut blink, &mut dodge, &mut |_, _| {}), 10_000, |lo, _| lo);
+            assert_eq!(ev.action, None);
+        }
+
+        // No blink positions yet: queue.
+        let mut world = MockWorld { enemy_found: true, entities: vec![entity_at(server_pos)], player_box: (Vec3::ZERO, Vec3::ZERO) };
+        let mut blink = MockBlink::with_positions(vec![]);
+        assert_eq!(run(&mut world, &mut blink, &mut dodge), Some(BlinkAction::Queue));
+
+        // No entities in range: no lag.
+        let mut world = MockWorld { enemy_found: true, entities: vec![], player_box: (Vec3::ZERO, Vec3::ZERO) };
+        let mut blink = MockBlink::with_positions(vec![server_pos]);
+        assert_eq!(run(&mut world, &mut blink, &mut dodge), None);
+
+        // Server position closer than client: keep lagging (no queue).
+        let mut world = MockWorld {
+            enemy_found: true,
+            entities: vec![entity_at(Vec3 { x: 12.0, y: 64.0, z: 0.0 })],
+            player_box: (Vec3::ZERO, Vec3::ZERO),
+        };
+        let mut blink = MockBlink::with_positions(vec![server_pos]);
+        assert_eq!(run(&mut world, &mut blink, &mut dodge), None);
+
+        // Player box intersects the entity: no lag.
+        let mut world = MockWorld {
+            enemy_found: true,
+            entities: vec![entity_at(Vec3 { x: 20.0, y: 64.0, z: 0.0 })],
+            player_box: (Vec3 { x: 19.0, y: 64.0, z: -0.3 }, Vec3 { x: 21.0, y: 65.8, z: 0.3 }),
+        };
+        let mut blink = MockBlink::with_positions(vec![server_pos]);
+        assert_eq!(run(&mut world, &mut blink, &mut dodge), None);
+
+        // Client position closer than server, no intersection: queue.
+        let mut world = MockWorld {
+            enemy_found: true,
+            entities: vec![entity_at(Vec3 { x: 2.0, y: 64.0, z: 0.0 })],
+            player_box: (Vec3 { x: -0.3, y: 64.0, z: -0.3 }, Vec3 { x: 0.3, y: 65.8, z: 0.3 }),
+        };
+        let mut blink = MockBlink::with_positions(vec![server_pos]);
+        assert_eq!(run(&mut world, &mut blink, &mut dodge), Some(BlinkAction::Queue));
     }
 }

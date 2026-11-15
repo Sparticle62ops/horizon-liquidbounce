@@ -8,6 +8,7 @@ pub enum Json {
     Bool(bool),
     Num(f64),
     Str(String),
+    Arr(Vec<Json>),
     Obj(BTreeMap<String, Json>),
 }
 
@@ -36,6 +37,7 @@ pub enum ValueKind {
     Bind(String),             // serialized input bind ("keyboard:key.code:action")
     FloatRange(f64, f64, f64, f64), // from..to within min..max
     IntRange(i64, i64, i64, i64),   // from..to within min..max
+    MultiChoice(Vec<String>, Vec<String>), // selected tags, all options
 }
 
 #[derive(Clone)]
@@ -57,6 +59,9 @@ impl Value {
             ValueKind::Bind(b) => Json::Str(b.clone()),
             ValueKind::FloatRange(a, b, _, _) => range_json(*a, *b),
             ValueKind::IntRange(a, b, _, _) => range_json(*a as f64, *b as f64),
+            ValueKind::MultiChoice(sel, _) => {
+                Json::Arr(sel.iter().map(|t| Json::Str(t.clone())).collect())
+            }
         }
     }
 
@@ -87,6 +92,19 @@ impl Value {
                 *a = clamp(f, *lo as f64, *hi as f64) as i64;
                 *b = clamp(t2, *lo as f64, *hi as f64) as i64;
                 if *b < *a { std::mem::swap(a, b); }
+            }
+            (ValueKind::MultiChoice(sel, opts), Json::Arr(items)) => {
+                let mut next: Vec<String> = Vec::with_capacity(items.len());
+                for it in items {
+                    let tag = it.as_str().ok_or("multi-choice needs string items")?;
+                    if !opts.contains(&tag.to_string()) {
+                        return Err("not a valid choice");
+                    }
+                    if !next.iter().any(|x| x == tag) {
+                        next.push(tag.to_string());
+                    }
+                }
+                *sel = next;
             }
             _ => return Err("wrong type for setting"),
         }
@@ -121,6 +139,18 @@ pub fn int(name: &str, v: i64, lo: i64, hi: i64) -> Value {
 pub fn float(name: &str, v: f64, lo: f64, hi: f64) -> Value {
     Value { name: name.into(), kind: ValueKind::Float(v, lo, hi), visible: |_| true, is_enabled_toggle: false }
 }
+pub fn multi_choice(name: &str, selected: &[&str], opts: &[&str]) -> Value {
+    Value {
+        name: name.into(),
+        kind: ValueKind::MultiChoice(
+            selected.iter().map(|s| s.to_string()).collect(),
+            opts.iter().map(|s| s.to_string()).collect(),
+        ),
+        visible: |_| true,
+        is_enabled_toggle: false,
+    }
+}
+
 pub fn choice(name: &str, sel: &str, opts: &[&str]) -> Value {
     Value {
         name: name.into(),

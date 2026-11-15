@@ -11092,3 +11092,476 @@ mod velocity_hypixel_grim_tests {
         assert!(!state.need_click);
     }
 }
+
+// ----- velocity/mode/VelocityGrim2344MC117.kt (GPL-3.0, (c) 2015-2026 CCBlueX) -----
+//
+// Duplicate-exempt Grim bypass. Abuses the C06 duplicate exempt to bypass
+// the velocity check: after sending a finish-mining digging packet that
+// coincides with the player's collision box and canceling the knockback
+// packet sent by the server before the player's movement packet is sent,
+// Grim seems to ignore the player's knockback.
+// https://github.com/GrimAnticheat/Grim/issues/1133
+
+/// Upstream `VelocityMode("Grim-2.3.44-MC1.17", aliases = listOf("Grim2344-117"))`.
+pub const VELOCITY_GRIM2344_NAME: &str = "Grim-2.3.44-MC1.17";
+pub const VELOCITY_GRIM2344_ALIASES: [&str; 1] = ["Grim2344-117"];
+
+pub fn velocity_grim2344() -> Module {
+    Module::new(
+        "Grim2344",
+        COMBAT,
+        vec![boolean("AlternativeBypass", true)],
+    )
+}
+
+/// Upstream `VelocityGrim2344MC117.canCancel`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct VelocityGrim2344State {
+    pub can_cancel: bool,
+}
+
+/// Upstream `enable()`.
+pub fn velocity_grim2344_enable(state: &mut VelocityGrim2344State) {
+    state.can_cancel = false;
+}
+
+/// The `ServerboundPlayerActionPacket` the mode sends: `STOP_DESTROY_BLOCK`
+/// at the player's block position with `player.direction.opposite`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VelocityGrim2344StopDestroy {
+    pub block_pos: (i64, i64, i64),
+    pub direction_opposite: VelocityGrimDirection,
+}
+
+/// What the packet handler did with a `PacketEvent`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum VelocityGrim2344PacketOutcome {
+    /// The event is untouched.
+    Untouched,
+    /// The damage velocity was cancelled, `waitTicks(1)` ran and the
+    /// duplicate-exempt packets were sent.
+    VelocityCancelled {
+        /// `repeat(if (alternativeBypass) 4 else 1)`: the `PosRot` sends.
+        pos_rot_sends: u32,
+        stop_destroy_block: VelocityGrim2344StopDestroy,
+    },
+}
+
+/// Upstream `packetHandler`, a `sequenceHandler` on `PacketEvent`.
+/// `isLocalPlayerVelocity()` takes its default `considerExplosion = true`.
+#[allow(clippy::too_many_arguments)]
+pub fn velocity_grim2344_packet_handler(
+    module: &Module,
+    state: &mut VelocityGrim2344State,
+    is_damage_event_for_player: bool,
+    is_local_player_velocity: bool,
+    player_block_pos: (i64, i64, i64),
+    player_direction: VelocityGrimDirection,
+) -> VelocityGrim2344PacketOutcome {
+    // Check for damage to make sure it will only cancel
+    // damage velocity (that all we need) and not affect other types of velocity
+    if is_damage_event_for_player {
+        state.can_cancel = true;
+    }
+
+    if is_local_player_velocity && state.can_cancel {
+        // event.cancelEvent()
+        // waitTicks(1)
+        let alternative_bypass = tb_setting_bool(module, "AlternativeBypass", true);
+        let pos_rot_sends = if alternative_bypass { 4 } else { 1 };
+        // network.send(PosRot(player.x, player.y, player.z, player.yRot,
+        //   player.xRot, player.onGround(), player.horizontalCollision)) x N
+        // network.send(ServerboundPlayerActionPacket(
+        //   STOP_DESTROY_BLOCK, player.blockPosition(), player.direction.opposite))
+        state.can_cancel = false;
+        return VelocityGrim2344PacketOutcome::VelocityCancelled {
+            pos_rot_sends,
+            stop_destroy_block: VelocityGrim2344StopDestroy {
+                block_pos: player_block_pos,
+                direction_opposite: velocity_grim_direction_opposite(player_direction),
+            },
+        };
+    }
+
+    VelocityGrim2344PacketOutcome::Untouched
+}
+
+/// Upstream `player.direction.opposite` on a block face direction.
+pub fn velocity_grim_direction_opposite(direction: VelocityGrimDirection) -> VelocityGrimDirection {
+    match direction {
+        VelocityGrimDirection::Up => VelocityGrimDirection::Down,
+        VelocityGrimDirection::Down => VelocityGrimDirection::Up,
+        VelocityGrimDirection::North => VelocityGrimDirection::South,
+        VelocityGrimDirection::South => VelocityGrimDirection::North,
+        VelocityGrimDirection::West => VelocityGrimDirection::East,
+        VelocityGrimDirection::East => VelocityGrimDirection::West,
+    }
+}
+
+// ----- velocity/mode/VelocityIntave20261002.kt (GPL-3.0, (c) 2015-2026 CCBlueX) -----
+//
+// Intave (2026-10-02): an attack-timed knockback reducer plus a
+// chance-driven jump reset that absorbs hurt velocity on the ground.
+
+/// Upstream `VelocityMode("Intave-2026-10-02", aliases = listOf("Intave"))`.
+pub const VELOCITY_INTAVE_NAME: &str = "Intave-2026-10-02";
+pub const VELOCITY_INTAVE_ALIASES: [&str; 1] = ["Intave"];
+
+pub fn velocity_intave() -> Module {
+    Module::new(
+        "Intave",
+        COMBAT,
+        vec![
+            // ReduceOnAttack group
+            boolean("ReduceOnAttack", true),
+            float("Factor", 0.6, 0.6, 1.0),
+            int_range("HurtTime", 5, 7, 1, 10),
+            int("LastAttackTimeToReduce", 2000, 1, 10000),
+            // JumpReset group
+            boolean("JumpReset", true),
+            float("Chance", 50.0, 0.0, 100.0),
+            // Randomize group
+            boolean("Randomize", false),
+            int_range("DelayTicks", 0, 5, 0, 10),
+        ],
+    )
+}
+
+/// Upstream `ReduceOnAttack.lastAttackTime` plus the `JumpReset` delay state.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct VelocityIntaveState {
+    pub last_attack_time: u64,
+    pub current_delay: i64,
+    pub delay_counter: i64,
+}
+
+/// What the attack handler did on an `AttackEntityEvent`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum VelocityIntaveAttackOutcome {
+    /// The delta movement is untouched.
+    Untouched,
+    /// `player.deltaMovement.multiply(factorX = reduceFactor, factorZ =
+    /// reduceFactor)`: the new horizontal delta.
+    DeltaReduced { x: f64, z: f64 },
+}
+
+/// Upstream `ReduceOnAttack.attackHandler`, a `handler` on
+/// `AttackEntityEvent`. `lastAttackTime` updates on every attack.
+pub fn velocity_intave_attack_handler(
+    module: &Module,
+    state: &mut VelocityIntaveState,
+    now_ms: u64,
+    hurt_time: i32,
+    delta_x: f64,
+    delta_y: f64,
+    delta_z: f64,
+) -> VelocityIntaveAttackOutcome {
+    let _ = delta_y;
+    let mut outcome = VelocityIntaveAttackOutcome::Untouched;
+
+    if tb_setting_bool(module, "ReduceOnAttack", true)
+        && velocity_intave_hurt_time_contains(module, hurt_time)
+        && now_ms.saturating_sub(state.last_attack_time)
+            <= tb_setting_i64(module, "LastAttackTimeToReduce", 2000) as u64
+    {
+        let factor = tb_setting_f64(module, "Factor", 0.6);
+        outcome = VelocityIntaveAttackOutcome::DeltaReduced {
+            x: delta_x * factor,
+            z: delta_z * factor,
+        };
+    }
+
+    state.last_attack_time = now_ms;
+    outcome
+}
+
+/// Upstream `player.hurtTime in hurtTime` on the `HurtTime` intRange setting.
+fn velocity_intave_hurt_time_contains(module: &Module, hurt_time: i32) -> bool {
+    let (from, to) = module
+        .setting("HurtTime")
+        .map(|value| &value.kind)
+        .and_then(|kind| kind.int_range())
+        .unwrap_or((5, 7));
+    (from..=to).contains(&(hurt_time as i64))
+}
+
+/// What the movement-input handler decided for the jump input.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum VelocityIntaveJumpOutcome {
+    /// The jump input stays untouched.
+    Untouched,
+    /// Upstream `it.jump = true`.
+    JumpQueued,
+    /// Randomize advanced past its current delay and re-rolled
+    /// `currentDelay` from the `DelayTicks` range.
+    DelayRerolled { new_delay: i64 },
+    /// Jump queued and the delay re-rolled in the same tick.
+    JumpQueuedAndDelayRerolled { new_delay: i64 },
+}
+
+/// Upstream `JumpReset.tickJumpHandler`, a `handler` on
+/// `MovementInputEvent`. `Random.nextInt(100) < chance` arrives as the
+/// host-rolled `rng_roll` in 0..100; `LocalPlayerFallDamageTracker
+/// .isCurrentFallDamage` as `is_current_fall_damage`; `mc.gui.screen() !is
+/// InventoryScreen` as `screen_is_inventory`.
+#[allow(clippy::too_many_arguments)]
+pub fn velocity_intave_movement_input_handler(
+    module: &Module,
+    state: &mut VelocityIntaveState,
+    rng_roll: i64,
+    hurt_time: i32,
+    is_current_fall_damage: bool,
+    on_ground: bool,
+    screen_is_inventory: bool,
+    delay_roll: f64,
+) -> VelocityIntaveJumpOutcome {
+    if !tb_setting_bool(module, "JumpReset", true) {
+        return VelocityIntaveJumpOutcome::Untouched;
+    }
+
+    let chance = tb_setting_f64(module, "Chance", 50.0);
+    let should_jump = (rng_roll as f64) < chance
+        && hurt_time > 5
+        && !is_current_fall_damage;
+    let can_jump = on_ground && !screen_is_inventory;
+    let should_finally_jump = should_jump && can_jump;
+
+    if tb_setting_bool(module, "Randomize", false) {
+        state.delay_counter += 1;
+
+        if state.delay_counter >= state.current_delay {
+            let new_delay = velocity_jump_range_random(module, "DelayTicks", 0, 5, delay_roll);
+            state.delay_counter = 0;
+            state.current_delay = new_delay;
+            return if should_finally_jump {
+                VelocityIntaveJumpOutcome::JumpQueuedAndDelayRerolled { new_delay }
+            } else {
+                VelocityIntaveJumpOutcome::DelayRerolled { new_delay }
+            };
+        }
+        return VelocityIntaveJumpOutcome::Untouched;
+    }
+
+    if should_finally_jump {
+        return VelocityIntaveJumpOutcome::JumpQueued;
+    }
+
+    VelocityIntaveJumpOutcome::Untouched
+}
+
+#[cfg(test)]
+mod velocity_grim2344_intave_tests {
+    use super::*;
+
+    fn grim2344_module() -> Module {
+        velocity_grim2344()
+    }
+
+    fn intave_module() -> Module {
+        velocity_intave()
+    }
+
+    #[test]
+    fn velocity_grim2344_sends_the_duplicate_exempt_packets_after_a_damage_velocity() {
+        let module = grim2344_module();
+        let mut state = VelocityGrim2344State::default();
+
+        // Velocity without a prior damage packet: untouched
+        assert_eq!(
+            velocity_grim2344_packet_handler(
+                &module, &mut state, false, true, (5, 60, 5), VelocityGrimDirection::North
+            ),
+            VelocityGrim2344PacketOutcome::Untouched
+        );
+
+        // Damage packet for the local player arms the cancel
+        assert_eq!(
+            velocity_grim2344_packet_handler(
+                &module, &mut state, true, false, (5, 60, 5), VelocityGrimDirection::North
+            ),
+            VelocityGrim2344PacketOutcome::Untouched
+        );
+        assert!(state.can_cancel);
+
+        // The velocity then cancels: waitTicks(1), 4 PosRot sends
+        // (AlternativeBypass default true) and the stop-destroy action with
+        // the opposite face direction
+        assert_eq!(
+            velocity_grim2344_packet_handler(
+                &module, &mut state, false, true, (5, 60, 5), VelocityGrimDirection::North
+            ),
+            VelocityGrim2344PacketOutcome::VelocityCancelled {
+                pos_rot_sends: 4,
+                stop_destroy_block: VelocityGrim2344StopDestroy {
+                    block_pos: (5, 60, 5),
+                    direction_opposite: VelocityGrimDirection::South,
+                },
+            }
+        );
+        assert!(!state.can_cancel);
+
+        // enable() clears the flag
+        state.can_cancel = true;
+        velocity_grim2344_enable(&mut state);
+        assert!(!state.can_cancel);
+    }
+
+    #[test]
+    fn velocity_grim2344_alternative_bypass_sends_one_pos_rot() {
+        let mut module = grim2344_module();
+        module.setting_mut("AlternativeBypass").unwrap().kind = ValueKind::Bool(false);
+        let mut state = VelocityGrim2344State::default();
+        state.can_cancel = true;
+
+        assert_eq!(
+            velocity_grim2344_packet_handler(
+                &module, &mut state, false, true, (5, 60, 5), VelocityGrimDirection::East
+            ),
+            VelocityGrim2344PacketOutcome::VelocityCancelled {
+                pos_rot_sends: 1,
+                stop_destroy_block: VelocityGrim2344StopDestroy {
+                    block_pos: (5, 60, 5),
+                    direction_opposite: VelocityGrimDirection::West,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn velocity_intave_attack_reduces_the_delta_inside_the_hurt_and_time_windows() {
+        let module = intave_module();
+        let mut state = VelocityIntaveState::default();
+
+        // No prior attack recorded: the window check passes (now - 0 <= 2000)
+        // and the delta reduces by the 0.6 factor
+        assert_eq!(
+            velocity_intave_attack_handler(&module, &mut state, 1000, 6, 0.5, 0.1, 0.9),
+            VelocityIntaveAttackOutcome::DeltaReduced { x: 0.3, z: 0.54 }
+        );
+        assert_eq!(state.last_attack_time, 1000);
+
+        // hurtTime outside the 5..7 window: untouched, but the time records
+        assert_eq!(
+            velocity_intave_attack_handler(&module, &mut state, 1200, 4, 0.5, 0.1, 0.9),
+            VelocityIntaveAttackOutcome::Untouched
+        );
+        assert_eq!(state.last_attack_time, 1200);
+
+        // A second attack inside 2000 ms with the right hurtTime: reduced
+        assert_eq!(
+            velocity_intave_attack_handler(&module, &mut state, 1500, 7, 1.0, 0.1, 0.0),
+            VelocityIntaveAttackOutcome::DeltaReduced { x: 0.6, z: 0.0 }
+        );
+
+        // Beyond the 2000 ms window: untouched
+        assert_eq!(
+            velocity_intave_attack_handler(&module, &mut state, 4000, 6, 1.0, 0.1, 0.0),
+            VelocityIntaveAttackOutcome::Untouched
+        );
+    }
+
+    #[test]
+    fn velocity_intave_jump_reset_queues_the_jump_on_the_ground() {
+        let module = intave_module();
+        let mut state = VelocityIntaveState::default();
+
+        // In air: no jump even with a winning roll
+        assert_eq!(
+            velocity_intave_movement_input_handler(
+                &module, &mut state, 10, 6, false, false, false, 0.0
+            ),
+            VelocityIntaveJumpOutcome::Untouched
+        );
+
+        // Inventory open: no jump
+        assert_eq!(
+            velocity_intave_movement_input_handler(
+                &module, &mut state, 10, 6, false, true, true, 0.0
+            ),
+            VelocityIntaveJumpOutcome::Untouched
+        );
+
+        // Current fall damage: no jump
+        assert_eq!(
+            velocity_intave_movement_input_handler(
+                &module, &mut state, 10, 6, true, true, false, 0.0
+            ),
+            VelocityIntaveJumpOutcome::Untouched
+        );
+
+        // hurtTime at or below 5: no jump
+        assert_eq!(
+            velocity_intave_movement_input_handler(
+                &module, &mut state, 10, 5, false, true, false, 0.0
+            ),
+            VelocityIntaveJumpOutcome::Untouched
+        );
+
+        // Winning roll (0 < 50) on the ground: jump queued
+        assert_eq!(
+            velocity_intave_movement_input_handler(
+                &module, &mut state, 10, 6, false, true, false, 0.0
+            ),
+            VelocityIntaveJumpOutcome::JumpQueued
+        );
+
+        // Losing roll (99 >= 50): untouched
+        assert_eq!(
+            velocity_intave_movement_input_handler(
+                &module, &mut state, 99, 6, false, true, false, 0.0
+            ),
+            VelocityIntaveJumpOutcome::Untouched
+        );
+    }
+
+    #[test]
+    fn velocity_intave_randomize_gates_the_jump_on_its_delay_counter() {
+        let mut module = intave_module();
+        module.setting_mut("Randomize").unwrap().kind = ValueKind::Bool(true);
+        let mut state = VelocityIntaveState::default();
+        // currentDelay 0 fires on the first tick
+        state.current_delay = 0;
+
+        // First tick: counter reaches the delay, jump queues and the delay
+        // re-rolls from DelayTicks 0..5
+        assert_eq!(
+            velocity_intave_movement_input_handler(
+                &module, &mut state, 10, 6, false, true, false, 0.75
+            ),
+            VelocityIntaveJumpOutcome::JumpQueuedAndDelayRerolled { new_delay: 4 }
+        );
+        assert_eq!(state.delay_counter, 0);
+        assert_eq!(state.current_delay, 4);
+
+        // The next three ticks only count up (counters 1, 2, 3 < 4)
+        assert_eq!(
+            velocity_intave_movement_input_handler(
+                &module, &mut state, 10, 6, false, true, false, 0.0
+            ),
+            VelocityIntaveJumpOutcome::Untouched
+        );
+        assert_eq!(
+            velocity_intave_movement_input_handler(
+                &module, &mut state, 10, 6, false, true, false, 0.0
+            ),
+            VelocityIntaveJumpOutcome::Untouched
+        );
+        assert_eq!(
+            velocity_intave_movement_input_handler(
+                &module, &mut state, 10, 6, false, true, false, 0.0
+            ),
+            VelocityIntaveJumpOutcome::Untouched
+        );
+        assert_eq!(state.delay_counter, 3);
+
+        // Losing roll when the counter expires: only the delay re-rolls
+        assert_eq!(
+            velocity_intave_movement_input_handler(
+                &module, &mut state, 99, 6, false, true, false, 0.5
+            ),
+            VelocityIntaveJumpOutcome::DelayRerolled { new_delay: 3 }
+        );
+        assert_eq!(state.delay_counter, 0);
+        assert_eq!(state.current_delay, 3);
+    }
+}

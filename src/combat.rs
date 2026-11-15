@@ -21603,6 +21603,7 @@ pub fn crystal_aura() -> Module {
             boolean("Terrain", true),
             // SubmoduleSetDead (ToggleableValueGroup "SetDead", true)
             boolean("SetDead", true),
+            int("ConfirmTime", 150, 10, 2000),
             // SubmoduleIdPredict (ToggleableValueGroup "IDPredict", false)
             boolean("IDPredict", false),
             // CrystalAuraTriggerer (ValueGroup "Triggers"): NotWhileUsingItem /
@@ -25490,7 +25491,7 @@ mod ca_trigger_tests {
         placer_max: f64,
         destroyer_max: f64,
         tracker_max: f64,
-        entities: HashMap<i32, CaTrackedEntity>,
+        entities: std::collections::HashMap<i32, CaTrackedEntity>,
         idpredict: bool,
         set_dead: bool,
         ran: Vec<CaTriggerRunnable>,
@@ -25586,7 +25587,7 @@ mod ca_trigger_tests {
     }
 
     fn add_crystal(
-        entities: &mut HashMap<i32, CaTrackedEntity>,
+        entities: &mut std::collections::HashMap<i32, CaTrackedEntity>,
         id: i32,
         pos: (f64, f64, f64),
     ) {
@@ -26082,5 +26083,652 @@ mod ca_trigger_tests {
             hooks.ran,
             vec![CaTriggerRunnable::DestroyerTick, CaTriggerRunnable::PlacerTick]
         );
+    }
+}
+
+// ----- combat/crystalaura/post/*.kt (GPL-3.0, (c) 2015-2026 CCBlueX) -----
+// CrystalPostAttackTracker.kt, CrystalAuraSpeedDebugger.kt,
+// SubmoduleSetDead.kt — ported 1:1.
+
+/// Upstream `CrystalPostAttackTracker` state: `attackedIds`
+/// (Int2LongLinkedOpenHashMap, id -> attacked-at ms, insertion ordered).
+#[derive(Debug, Clone, Default)]
+pub struct CaPostAttackTrackerState {
+    pub attacked_ids: Vec<(i32, u64)>,
+}
+
+/// The engine surfaces the post attack trackers read: the concrete tracker's
+/// `running`, the world, the current `mc.level`, and the debug sink.
+pub trait CaPostAttackHooks {
+    /// The concrete tracker's `running` (SpeedDebugger:
+    /// `ModuleCrystalAura.running && ModuleDebug.running`;
+    /// SetDead.CrystalTracker: `SubmoduleSetDead.running`).
+    fn pa_running(&self) -> bool {
+        false
+    }
+    /// `timeOutAfter()` in ms (base: 5000).
+    fn pa_time_out_after(&self) -> u64 {
+        5000
+    }
+    /// `confirmed(id)`.
+    fn pa_confirmed(&mut self, id: i32) {
+        let _ = id;
+    }
+    /// `timedOut(id)`.
+    fn pa_timed_out(&mut self, id: i32) {
+        let _ = id;
+    }
+    /// `cleared()`.
+    fn pa_cleared(&mut self) {}
+    /// `world.getEntity(id)`.
+    fn pa_world_get_entity(&mut self, id: i32) -> Option<CaTrackedEntity> {
+        let _ = id;
+        None
+    }
+    /// `world.removeEntity(id, Entity.RemovalReason.DISCARDED)`.
+    fn pa_remove_entity(&mut self, id: i32) {
+        let _ = id;
+    }
+    /// `mc.level != null`.
+    fn pa_current_world_exists(&self) -> bool {
+        false
+    }
+    /// `currentWorld.getEntity(id) != null`.
+    fn pa_current_world_has_entity(&self, id: i32) -> bool {
+        let _ = id;
+        false
+    }
+    /// `tracked.level === currentWorld`.
+    fn pa_tracked_world_is_current(&self, id: i32) -> bool {
+        let _ = id;
+        false
+    }
+    /// `tracked.entity.unsetRemoved(); currentWorld.addEntity(tracked.entity)`.
+    fn pa_restore_entity(&mut self, id: i32) {
+        let _ = id;
+    }
+    /// `mc.execute { }` wrapper.
+    fn pa_execute(&mut self) {}
+    /// `ModuleCrystalAura.debugParameter("CPS") { }`.
+    fn pa_debug_cps(&mut self, count: usize) {
+        let _ = count;
+    }
+}
+
+/// `attackedIds.put(id, now)` (replace on re-attack).
+fn ca_post_attack_put(state: &mut CaPostAttackTrackerState, id: i32, now_ms: u64) {
+    state.attacked_ids.retain(|(existing, _)| *existing != id);
+    state.attacked_ids.push((id, now_ms));
+}
+
+/// `attackedIds.remove(id)` (the removed stamp, `None` = the default 0).
+fn ca_post_attack_remove(state: &mut CaPostAttackTrackerState, id: i32) -> Option<u64> {
+    let pos = state
+        .attacked_ids
+        .iter()
+        .position(|(existing, _)| *existing == id)?;
+    Some(state.attacked_ids.remove(pos).1)
+}
+
+/// Upstream `CrystalPostAttackTracker.attacked(id)` (the base default).
+pub fn pa_attacked(
+    hooks: &dyn CaPostAttackHooks,
+    state: &mut CaPostAttackTrackerState,
+    id: i32,
+    now_ms: u64,
+) {
+    if !hooks.pa_running() {
+        return;
+    }
+
+    ca_post_attack_put(state, id, now_ms);
+}
+
+/// Upstream `CrystalPostAttackTracker`'s repeatable `handler<GameTickEvent>`
+/// (FIRST_PRIORITY): sweeps attacks that were not confirmed in
+/// `timeOutAfter()` ms and calls `timedOut(id)` for each.
+pub fn pa_repeatable_tick(
+    hooks: &mut dyn CaPostAttackHooks,
+    state: &mut CaPostAttackTrackerState,
+    now_ms: u64,
+) {
+    let attack_time = now_ms.saturating_sub(hooks.pa_time_out_after());
+    let mut timed_out_ids = Vec::new();
+    state.attacked_ids.retain(|(id, time)| {
+        if *time < attack_time {
+            timed_out_ids.push(*id);
+            false
+        } else {
+            true
+        }
+    });
+    for id in timed_out_ids {
+        hooks.pa_timed_out(id);
+    }
+}
+
+/// Upstream `CrystalPostAttackTracker`'s `handler<WorldChangeEvent>`:
+/// `attackedIds.clear(); cleared()`.
+pub fn pa_world_change(
+    hooks: &mut dyn CaPostAttackHooks,
+    state: &mut CaPostAttackTrackerState,
+) {
+    state.attacked_ids.clear();
+    hooks.pa_cleared();
+}
+
+/// The packets the explode listener reads.
+#[derive(Debug, Clone)]
+pub enum CaPostAttackPacket {
+    /// `ClientboundSoundEntityPacket` with `SoundEvents.GENERIC_EXPLODE`.
+    SoundExplode { id: i32 },
+    /// `ClientboundRemoveEntitiesPacket`.
+    RemoveEntities { entity_ids: Vec<i32> },
+}
+
+/// Upstream `CrystalPostAttackTracker`'s explode `handler<PacketEvent>`.
+pub fn pa_packet_listener(
+    hooks: &mut dyn CaPostAttackHooks,
+    state: &mut CaPostAttackTrackerState,
+    packet: &CaPostAttackPacket,
+) {
+    match packet {
+        CaPostAttackPacket::SoundExplode { id } => {
+            // Default (non-existing) value = 0
+            if ca_post_attack_remove(state, *id).is_some() {
+                hooks.pa_confirmed(*id);
+            }
+        }
+        CaPostAttackPacket::RemoveEntities { entity_ids } => {
+            for id in entity_ids {
+                if ca_post_attack_remove(state, *id).is_some() {
+                    hooks.pa_confirmed(*id);
+                }
+            }
+        }
+    }
+}
+
+/// Upstream `CrystalPostAttackTracker.onToggle()`:
+/// `attackedIds.clear(); cleared()`.
+pub fn pa_on_toggle(
+    hooks: &mut dyn CaPostAttackHooks,
+    state: &mut CaPostAttackTrackerState,
+) {
+    state.attacked_ids.clear();
+    hooks.pa_cleared();
+}
+
+// ----- CrystalAuraSpeedDebugger.kt -----
+
+/// Upstream `CrystalAuraSpeedDebugger` state: `cps`
+/// (ConcurrentLinkedQueue<Long> of confirmation timestamps).
+/// "CPS" stands for crystals per second.
+#[derive(Debug, Clone, Default)]
+pub struct CaSpeedDebuggerState {
+    pub cps: std::collections::VecDeque<u64>,
+}
+
+/// Upstream `CrystalAuraSpeedDebugger`'s `handler<GameTickEvent>`: purges
+/// confirmations older than a second and reports the count.
+pub fn pa_speed_debugger_tick(
+    hooks: &mut dyn CaPostAttackHooks,
+    state: &mut CaSpeedDebuggerState,
+    now_ms: u64,
+) {
+    if !hooks.pa_running() {
+        return;
+    }
+
+    let cps_time = now_ms.saturating_sub(1000);
+    state.cps.retain(|time| *time >= cps_time);
+
+    hooks.pa_debug_cps(state.cps.len());
+}
+
+/// Upstream `CrystalAuraSpeedDebugger.confirmed(id)`.
+pub fn pa_speed_debugger_confirmed(state: &mut CaSpeedDebuggerState, now_ms: u64) {
+    state.cps.push_back(now_ms);
+}
+
+/// Upstream `CrystalAuraSpeedDebugger.cleared()`.
+pub fn pa_speed_debugger_cleared(state: &mut CaSpeedDebuggerState) {
+    state.cps.clear();
+}
+
+// ----- SubmoduleSetDead.kt -----
+
+/// Upstream `SubmoduleSetDead` state: the `ConfirmTime` setting and the
+/// `CrystalTracker`'s `RemovedCrystal` map (tracked ids; the entities live
+/// engine-side behind the hooks).
+#[derive(Debug, Clone, Default)]
+pub struct CaSetDeadState {
+    /// `ConfirmTime` 150 10..2000 (ms)
+    pub confirm_time_ms: u64,
+    /// `entities` (id -> RemovedCrystal), tracked as ids.
+    pub entities: Vec<i32>,
+}
+
+/// Upstream `SubmoduleSetDead.CrystalTracker.attacked(id)`: removes hit
+/// crystals instantly from the world instead of waiting for the actual
+/// remove packet, what might allow faster placement.
+pub fn pa_set_dead_attacked(
+    hooks: &mut dyn CaPostAttackHooks,
+    tracker: &mut CaPostAttackTrackerState,
+    state: &mut CaSetDeadState,
+    id: i32,
+    now_ms: u64,
+) {
+    if !hooks.pa_running() {
+        return;
+    }
+
+    hooks.pa_execute();
+    match hooks.pa_world_get_entity(id) {
+        Some(entity) if entity.is_end_crystal => {
+            // super.attacked(id)
+            ca_post_attack_put(tracker, id, now_ms);
+            hooks.pa_remove_entity(id);
+            state.entities.push(id);
+        }
+        _ => {}
+    }
+}
+
+/// Upstream `SubmoduleSetDead.CrystalTracker.confirmed(id)`.
+pub fn pa_set_dead_confirmed(state: &mut CaSetDeadState, id: i32) {
+    state.entities.retain(|existing| *existing != id);
+}
+
+/// Upstream `SubmoduleSetDead.CrystalTracker.timedOut(id)`: if the crystal
+/// was removed but no entity remove packet was sent after the confirmation
+/// time, the crystal is added back to the world.
+pub fn pa_set_dead_timed_out(
+    hooks: &mut dyn CaPostAttackHooks,
+    state: &mut CaSetDeadState,
+    id: i32,
+) {
+    hooks.pa_execute();
+    // tracked = entities.remove(id) ?: return@execute
+    let pos = match state.entities.iter().position(|existing| *existing == id) {
+        Some(pos) => pos,
+        None => return,
+    };
+    state.entities.remove(pos);
+
+    // val currentWorld = mc.level ?: return@execute
+    if !hooks.pa_current_world_exists() {
+        return;
+    }
+    if !hooks.pa_tracked_world_is_current(id) || hooks.pa_current_world_has_entity(id) {
+        return;
+    }
+
+    hooks.pa_restore_entity(id);
+}
+
+/// Upstream `SubmoduleSetDead.CrystalTracker.cleared()`: restores every
+/// tracked crystal of the current world that is not already present.
+pub fn pa_set_dead_cleared(
+    hooks: &mut dyn CaPostAttackHooks,
+    state: &mut CaSetDeadState,
+) {
+    hooks.pa_execute();
+
+    // val currentWorld = mc.level ?: run { entities.clear(); return@execute }
+    if !hooks.pa_current_world_exists() {
+        state.entities.clear();
+        return;
+    }
+
+    let tracked = std::mem::take(&mut state.entities);
+    for id in tracked {
+        if hooks.pa_tracked_world_is_current(id) && !hooks.pa_current_world_has_entity(id) {
+            hooks.pa_restore_entity(id);
+        }
+    }
+    // entities.clear() (already taken above)
+}
+
+/// Upstream `SubmoduleSetDead.CrystalTracker.timeOutAfter() = confirmTime`.
+pub fn pa_set_dead_time_out_after(state: &CaSetDeadState) -> u64 {
+    state.confirm_time_ms
+}
+
+mod ca_post_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    struct PostMock {
+        running: bool,
+        time_out: u64,
+        confirmed: Vec<i32>,
+        timed_out: Vec<i32>,
+        cleared: usize,
+        entities: std::collections::HashMap<i32, CaTrackedEntity>,
+        removed: Vec<i32>,
+        current_world: bool,
+        world_entities: Vec<i32>,
+        tracked_world_current: bool,
+        restored: Vec<i32>,
+        executed: usize,
+        cps_reports: Vec<usize>,
+    }
+
+    impl Default for PostMock {
+        fn default() -> Self {
+            PostMock {
+                running: true,
+                time_out: 5000,
+                confirmed: Vec::new(),
+                timed_out: Vec::new(),
+                cleared: 0,
+                entities: HashMap::new(),
+                removed: Vec::new(),
+                current_world: true,
+                world_entities: Vec::new(),
+                tracked_world_current: true,
+                restored: Vec::new(),
+                executed: 0,
+                cps_reports: Vec::new(),
+            }
+        }
+    }
+
+    impl CaPostAttackHooks for PostMock {
+        fn pa_running(&self) -> bool {
+            self.running
+        }
+        fn pa_time_out_after(&self) -> u64 {
+            self.time_out
+        }
+        fn pa_confirmed(&mut self, id: i32) {
+            self.confirmed.push(id);
+        }
+        fn pa_timed_out(&mut self, id: i32) {
+            self.timed_out.push(id);
+        }
+        fn pa_cleared(&mut self) {
+            self.cleared += 1;
+        }
+        fn pa_world_get_entity(&mut self, id: i32) -> Option<CaTrackedEntity> {
+            self.entities.get(&id).copied()
+        }
+        fn pa_remove_entity(&mut self, id: i32) {
+            self.removed.push(id);
+        }
+        fn pa_current_world_exists(&self) -> bool {
+            self.current_world
+        }
+        fn pa_current_world_has_entity(&self, id: i32) -> bool {
+            self.world_entities.contains(&id)
+        }
+        fn pa_tracked_world_is_current(&self, _id: i32) -> bool {
+            self.tracked_world_current
+        }
+        fn pa_restore_entity(&mut self, id: i32) {
+            self.restored.push(id);
+        }
+        fn pa_execute(&mut self) {
+            self.executed += 1;
+        }
+        fn pa_debug_cps(&mut self, count: usize) {
+            self.cps_reports.push(count);
+        }
+    }
+
+    fn crystal(id: i32, pos: (f64, f64, f64)) -> (i32, CaTrackedEntity) {
+        (
+            id,
+            CaTrackedEntity {
+                is_end_crystal: true,
+                position: pos,
+            },
+        )
+    }
+
+    #[test]
+    fn pa_attacked_gates_on_running_and_records() {
+        let mut hooks = PostMock::default();
+        hooks.running = false;
+        let mut state = CaPostAttackTrackerState::default();
+
+        pa_attacked(&hooks, &mut state, 7, 1000);
+        assert!(state.attacked_ids.is_empty());
+
+        hooks.running = true;
+        pa_attacked(&hooks, &mut state, 7, 1000);
+        assert_eq!(state.attacked_ids, vec![(7, 1000)]);
+    }
+
+    #[test]
+    fn pa_attacked_replaces_the_existing_entry() {
+        let hooks = PostMock::default();
+        let mut state = CaPostAttackTrackerState::default();
+
+        pa_attacked(&hooks, &mut state, 7, 1000);
+        pa_attacked(&hooks, &mut state, 7, 2500);
+        assert_eq!(state.attacked_ids, vec![(7, 2500)]);
+    }
+
+    #[test]
+    fn pa_repeatable_tick_times_out_old_attacks() {
+        let mut hooks = PostMock::default();
+        let mut state = CaPostAttackTrackerState::default();
+        // attacked at 1000, timeout 5000: old at now = 6500
+        state.attacked_ids = vec![(3, 1000), (4, 3000)];
+
+        pa_repeatable_tick(&mut hooks, &mut state, 6500);
+        assert_eq!(hooks.timed_out, vec![3]);
+        assert_eq!(state.attacked_ids, vec![(4, 3000)]);
+
+        // fresh ticks: nothing times out
+        pa_repeatable_tick(&mut hooks, &mut state, 7000);
+        assert_eq!(hooks.timed_out, vec![3]);
+        assert_eq!(state.attacked_ids, vec![(4, 3000)]);
+    }
+
+    #[test]
+    fn pa_world_change_clears_and_calls_cleared() {
+        let mut hooks = PostMock::default();
+        let mut state = CaPostAttackTrackerState::default();
+        state.attacked_ids = vec![(3, 1000)];
+
+        pa_world_change(&mut hooks, &mut state);
+        assert!(state.attacked_ids.is_empty());
+        assert_eq!(hooks.cleared, 1);
+    }
+
+    #[test]
+    fn pa_packet_listener_confirms_explode_and_remove() {
+        let mut hooks = PostMock::default();
+        let mut state = CaPostAttackTrackerState::default();
+        pa_attacked(&hooks, &mut state, 5, 1000);
+        pa_attacked(&hooks, &mut state, 6, 1000);
+
+        // an explosion sound confirms the attacked crystal
+        pa_packet_listener(
+            &mut hooks,
+            &mut state,
+            &CaPostAttackPacket::SoundExplode { id: 5 },
+        );
+        assert_eq!(hooks.confirmed, vec![5]);
+        assert_eq!(state.attacked_ids, vec![(6, 1000)]);
+
+        // an unknown id is not confirmed
+        pa_packet_listener(
+            &mut hooks,
+            &mut state,
+            &CaPostAttackPacket::SoundExplode { id: 99 },
+        );
+        assert_eq!(hooks.confirmed, vec![5]);
+
+        // a remove packet confirms each tracked id
+        pa_packet_listener(
+            &mut hooks,
+            &mut state,
+            &CaPostAttackPacket::RemoveEntities {
+                entity_ids: vec![6, 99],
+            },
+        );
+        assert_eq!(hooks.confirmed, vec![5, 6]);
+        assert!(state.attacked_ids.is_empty());
+    }
+
+    #[test]
+    fn pa_on_toggle_clears_and_calls_cleared() {
+        let mut hooks = PostMock::default();
+        let mut state = CaPostAttackTrackerState::default();
+        state.attacked_ids = vec![(3, 1000)];
+
+        pa_on_toggle(&mut hooks, &mut state);
+        assert!(state.attacked_ids.is_empty());
+        assert_eq!(hooks.cleared, 1);
+    }
+
+    #[test]
+    fn pa_speed_debugger_counts_and_purges_cps() {
+        let mut hooks = PostMock::default();
+        let mut state = CaSpeedDebuggerState::default();
+
+        pa_speed_debugger_confirmed(&mut state, 1000);
+        pa_speed_debugger_confirmed(&mut state, 1500);
+        pa_speed_debugger_tick(&mut hooks, &mut state, 1800);
+        assert_eq!(hooks.cps_reports, vec![2]);
+
+        // later ticks drop the older confirmations past the 1s window
+        pa_speed_debugger_tick(&mut hooks, &mut state, 2200);
+        assert_eq!(hooks.cps_reports, vec![2, 1]);
+
+        pa_speed_debugger_tick(&mut hooks, &mut state, 3000);
+        assert_eq!(hooks.cps_reports.last(), Some(&0));
+
+        pa_speed_debugger_cleared(&mut state);
+        assert!(state.cps.is_empty());
+    }
+
+    #[test]
+    fn pa_speed_debugger_tick_gates_on_running() {
+        let mut hooks = PostMock::default();
+        hooks.running = false;
+        let mut state = CaSpeedDebuggerState::default();
+        pa_speed_debugger_confirmed(&mut state, 1000);
+
+        pa_speed_debugger_tick(&mut hooks, &mut state, 5000);
+        assert!(hooks.cps_reports.is_empty());
+        assert_eq!(state.cps.len(), 1, "no purge while not running");
+    }
+
+    #[test]
+    fn pa_set_dead_attacked_tracks_and_removes_the_crystal() {
+        let mut hooks = PostMock::default();
+        hooks.entities.insert(5, crystal(5, (2.0, 65.0, 0.0)).1);
+        // an entity that is not a crystal
+        hooks.entities.insert(
+            6,
+            CaTrackedEntity {
+                is_end_crystal: false,
+                position: (2.0, 65.0, 0.0),
+            },
+        );
+        let mut tracker = CaPostAttackTrackerState::default();
+        let mut state = CaSetDeadState::default();
+
+        pa_set_dead_attacked(&mut hooks, &mut tracker, &mut state, 5, 1000);
+        assert_eq!(tracker.attacked_ids, vec![(5, 1000)]);
+        assert_eq!(hooks.removed, vec![5]);
+        assert_eq!(state.entities, vec![5]);
+        assert_eq!(hooks.executed, 1);
+
+        // a non-crystal entity is left alone
+        pa_set_dead_attacked(&mut hooks, &mut tracker, &mut state, 6, 1000);
+        assert_eq!(hooks.removed, vec![5]);
+        assert_eq!(state.entities, vec![5]);
+
+        // gated on running
+        hooks.running = false;
+        pa_set_dead_attacked(&mut hooks, &mut tracker, &mut state, 7, 1000);
+        assert_eq!(hooks.executed, 2, "running check runs before mc.execute");
+        assert_eq!(state.entities, vec![5]);
+    }
+
+    #[test]
+    fn pa_set_dead_timed_out_restores_the_crystal() {
+        let mut hooks = PostMock::default();
+        let mut state = CaSetDeadState::default();
+        state.entities = vec![5];
+
+        // the crystal is still absent from the world: restore it
+        pa_set_dead_timed_out(&mut hooks, &mut state, 5);
+        assert_eq!(hooks.restored, vec![5]);
+        assert!(state.entities.is_empty());
+
+        // an unknown id: nothing happens
+        pa_set_dead_timed_out(&mut hooks, &mut state, 9);
+        assert_eq!(hooks.restored, vec![5]);
+
+        // the crystal already came back: no restore
+        let mut hooks = PostMock::default();
+        hooks.world_entities = vec![5];
+        let mut state = CaSetDeadState::default();
+        state.entities = vec![5];
+        pa_set_dead_timed_out(&mut hooks, &mut state, 5);
+        assert!(hooks.restored.is_empty());
+
+        // no current world: no restore
+        let mut hooks = PostMock::default();
+        hooks.current_world = false;
+        let mut state = CaSetDeadState::default();
+        state.entities = vec![5];
+        pa_set_dead_timed_out(&mut hooks, &mut state, 5);
+        assert!(hooks.restored.is_empty());
+        assert!(state.entities.is_empty(), "the tracking is dropped");
+
+        // the tracked world changed: no restore
+        let mut hooks = PostMock::default();
+        hooks.tracked_world_current = false;
+        let mut state = CaSetDeadState::default();
+        state.entities = vec![5];
+        pa_set_dead_timed_out(&mut hooks, &mut state, 5);
+        assert!(hooks.restored.is_empty());
+    }
+
+    #[test]
+    fn pa_set_dead_cleared_restores_absent_crystals() {
+        let mut hooks = PostMock::default();
+        // crystal 6 already came back on its own
+        hooks.world_entities = vec![6];
+        let mut state = CaSetDeadState::default();
+        state.entities = vec![5, 6];
+
+        pa_set_dead_cleared(&mut hooks, &mut state);
+        assert_eq!(hooks.restored, vec![5]);
+        assert!(state.entities.is_empty());
+
+        // no current world: just drop the tracking
+        let mut hooks = PostMock::default();
+        hooks.current_world = false;
+        let mut state = CaSetDeadState::default();
+        state.entities = vec![5, 6];
+        pa_set_dead_cleared(&mut hooks, &mut state);
+        assert!(hooks.restored.is_empty());
+        assert!(state.entities.is_empty());
+    }
+
+    #[test]
+    fn pa_set_dead_timeout_follows_confirm_time() {
+        let mut hooks = PostMock::default();
+        let mut tracker = CaPostAttackTrackerState::default();
+        let mut state = CaSetDeadState::default();
+        hooks.entities.insert(5, crystal(5, (2.0, 65.0, 0.0)).1);
+        state.confirm_time_ms = 150;
+        hooks.time_out = pa_set_dead_time_out_after(&state);
+        assert_eq!(hooks.time_out, 150);
+
+        pa_set_dead_attacked(&mut hooks, &mut tracker, &mut state, 5, 1000);
+        // 150 ms later the attack times out and the crystal is restored
+        pa_repeatable_tick(&mut hooks, &mut tracker, 1200);
+        assert_eq!(hooks.timed_out, vec![5]);
+        assert!(tracker.attacked_ids.is_empty());
     }
 }

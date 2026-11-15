@@ -12687,3 +12687,1859 @@ mod spear_kill_tests {
         );
     }
 }
+
+// ----- clicking/ClickPlan.kt + ClickTiming.kt + ConstantClickTiming.kt + HumanClickTiming.kt + ItemCooldown.kt + Clicker.kt (GPL-3.0, (c) 2015-2026 CCBlueX) -----
+//
+// The click scheduler under AutoClicker and TriggerBot. Presses are planned in
+// milliseconds and batched into ticks the way `Minecraft.handleKeybinds`
+// drains every click queued since the previous tick.
+
+/// Upstream `java.util.Random` (the JDK 48-bit LCG plus the Box-Muller
+/// gaussian), ported so the click timing draws the same stream a Java run
+/// would.
+#[derive(Clone, Debug)]
+pub struct JdkRandom {
+    seed: u64,
+    have_next_next_gaussian: bool,
+    next_next_gaussian: f64,
+}
+
+impl JdkRandom {
+    pub fn new(seed: u64) -> Self {
+        // Upstream constructor scrambles the seed once.
+        let seed = (seed ^ 0x5DEECE66D) & ((1u64 << 48) - 1);
+        JdkRandom { seed, have_next_next_gaussian: false, next_next_gaussian: 0.0 }
+    }
+
+    fn next_bits(&mut self, bits: u32) -> i64 {
+        self.seed = self
+            .seed
+            .wrapping_mul(0x5DEECE66D)
+            .wrapping_add(0xB)
+            & ((1u64 << 48) - 1);
+        let raw = (self.seed >> (48 - bits)) as i64;
+        if bits < 32 {
+            (raw << (32 - bits)) >> (32 - bits)
+        } else {
+            raw
+        }
+    }
+
+    pub fn next_double(&mut self) -> f64 {
+        ((self.next_bits(26) as f64) * 134217728.0 + self.next_bits(27) as f64)
+            / 9007199254740992.0
+    }
+
+    pub fn next_gaussian(&mut self) -> f64 {
+        if self.have_next_next_gaussian {
+            self.have_next_next_gaussian = false;
+            return self.next_next_gaussian;
+        }
+        loop {
+            let v1 = 2.0 * self.next_double() - 1.0;
+            let v2 = 2.0 * self.next_double() - 1.0;
+            let s = v1 * v1 + v2 * v2;
+            if s >= 1.0 || s == 0.0 {
+                continue;
+            }
+            let multiplier = (-2.0 * s.ln() / s).sqrt();
+            self.next_next_gaussian = v2 * multiplier;
+            self.have_next_next_gaussian = true;
+            return v1 * multiplier;
+        }
+    }
+}
+
+/// Upstream `ClickTechnique`.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum ClickTechnique {
+    Human,
+    /// Evenly spaced at the top of the CPS range, for anticheats that only
+    /// look at the time since the last attack.
+    Constant,
+}
+
+/// Upstream `ClickTiming`: source of the time between two presses.
+pub trait ClickTiming {
+    /// `recent`: intervals of the current combo in ms, oldest first;
+    /// `combo_ms`: time from the combo start to the press the interval starts
+    /// at. Returns ms until the next press.
+    fn next_interval(
+        &mut self,
+        recent: &[i64],
+        combo_ms: i64,
+        cps: (i64, i64),
+        random: &mut JdkRandom,
+    ) -> i64;
+}
+
+/// Upstream `ConstantClickTiming`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ConstantClickTiming;
+
+impl ClickTiming for ConstantClickTiming {
+    fn next_interval(
+        &mut self,
+        _recent: &[i64],
+        _combo_ms: i64,
+        cps: (i64, i64),
+        _random: &mut JdkRandom,
+    ) -> i64 {
+        (1000.0 / cps.1 as f64).round() as i64
+    }
+}
+
+const HUMAN_SIGMA: f64 = 0.45;
+const MIN_INTERVAL_MS: i64 = 10;
+const MAX_INTERVAL_MS: i64 = 1000;
+
+/// Upstream `HumanClickTiming`: log-normal intervals around a CPS drawn once
+/// per combo.
+#[derive(Clone, Debug, Default)]
+pub struct HumanClickTiming {
+    combo_cps: f64,
+    range: Option<(i64, i64)>,
+}
+
+impl ClickTiming for HumanClickTiming {
+    fn next_interval(
+        &mut self,
+        _recent: &[i64],
+        combo_ms: i64,
+        cps: (i64, i64),
+        random: &mut JdkRandom,
+    ) -> i64 {
+        if combo_ms == 0 || Some(cps) != self.range {
+            self.combo_cps = cps.0 as f64 + random.next_double() * (cps.1 - cps.0) as f64;
+            self.range = Some(cps);
+        }
+
+        // mu shifted by -sigma^2/2 so the mean interval, not the median, lands on the target CPS
+        let mu = (1000.0 / self.combo_cps).ln() - HUMAN_SIGMA * HUMAN_SIGMA / 2.0;
+        ((mu + HUMAN_SIGMA * random.next_gaussian())
+            .exp()
+            .round() as i64)
+            .clamp(MIN_INTERVAL_MS, MAX_INTERVAL_MS)
+    }
+}
+
+pub const CLICK_PLAN_TICK_MS: i64 = 50;
+const CLICK_PLAN_HORIZON_MS: i64 = 1000;
+const CLICK_PLAN_IDLE_MS: i64 = 250;
+const CLICK_PLAN_HISTORY: usize = 32;
+const CLICK_PLAN_NONE: i64 = i64::MIN;
+
+/// Upstream `ClickPlan`: press timestamps planned ahead in milliseconds and
+/// batched into ticks. Tick `n` consumes the presses in
+/// `(tickTime + (n - 1) * 50, tickTime + n * 50]`, so `clicks_at` is what that
+/// tick will consume.
+pub struct ClickPlan {
+    /// Upstream `Clicker`'s timing closure, which picks the technique each
+    /// call. Pushed by `Clicker.tick` each game tick.
+    pub technique: ClickTechnique,
+    /// Upstream `HumanClickTiming` instance owned by Clicker.
+    human: HumanClickTiming,
+    random: JdkRandom,
+    cps: (i64, i64),
+    max_per_tick: i32,
+    /// Upstream `enforced: IntPredicate`; rebuilt by `Clicker.tick` each game
+    /// tick over the cooldown seams.
+    pub enforced: Option<Box<dyn Fn(i32) -> bool>>,
+    pub tick_time: i64,
+    times: Vec<i64>,
+    intervals: Vec<i64>,
+    next: usize,
+    combo_start: i64,
+    due: i32,
+    consumed: i32,
+    idle_since: i64,
+}
+
+impl ClickPlan {
+    pub fn new(seed: u64) -> Self {
+        ClickPlan {
+            technique: ClickTechnique::Human,
+            human: HumanClickTiming::default(),
+            random: JdkRandom::new(seed),
+            cps: (11, 14),
+            max_per_tick: 2,
+            enforced: None,
+            tick_time: 0,
+            times: Vec::new(),
+            intervals: Vec::new(),
+            next: 0,
+            combo_start: 0,
+            due: 0,
+            consumed: 0,
+            idle_since: CLICK_PLAN_NONE,
+        }
+    }
+
+    /// Upstream `cps` setter: a change replans.
+    pub fn set_cps(&mut self, cps: (i64, i64)) {
+        if self.cps != cps {
+            self.cps = cps;
+            self.replan();
+        }
+    }
+
+    /// Upstream `maxPerTick` setter: a change replans.
+    pub fn set_max_per_tick(&mut self, max_per_tick: i32) {
+        if self.max_per_tick != max_per_tick {
+            self.max_per_tick = max_per_tick;
+            self.replan();
+        }
+    }
+
+    /// Upstream `comboMs`.
+    pub fn combo_ms(&self) -> i64 {
+        self.tick_time - self.combo_start
+    }
+
+    /// Upstream `reset(now)`: starts a new combo with a press at `now`.
+    pub fn reset(&mut self, now: i64) {
+        self.times.clear();
+        self.intervals.clear();
+        self.next = 0;
+        self.due = 0;
+        self.consumed = 0;
+        self.idle_since = CLICK_PLAN_NONE;
+        self.combo_start = now;
+        self.tick_time = now - CLICK_PLAN_TICK_MS;
+        self.times.push(now);
+    }
+
+    /// Upstream `tick(now)`: advances to the next tick and consumes the
+    /// presses due at `now`. Presses nobody used for a while, or a gap in
+    /// ticks, end the combo.
+    pub fn tick(&mut self, now: i64) {
+        if self.consumed > 0 {
+            self.idle_since = CLICK_PLAN_NONE;
+        } else if self.due > 0 && self.idle_since == CLICK_PLAN_NONE {
+            self.idle_since = self.tick_time;
+        }
+
+        if self.times.is_empty()
+            || now - self.tick_time > CLICK_PLAN_IDLE_MS
+            || (self.idle_since != CLICK_PLAN_NONE && now - self.idle_since > CLICK_PLAN_IDLE_MS)
+        {
+            self.reset(now);
+        }
+
+        // Stay on the 50 ms grid so lookahead matches consumption, unless the real tick drifted off it
+        let expected = self.tick_time + CLICK_PLAN_TICK_MS;
+        self.tick_time = if (now - expected).abs() > CLICK_PLAN_TICK_MS {
+            now
+        } else {
+            expected
+        };
+
+        self.plan_until(self.tick_time + CLICK_PLAN_HORIZON_MS);
+        let mut count = 0;
+        while self.next < self.times.len() && self.times[self.next] <= self.tick_time {
+            self.next += 1;
+            count += 1;
+        }
+        self.due = count.min(self.max_per_tick);
+        self.consumed = 0;
+        self.trim();
+    }
+
+    /// Upstream `clicksAt(tick)`: presses consumed by the tick `tick` ticks
+    /// from now.
+    pub fn clicks_at(&mut self, tick: i32) -> i32 {
+        let planned = if tick <= 0 { self.due } else { self.planned_at(tick) };
+        if planned == 0 {
+            if let Some(enforced) = &self.enforced {
+                if enforced(tick.max(0)) {
+                    return 1;
+                }
+            }
+        }
+        planned
+    }
+
+    fn planned_at(&mut self, tick: i32) -> i32 {
+        let from = self.tick_time + (tick as i64 - 1) * CLICK_PLAN_TICK_MS;
+        let to = from + CLICK_PLAN_TICK_MS;
+        self.plan_until(to);
+        let mut count = 0;
+        for i in self.next..self.times.len() {
+            let time = self.times[i];
+            if time > to {
+                break;
+            }
+            if time > from {
+                count += 1;
+            }
+        }
+        (count as i32).min(self.max_per_tick)
+    }
+
+    /// Upstream `take()` (`@PublishedApi internal`): a press is available this
+    /// tick.
+    pub fn take(&mut self) -> bool {
+        if self.consumed >= self.clicks_at(0) {
+            return false;
+        }
+        self.consumed += 1;
+        true
+    }
+
+    /// Upstream `consume(gate, block)`: uses up the presses of the current
+    /// tick; a press failing `gate` is dropped, as vanilla drops presses while
+    /// `missTime` is set. `Clicker.click` inlines this loop so the gate and
+    /// the success side effects can touch the clicker's own state.
+    pub fn consume(&mut self, gate: &mut dyn FnMut() -> bool, block: &mut dyn FnMut() -> bool) -> i32 {
+        let mut clicks = 0;
+        while self.take() {
+            if gate() && block() {
+                clicks += 1;
+            }
+        }
+        clicks
+    }
+
+    /// Upstream `pressedByPlayer()`: the player pressed the key. The press
+    /// takes the place of our next planned one, so the presses keep our rhythm
+    /// and CPS instead of adding up.
+    pub fn pressed_by_player(&mut self) {
+        if self.next >= self.times.len() {
+            return;
+        }
+
+        let interval = self.intervals.len() as i64 - (self.times.len() - self.next) as i64;
+        if interval >= 0 {
+            self.intervals.remove(interval as usize);
+        }
+        self.times.remove(self.next);
+    }
+
+    /// Upstream `pressedBy(leader, time)`: another clicker on the same key
+    /// pressed at `time`. It counts as one of this tick's presses, and the
+    /// presses after it follow the plan of `leader`: drawing our own would
+    /// race it, and the earlier of two random presses comes faster than either
+    /// plan's CPS.
+    pub fn pressed_by(&mut self, leader: &ClickPlan, time: i64) {
+        if self.times.is_empty() {
+            return;
+        }
+
+        if self.consumed < self.due {
+            self.consumed += 1;
+        }
+
+        self.replan();
+        if time >= *self.times.last().expect("click plan has a combo press") {
+            self.append(time);
+        }
+        self.next = self.times.len();
+
+        for &planned in &leader.times[leader.next..] {
+            if planned > time {
+                self.append(planned);
+            }
+        }
+    }
+
+    /// Upstream `replan()`: drops the presses planned after this tick, so they
+    /// are planned again with changed settings.
+    fn replan(&mut self) {
+        let keep = (self.next as i64).max(1) as usize;
+        if self.times.len() <= keep {
+            return;
+        }
+        let dropped = self.times.len() - keep;
+        self.times.truncate(keep);
+        let keep_intervals = self.intervals.len().saturating_sub(dropped);
+        self.intervals.truncate(keep_intervals);
+    }
+
+    fn plan_until(&mut self, time: i64) {
+        while *self.times.last().expect("click plan has a combo press") <= time {
+            self.plan_next();
+        }
+    }
+
+    fn plan_next(&mut self) {
+        let last = *self.times.last().expect("click plan has a combo press");
+        let interval = match self.technique {
+            ClickTechnique::Human => {
+                self.human
+                    .next_interval(&self.intervals, last - self.combo_start, self.cps, &mut self.random)
+            }
+            ClickTechnique::Constant => {
+                ConstantClickTiming
+                    .next_interval(&self.intervals, last - self.combo_start, self.cps, &mut self.random)
+            }
+        };
+        let mut time = last + interval;
+        if self.times.len() >= self.max_per_tick as usize {
+            time = time.max(self.times[self.times.len() - self.max_per_tick as usize] + CLICK_PLAN_TICK_MS);
+        }
+
+        self.append(time);
+    }
+
+    fn append(&mut self, time: i64) {
+        self.intervals.push(time - *self.times.last().expect("click plan has a combo press"));
+        if self.intervals.len() > CLICK_PLAN_HISTORY {
+            self.intervals.remove(0);
+        }
+        self.times.push(time);
+    }
+
+    fn trim(&mut self) {
+        let excess = self.next as i64 - CLICK_PLAN_HISTORY as i64;
+        if excess > 0 {
+            self.times.drain(0..excess as usize);
+            self.next -= excess as usize;
+        }
+    }
+}
+
+/// Upstream `ItemCooldown` (ValueGroup "ItemCooldown", aliases "Cooldown"),
+/// flattened: the `Minimum` floatRange lands on the parent Clicker's settings
+/// and the cooldown progress is the engine seam.
+pub struct ItemCooldown {
+    pub next_cooldown: f64,
+    /// Upstream `CombatManager.attackCooldownProgress(baseTime)` (the server's
+    /// view of `Player.getAttackStrengthScale`), engine seam.
+    pub attack_cooldown_progress: std::sync::Arc<dyn Fn(i32) -> f64>,
+}
+
+impl ItemCooldown {
+    /// Upstream `isCooldownPassed(ticks)`.
+    pub fn is_cooldown_passed(&self, ticks: i32) -> bool {
+        (self.attack_cooldown_progress)(ticks) >= self.next_cooldown
+    }
+}
+
+pub const CLICKER_TICKS_AHEAD: i32 = 20;
+
+/// Upstream `Clicker` (an attack scheduler): presses are planned by a
+/// `ClickTiming` and batched into ticks by a `ClickPlan`, so future clicks can
+/// be predicted. Settings read the parent module under `prefix`.
+pub struct Clicker {
+    /// Upstream key binding identity: 0 = keyAttack, 1 = keyUse.
+    pub key: u8,
+    /// Upstream `keyBinding == mc.options.keyAttack`, which selects
+    /// MissCooldown and the simulate-attack-key-down handler.
+    pub is_attack_key: bool,
+    /// Setting-name prefix inside the parent module ("Attack"/"Use" for the
+    /// AutoClicker groups, empty for TriggerBot's own clicker).
+    pub prefix: &'static str,
+    /// Upstream `simulateAttackKeyDown`.
+    pub simulate_attack_key_down: bool,
+    /// Upstream `mc.missTime`, refreshed by the engine each tick.
+    pub miss_time: i32,
+    /// Upstream `player.hasCooldown`, refreshed by the engine each tick.
+    pub player_has_cooldown: bool,
+    /// Upstream `itemCooldown`: None mirrors `itemCooldown = null`.
+    pub item_cooldown: Option<ItemCooldown>,
+    /// Upstream `CombatManager.attackCooldownProgress(baseTime)`, engine seam.
+    pub attack_cooldown_progress: std::sync::Arc<dyn Fn(i32) -> f64>,
+    pub plan: ClickPlan,
+    /// Upstream `clickAmount`: clicks executed by `click` in the current tick.
+    pub click_amount: Option<i32>,
+    pub ticks_since_last_click: i32,
+    /// Upstream ValueGroup `running`.
+    pub running: bool,
+}
+
+impl Clicker {
+    #[allow(clippy::too_many_arguments, unused_variables)]
+    pub fn new(
+        key: u8,
+        is_attack_key: bool,
+        prefix: &'static str,
+        simulate_attack_key_down: bool,
+        max_cps: i64,
+        seed: u64,
+        with_item_cooldown: bool,
+        attack_cooldown_progress: std::sync::Arc<dyn Fn(i32) -> f64>,
+    ) -> Self {
+        Clicker {
+            key,
+            is_attack_key,
+            prefix,
+            simulate_attack_key_down,
+            miss_time: 0,
+            player_has_cooldown: false,
+            item_cooldown: if with_item_cooldown {
+                Some(ItemCooldown { next_cooldown: 1.0, attack_cooldown_progress: std::sync::Arc::clone(&attack_cooldown_progress) })
+            } else {
+                None
+            },
+            attack_cooldown_progress,
+            plan: ClickPlan::new(seed),
+            click_amount: None,
+            ticks_since_last_click: 0,
+            running: false,
+        }
+    }
+
+    fn prefixed(&self, name: &str) -> String {
+        format!("{}{}", self.prefix, name)
+    }
+
+    pub fn technique(&self, module: &Module) -> ClickTechnique {
+        match module.setting(&self.prefixed("Technique")).and_then(|v| v.kind.choice()) {
+            Some("Constant") => ClickTechnique::Constant,
+            _ => ClickTechnique::Human,
+        }
+    }
+
+    pub fn cps(&self, module: &Module) -> (i64, i64) {
+        tb_setting_int_range(module, &self.prefixed("CPS"), (11, 14))
+    }
+
+    pub fn max_per_tick(&self, module: &Module) -> i32 {
+        tb_setting_i64(module, &self.prefixed("MaxPerTick"), 2) as i32
+    }
+
+    fn miss_cooldown(&self, module: &Module) -> bool {
+        tb_setting_bool(module, &self.prefixed("MissCooldown"), true)
+    }
+
+    /// Upstream `passesMissCooldown`.
+    fn passes_miss_cooldown(&self, module: &Module) -> bool {
+        !(self.is_attack_key && self.miss_cooldown(module) && self.miss_time > 0)
+    }
+
+    /// Upstream `isClickTick`.
+    pub fn is_click_tick(&mut self) -> bool {
+        self.will_click_at(0)
+    }
+
+    /// Upstream `ticksUntilClick`.
+    pub fn ticks_until_click(&mut self) -> i32 {
+        for tick in 0..CLICKER_TICKS_AHEAD {
+            if self.plan.clicks_at(tick) > 0 {
+                return tick;
+            }
+        }
+        CLICKER_TICKS_AHEAD
+    }
+
+    /// Upstream `willClickAt(tick)`.
+    pub fn will_click_at(&mut self, tick: i32) -> bool {
+        self.plan.clicks_at(tick) > 0
+    }
+
+    /// Upstream `getClickAmount(tick)`.
+    pub fn get_click_amount(&mut self, tick: i32) -> i32 {
+        self.plan.clicks_at(tick)
+    }
+
+    /// Upstream `simulateAttackKeyDown`'s `KeybindIsPressedEvent` handler:
+    /// simulate the click so the game handles the logic as if we clicked.
+    pub fn simulated_key_is_pressed(&self) -> bool {
+        self.click_amount.map_or(false, |clicks| clicks > 0)
+    }
+
+    /// Upstream `gameHandler` (FIRST_PRIORITY): per-tick plan maintenance.
+    pub fn tick(&mut self, module: &Module, now_ms: i64) {
+        self.ticks_since_last_click += 1;
+        self.click_amount = None;
+
+        self.plan.technique = self.technique(module);
+        self.plan.set_cps(self.cps(module));
+        self.plan.set_max_per_tick(self.max_per_tick(module));
+
+        // Once, on the tick the cooldown fills up; one that is always ready would otherwise click every tick
+        let progress = std::sync::Arc::clone(&self.attack_cooldown_progress);
+        let has_cooldown = self.player_has_cooldown;
+        let item_cooldown_next = self.item_cooldown.as_ref().map(|c| c.next_cooldown);
+        self.plan.enforced = Some(Box::new(move |tick: i32| {
+            if !has_cooldown {
+                return false;
+            }
+            let Some(next) = item_cooldown_next else {
+                return false;
+            };
+            progress(tick) >= next && !(progress(tick - 1) >= next)
+        }));
+
+        self.plan.tick(now_ms);
+    }
+
+    /// Upstream `click(block)`: uses the presses of this tick. If the cooldown
+    /// is not passed, the press is dropped. `block` should return true if the
+    /// click was successful; otherwise it will not count as a click.
+    /// `press_others` is upstream `pressedForOthers`, wired by the engine's
+    /// per-key clicker registry (`ClickerGroup.click`).
+    pub fn click(
+        &mut self,
+        module: &Module,
+        now_ms: i64,
+        block: &mut dyn FnMut() -> bool,
+        mut press_others: Option<&mut dyn FnMut(&ClickPlan, i64)>,
+    ) -> i32 {
+        let mut clicks = 0;
+        while self.plan.take() {
+            let gate = self.passes_miss_cooldown(module)
+                && self.item_cooldown.as_ref().map(|c| c.is_cooldown_passed(0)) != Some(false);
+            if gate && block() {
+                if let Some(_cooldown) = self.item_cooldown.as_ref() {
+                    // Upstream `itemCooldown?.newCooldown()` draws
+                    // `minimumCooldown.random()` from the module's range.
+                    let (min, max) = tb_setting_float_range(
+                        module,
+                        &self.prefixed("ItemCooldownMinimum"),
+                        (1.0, 1.0),
+                    );
+                    let next = min + self.plan.random.next_double() * (max - min);
+                    self.item_cooldown.as_mut().unwrap().next_cooldown = next;
+                }
+                self.ticks_since_last_click = 0;
+                if let Some(press) = press_others.as_deref_mut() {
+                    press(&self.plan, now_ms);
+                }
+                clicks += 1;
+            }
+        }
+
+        self.click_amount = Some(self.click_amount.unwrap_or(0) + clicks);
+        clicks
+    }
+}
+
+/// Upstream `Clicker.clickers` companion registry: clickers grouped by key
+/// binding, so presses on the same key by the player or other clickers count
+/// as ours instead of adding up.
+pub struct ClickerGroup {
+    pub clickers: Vec<Clicker>,
+}
+
+impl ClickerGroup {
+    pub fn new(clickers: Vec<Clicker>) -> Self {
+        ClickerGroup { clickers }
+    }
+
+    /// Upstream `onPlayerPress` via the mouse/keyboard handlers: Minecraft
+    /// only clicks keys while no screen is open.
+    pub fn on_player_press(&mut self, key: u8, pressed: bool, screen_open: bool) {
+        if !pressed || screen_open {
+            return;
+        }
+        for clicker in self.clickers.iter_mut() {
+            if clicker.key == key {
+                clicker.plan.pressed_by_player();
+            }
+        }
+    }
+
+    /// Upstream per-clicker `gameHandler`s.
+    pub fn tick(&mut self, module: &Module, now_ms: i64) {
+        for clicker in self.clickers.iter_mut() {
+            clicker.tick(module, now_ms);
+        }
+    }
+
+    /// Upstream `click(block)` for clicker `index`, including
+    /// `pressedForOthers`: other running clickers on the same key take the
+    /// leader's presses instead of drawing their own.
+    pub fn click(
+        &mut self,
+        index: usize,
+        module: &Module,
+        now_ms: i64,
+        block: &mut dyn FnMut() -> bool,
+    ) -> i32 {
+        let key = self.clickers[index].key;
+        let other_running: Vec<bool> = self
+            .clickers
+            .iter()
+            .enumerate()
+            .map(|(j, c)| j != index && c.key == key && c.running)
+            .collect();
+        let (head, rest) = self.clickers.split_at_mut(index);
+        let (leader_slot, tail) = rest.split_at_mut(1);
+        let mut others: Vec<&mut Clicker> = Vec::new();
+        for (j, clicker) in head.iter_mut().enumerate() {
+            if other_running[j] {
+                others.push(clicker);
+            }
+        }
+        for (j, clicker) in tail.iter_mut().enumerate() {
+            if other_running[index + 1 + j] {
+                others.push(clicker);
+            }
+        }
+        let leader = &mut leader_slot[0];
+        let mut press_others = |plan: &ClickPlan, t: i64| {
+            for other in others.iter_mut() {
+                other.plan.pressed_by(plan, t);
+            }
+        };
+        leader.click(module, now_ms, block, Some(&mut press_others))
+    }
+}
+
+fn tb_setting_str(module: &Module, name: &str, default: &str) -> String {
+    module
+        .setting(name)
+        .and_then(|v| v.kind.choice())
+        .unwrap_or(default)
+        .to_string()
+}
+
+fn tb_setting_int_range(module: &Module, name: &str, default: (i64, i64)) -> (i64, i64) {
+    module.setting(name).and_then(|v| v.kind.int_range()).unwrap_or(default)
+}
+
+fn tb_setting_float_range(module: &Module, name: &str, default: (f64, f64)) -> (f64, f64) {
+    module.setting(name).and_then(|v| v.kind.float_range()).unwrap_or(default)
+}
+
+fn tb_setting_items(module: &Module, name: &str) -> Vec<String> {
+    module.setting(name).and_then(|v| v.kind.items()).map(|items| items.to_vec()).unwrap_or_default()
+}
+
+// ----- combat/autoclicker/CrosshairAttacker.kt (GPL-3.0, (c) 2015-2026 CCBlueX) -----
+
+/// Upstream `CriticalsSelectionMode` (ModuleCriticals.kt): how the attacker
+/// treats critical hits.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum CriticalsSelectionMode {
+    Smart,
+    Ignore,
+    Always,
+}
+
+impl CriticalsSelectionMode {
+    pub fn from_tag(tag: &str) -> Self {
+        match tag {
+            "Ignore" => CriticalsSelectionMode::Ignore,
+            "Always" => CriticalsSelectionMode::Always,
+            _ => CriticalsSelectionMode::Smart,
+        }
+    }
+
+    /// Upstream `isCriticalHit()`: whether the next click will be (or counts
+    /// as) a critical hit. The Criticals module state arrives as the two
+    /// seams: `shouldWaitForCrit(ignoreState)` and `wouldDoCriticalHit()`.
+    pub fn is_critical_hit(
+        &self,
+        should_wait_for_crit: &dyn Fn(bool) -> bool,
+        would_do_critical_hit: &dyn Fn() -> bool,
+    ) -> bool {
+        match self {
+            CriticalsSelectionMode::Ignore => true,
+            CriticalsSelectionMode::Smart => !should_wait_for_crit(true),
+            CriticalsSelectionMode::Always => would_do_critical_hit(),
+        }
+    }
+
+    /// Upstream `shouldStopSprinting(clicker, target)`.
+    pub fn should_stop_sprinting(
+        &self,
+        player_on_ground: bool,
+        target_is_some: bool,
+        clicker_will_click_at_1: bool,
+    ) -> bool {
+        // If we don't care about critical hits we don't have to stop sprinting.
+        if *self == CriticalsSelectionMode::Ignore {
+            return false;
+        }
+
+        // On ground, we cannot do critical hits anyway.
+        if player_on_ground {
+            return false;
+        }
+
+        // If we are about to do a critical hit, we should stop sprinting.
+        target_is_some && clicker_will_click_at_1
+    }
+}
+
+/// Upstream `Use` (CrosshairAttacker's OnItemUse setting).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum CrosshairUse {
+    Wait,
+    Stop,
+    Ignore,
+}
+
+/// The engine inputs and actions CrosshairAttacker's `attack()` reads and
+/// performs.
+pub struct CrosshairAttackerDeps<'a> {
+    /// Upstream `mc.hitResult`: `Some(entity id)` on an entity hit, None
+    /// otherwise.
+    pub crosshair_entity: Option<u64>,
+    /// Upstream `crosshair.entity.shouldBeAttacked()` (TriggerBot's
+    /// wantsToAttack), engine seam.
+    pub crosshair_should_be_attacked: bool,
+    pub player_is_using_item: bool,
+    pub now_ms: i64,
+    /// Upstream `weapon.matchesAny(player.mainHandItem)`, engine seam given
+    /// the module's Weapon multi-choice tags.
+    pub weapon_matches: Box<dyn Fn(&[String]) -> bool + 'a>,
+    /// Upstream `ModuleCriticals.CriticalsSelectionMode`'s seams.
+    pub should_wait_for_crit: Box<dyn Fn(bool) -> bool + 'a>,
+    pub would_do_critical_hit: Box<dyn Fn() -> bool + 'a>,
+    /// Upstream `ModuleAutoWeapon.onTarget(entity)`.
+    pub on_target: Box<dyn FnMut(u64) + 'a>,
+    /// Upstream `interaction.releaseUsingItem(player)`.
+    pub release_using_item: Box<dyn FnMut() + 'a>,
+    /// Upstream the click block: `KeyMapping.click(mc.options.keyAttack.key)`.
+    pub press_attack_key: Box<dyn FnMut() -> bool + 'a>,
+}
+
+/// Upstream `CrosshairAttacker<T>`: clicks the attack key on the crosshair
+/// target for AutoClicker and TriggerBot. Its settings are added to `parent`,
+/// after the ones `parent` declared before creating it.
+pub struct CrosshairAttacker {
+    /// Setting-name prefix inside the parent module ("Attack" for the
+    /// AutoClicker group, empty for TriggerBot's own attacker).
+    prefix: &'static str,
+    /// Upstream `tickUntil { !player.isUsingItem }` in flight.
+    waiting_item_use: bool,
+    /// Upstream `waitTicks(delayPostStopUse)` in flight.
+    post_stop_ticks_left: i32,
+}
+
+impl CrosshairAttacker {
+    pub fn new(prefix: &'static str) -> Self {
+        CrosshairAttacker { prefix, waiting_item_use: false, post_stop_ticks_left: 0 }
+    }
+
+    fn on_item_use(module: &Module, prefix: &str) -> CrosshairUse {
+        match tb_setting_str(module, &format!("{}OnItemUse", prefix), "Wait").as_str() {
+            "Stop" => CrosshairUse::Stop,
+            "Ignore" => CrosshairUse::Ignore,
+            _ => CrosshairUse::Wait,
+        }
+    }
+
+    fn delay_post_stop_use(module: &Module, prefix: &str) -> i32 {
+        tb_setting_i64(module, &format!("{}DelayPostStopUse", prefix), 0) as i32
+    }
+
+    fn weapon_tags(module: &Module, prefix: &str) -> Vec<String> {
+        module
+            .setting(&format!("{}Weapon", prefix))
+            .map(|v| match &v.kind {
+                crate::value::ValueKind::MultiChoice(selected, _) => selected.clone(),
+                _ => Vec::new(),
+            })
+            .unwrap_or_else(|| vec!["Any".to_string()])
+    }
+
+    /// Upstream `isAttacking`.
+    pub fn is_attacking(
+        &self,
+        module: &Module,
+        deps: &CrosshairAttackerDeps,
+        wants_to_attack: bool,
+    ) -> bool {
+        wants_to_attack && (deps.weapon_matches)(&Self::weapon_tags(module, self.prefix))
+    }
+
+    /// Upstream `attack()`: clicks as often as `clicker` plans for this tick,
+    /// unless a critical hit is still pending. Returns false when the tick
+    /// went to waiting for or stopping an item use instead.
+    ///
+    /// Suspend note: upstream suspends at `tickUntil`/`waitTicks` inside the
+    /// per-tick coroutine; the port re-enters each tick and tracks the waits
+    /// in state, so the click lands after the same total delay.
+    pub fn attack(&mut self, module: &Module, deps: &mut CrosshairAttackerDeps, clicker: &mut Clicker) -> bool {
+        // Resumed suspension: a post-stop delay from a previous tick.
+        if self.post_stop_ticks_left > 0 {
+            self.post_stop_ticks_left -= 1;
+            return false;
+        }
+
+        // Resumed suspension: tickUntil { !player.isUsingItem }.
+        if self.waiting_item_use {
+            if deps.player_is_using_item {
+                return false;
+            }
+            self.waiting_item_use = false;
+            self.post_stop_ticks_left = Self::delay_post_stop_use(module, self.prefix);
+            return false;
+        }
+
+        let crosshair_target = deps.crosshair_entity;
+        if let Some(entity) = crosshair_target {
+            (deps.on_target)(entity);
+
+            let mode = CriticalsSelectionMode::from_tag(&tb_setting_str(module, &format!("{}Criticals", self.prefix), "Smart"));
+            if !mode.is_critical_hit(&*deps.should_wait_for_crit, &*deps.would_do_critical_hit) {
+                return true;
+            }
+        }
+
+        if deps.player_is_using_item {
+            match Self::on_item_use(module, self.prefix) {
+                CrosshairUse::Wait => {
+                    self.waiting_item_use = true;
+                    return false;
+                }
+                CrosshairUse::Stop => {
+                    (deps.release_using_item)();
+                    self.post_stop_ticks_left = Self::delay_post_stop_use(module, self.prefix);
+                    return false;
+                }
+                CrosshairUse::Ignore => {}
+            }
+        }
+
+        clicker.click(module, deps.now_ms, &mut *deps.press_attack_key, None);
+        true
+    }
+}
+
+// ----- combat/autoclicker/ModuleAutoClicker.kt (GPL-3.0, (c) 2015-2026 CCBlueX) -----
+//
+// AutoClicker: clicks automatically when holding down a mouse button.
+
+pub const AUTO_CLICKER_NAME: &str = "AutoClicker";
+
+/// Upstream `SPECIAL_ITEMS_FOR_IGNORE`.
+pub const AUTO_CLICKER_SPECIAL_ITEMS_FOR_IGNORE: [&str; 9] = [
+    "minecraft:red_bed",
+    "minecraft:player_head",
+    "minecraft:compass",
+    "minecraft:emerald",
+    "minecraft:lapis_lazuli",
+    "minecraft:green_dye",
+    "minecraft:gray_dye",
+    "minecraft:pink_dye",
+    "minecraft:slime_ball",
+];
+
+/// Upstream `WeaponType` tags (utils/item/WeaponType.kt).
+pub const WEAPON_TYPE_TAGS: [&str; 10] = [
+    "Any",
+    "Sword",
+    "Axe",
+    "Mace",
+    "Spear",
+    "Pickaxe",
+    "Shovel",
+    "Hoe",
+    "Knockback",
+    "FireAspect",
+];
+
+pub fn auto_clicker() -> Module {
+    Module::new(
+        "AutoClicker",
+        COMBAT,
+        vec![
+            // tree(AttackButton): ToggleableValueGroup(this, "Attack", true)
+            boolean("Attack", true),
+            // Clicker(this, mc.options.keyAttack, simulateAttackKeyDown = true)
+            choice("AttackTechnique", "Human", &["Human", "Constant"]),
+            int_range("AttackCPS", 11, 14, 1, 30),
+            int("AttackMaxPerTick", 2, 1, 5),
+            boolean("AttackMissCooldown", true),
+            float_range("AttackItemCooldownMinimum", 1.0, 1.0, 0.0, 2.0),
+            boolean("AttackDelayOnBroken", true),
+            // enumChoice("Objective", ObjectiveType.ANY)
+            choice("AttackObjective", "Any", &["Enemy", "Entity", "Block", "Any"]),
+            // CrosshairAttacker(this, clicker) { attack && isOnObjective() }
+            choice("AttackOnItemUse", "Wait", &["Wait", "Stop", "Ignore"]),
+            multi_choice("AttackWeapon", &["Any"], &WEAPON_TYPE_TAGS),
+            choice("AttackCriticals", "Smart", &["Smart", "Ignore", "Always"]),
+            int("AttackDelayPostStopUse", 0, 0, 20),
+            // tree(UseButton): ToggleableValueGroup(this, "Use", false)
+            boolean("Use", false),
+            // Clicker(this, mc.options.keyUse, null): no ItemCooldown group.
+            choice("UseTechnique", "Human", &["Human", "Constant"]),
+            int_range("UseCPS", 11, 14, 1, 30),
+            int("UseMaxPerTick", 2, 1, 5),
+            items(
+                "UseHoldingItemsForIgnore",
+                &[
+                    "minecraft:water_bucket",
+                    "minecraft:lava_bucket",
+                    "minecraft:ender_pearl",
+                    "minecraft:ender_eye",
+                    "minecraft:player_head",
+                ],
+            ),
+            // blocks("UseBlocksForIgnore", ...): the engine registry supplies
+            // the door/fence-gate/trapdoor ids (seam); the check ports.
+            items("UseBlocksForIgnore", &[]),
+            boolean("UseDelayStart", false),
+            boolean("UseOnlyBlock", false),
+            boolean("UseRequiresNoInput", false),
+        ],
+    )
+}
+
+/// Upstream `mc.hitResult` classification.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CrosshairTarget {
+    /// `EntityHitResult` with `shouldBeAttacked()` split at the seam.
+    Entity { id: u64, should_be_attacked: bool },
+    Block,
+    None,
+}
+
+/// What a tick mutates in the engine.
+#[derive(Default, Debug, PartialEq)]
+pub struct AutoClickerOutcome {
+    pub attack_clicks: i32,
+    pub use_clicks: i32,
+}
+
+/// The engine inputs AutoClicker's tick handler reads.
+pub struct AutoClickerTickDeps<'a> {
+    /// Upstream `mc.options.keyAttack.isPressedOnAny`.
+    pub attack_pressed: bool,
+    /// Upstream `mc.options.keyUse.isPressedOnAny`.
+    pub use_pressed: bool,
+    /// Upstream `interaction.isDestroying`.
+    pub is_destroying: bool,
+    /// Upstream `mc.hitResult`.
+    pub crosshair: CrosshairTarget,
+    /// Upstream `player.mainHandItem` / `player.offhandItem` item ids.
+    pub main_hand_item: &'a str,
+    pub off_hand_item: &'a str,
+    /// Upstream `mainHandStack.customName != null`.
+    pub main_hand_custom_name: bool,
+    /// Upstream `item is BlockItem`.
+    pub main_hand_is_block_item: bool,
+    pub off_hand_is_block_item: bool,
+    /// Upstream `mc.level?.getBlockState(crosshair.blockPos)?.block` id.
+    pub crosshair_block: Option<&'a str>,
+    /// Upstream the UseButton click block:
+    /// `KeyMapping.click(mc.options.keyUse.key)`.
+    pub press_use_key: Box<dyn FnMut() -> bool + 'a>,
+    /// Upstream `System.currentTimeMillis()`.
+    pub now_ms: i64,
+}
+
+/// Upstream `ModuleAutoClicker` state.
+pub struct AutoClicker {
+    pub module: Module,
+    /// Upstream `lastFinishBreak`.
+    pub last_finish_break_ms: i64,
+    /// Upstream `UseButton.needToWait`.
+    pub need_to_wait: bool,
+    /// Upstream `waitTicks(2)` for DelayStart.
+    use_delay_ticks_left: i32,
+    pub attack_clicker: Clicker,
+    pub use_clicker: Clicker,
+    pub attacker: CrosshairAttacker,
+}
+
+impl AutoClicker {
+    pub fn new(seed: u64, attack_cooldown_progress: std::sync::Arc<dyn Fn(i32) -> f64>) -> Self {
+        AutoClicker {
+            module: auto_clicker(),
+            last_finish_break_ms: 0,
+            need_to_wait: true,
+            use_delay_ticks_left: 0,
+            attack_clicker: Clicker::new(
+                0,
+                true,
+                "Attack",
+                true,
+                30,
+                seed,
+                true,
+                std::sync::Arc::clone(&attack_cooldown_progress),
+            ),
+            use_clicker: Clicker::new(1, false, "Use", false, 30, seed ^ 0x9E3779B97F4A7C15, false, attack_cooldown_progress),
+            attacker: CrosshairAttacker::new("Attack"),
+        }
+    }
+
+    fn objective_type(&self) -> String {
+        tb_setting_str(&self.module, "AttackObjective", "Any")
+    }
+
+    /// Upstream `AttackButton.isOnObjective()`.
+    fn is_on_objective(&self, deps: &AutoClickerTickDeps) -> bool {
+        match self.objective_type().as_str() {
+            "Enemy" => matches!(&deps.crosshair, CrosshairTarget::Entity { should_be_attacked: true, .. }),
+            "Entity" => matches!(deps.crosshair, CrosshairTarget::Entity { .. }),
+            "Block" => deps.crosshair == CrosshairTarget::Block,
+            _ => true,
+        }
+    }
+
+    /// Upstream `packetHandler` for `ServerboundPlayerActionPacket`.
+    pub fn on_player_action_packet(&mut self, action: &str, now_ms: i64) {
+        if action == "STOP_DESTROY_BLOCK" {
+            self.last_finish_break_ms = now_ms;
+        }
+    }
+
+    /// Upstream `tickHandler`. `attacker_deps` wires the CrosshairAttacker
+    /// seams (criticals, AutoWeapon, the attack click itself).
+    pub fn on_tick(
+        &mut self,
+        deps: &mut AutoClickerTickDeps,
+        attacker_deps: &mut CrosshairAttackerDeps,
+    ) -> AutoClickerOutcome {
+        let mut outcome = AutoClickerOutcome::default();
+
+        // AttackButton.run
+        if tb_setting_bool(&self.module, "Attack", true) {
+            let wants_to_attack = deps.attack_pressed && self.is_on_objective(deps);
+            let attacking = self.attacker.is_attacking(&self.module, attacker_deps, wants_to_attack);
+            if attacking {
+                // Check if the player is breaking a block, if so, return
+                if !deps.is_destroying {
+                    if !(deps.now_ms - self.last_finish_break_ms < 300
+                        && tb_setting_bool(&self.module, "AttackDelayOnBroken", true))
+                    {
+                        // Upstream `if (!attacker.attack()) return@tickHandler`.
+                        if !self.attacker.attack(&self.module, attacker_deps, &mut self.attack_clicker) {
+                            return outcome;
+                        }
+                        outcome.attack_clicks = self.attack_clicker.click_amount.unwrap_or(0);
+                    }
+                }
+            }
+        }
+
+        // UseButton.run
+        if tb_setting_bool(&self.module, "Use", false) {
+            let requires_no_input = tb_setting_bool(&self.module, "UseRequiresNoInput", false);
+            if !(deps.use_pressed || requires_no_input) {
+                self.need_to_wait = true;
+            } else {
+                let holding = tb_setting_items(&self.module, "UseHoldingItemsForIgnore");
+                let blocks_ignore = tb_setting_items(&self.module, "UseBlocksForIgnore");
+                let only_block = tb_setting_bool(&self.module, "UseOnlyBlock", false);
+                let allowed = !(AUTO_CLICKER_SPECIAL_ITEMS_FOR_IGNORE
+                    .contains(&deps.main_hand_item)
+                    && deps.main_hand_custom_name)
+                    && !holding
+                        .iter()
+                        .any(|item| item == deps.main_hand_item || item == deps.off_hand_item)
+                    && !(only_block && !deps.main_hand_is_block_item && !deps.off_hand_is_block_item)
+                    && match &deps.crosshair {
+                        CrosshairTarget::Block => match deps.crosshair_block {
+                            Some(block) => !blocks_ignore.iter().any(|b| b == block),
+                            None => true,
+                        },
+                        _ => true,
+                    };
+                if allowed {
+                    if tb_setting_bool(&self.module, "UseDelayStart", false) && self.need_to_wait {
+                        self.need_to_wait = false;
+                        self.use_delay_ticks_left = 2;
+                        return outcome;
+                    }
+                    if self.use_delay_ticks_left > 0 {
+                        self.use_delay_ticks_left -= 1;
+                        if self.use_delay_ticks_left > 0 {
+                            return outcome;
+                        }
+                    }
+
+                    let press = &mut *deps.press_use_key;
+                    outcome.use_clicks = self.use_clicker.click(&self.module, deps.now_ms, press, None);
+                }
+            }
+        }
+
+        outcome
+    }
+}
+
+// ----- combat/autoclicker/ModuleTriggerBot.kt (GPL-3.0, (c) 2015-2026 CCBlueX) -----
+//
+// TriggerBot: attacks the enemy under the crosshair without holding the
+// attack button.
+
+pub const TRIGGER_BOT_NAME: &str = "TriggerBot";
+
+pub fn trigger_bot() -> Module {
+    Module::new(
+        "TriggerBot",
+        COMBAT,
+        vec![
+            // Clicker(this, mc.options.keyAttack, simulateAttackKeyDown = true)
+            choice("Technique", "Human", &["Human", "Constant"]),
+            int_range("CPS", 11, 14, 1, 30),
+            int("MaxPerTick", 2, 1, 5),
+            boolean("MissCooldown", true),
+            float_range("ItemCooldownMinimum", 1.0, 1.0, 0.0, 2.0),
+            // CrosshairAttacker(this, clicker) settings on the module itself.
+            choice("OnItemUse", "Wait", &["Wait", "Stop", "Ignore"]),
+            multi_choice("Weapon", &["Any"], &WEAPON_TYPE_TAGS),
+            choice("Criticals", "Smart", &["Smart", "Ignore", "Always"]),
+            int("DelayPostStopUse", 0, 0, 20),
+        ],
+    )
+}
+
+/// Upstream `ModuleTriggerBot` state.
+pub struct TriggerBot {
+    pub module: Module,
+    pub clicker: Clicker,
+    pub attacker: CrosshairAttacker,
+}
+
+impl TriggerBot {
+    pub fn new(seed: u64, attack_cooldown_progress: std::sync::Arc<dyn Fn(i32) -> f64>) -> Self {
+        TriggerBot {
+            module: trigger_bot(),
+            clicker: Clicker::new(0, true, "", true, 30, seed, true, attack_cooldown_progress),
+            attacker: CrosshairAttacker::new(""),
+        }
+    }
+
+    /// Upstream `tickHandler`. Returns whether the tick clicked.
+    pub fn on_tick(&mut self, deps: &mut CrosshairAttackerDeps) -> bool {
+        let wants_to_attack =
+            deps.crosshair_entity.is_some() && deps.crosshair_should_be_attacked;
+        if self.attacker.is_attacking(&self.module, deps, wants_to_attack) {
+            self.attacker.attack(&self.module, deps, &mut self.clicker)
+        } else {
+            false
+        }
+    }
+}
+
+mod autoclicker_triggerbot_tests {
+    use super::*;
+
+    fn always_pass_progress() -> std::sync::Arc<dyn Fn(i32) -> f64> {
+        std::sync::Arc::new(|_ticks: i32| 10.0)
+    }
+
+    #[test]
+    fn jdk_random_draws_a_deterministic_stream() {
+        let mut a = JdkRandom::new(42);
+        let mut b = JdkRandom::new(42);
+        for _ in 0..16 {
+            assert!((a.next_double() - b.next_double()).abs() < f64::EPSILON);
+        }
+        for _ in 0..8 {
+            assert!((a.next_gaussian() - b.next_gaussian()).abs() < f64::EPSILON);
+        }
+        // JDK sanity: a fresh Random(42).nextDouble() is 0.7275636800328681.
+        let mut c = JdkRandom::new(42);
+        assert!((c.next_double() - 0.7275636800328681).abs() < 1e-12);
+    }
+
+    #[test]
+    fn click_plan_plans_presses_and_resets_after_idle() {
+        let mut plan = ClickPlan::new(7);
+        plan.technique = ClickTechnique::Constant;
+        plan.set_cps((2, 2));
+
+        plan.tick(0);
+        // Press at 0 is due this tick; the 500 ms spacing puts the next press
+        // on tick 10 ((0, 500] with tickTime 0).
+        assert_eq!(plan.clicks_at(0), 1);
+        assert_eq!(plan.clicks_at(1), 0);
+        assert_eq!(plan.clicks_at(10), 1);
+
+        plan.tick(50);
+        assert_eq!(plan.clicks_at(0), 0);
+
+        // A gap longer than IDLE_MS ends the combo and starts a fresh one.
+        plan.tick(550);
+        assert_eq!(plan.clicks_at(0), 1);
+        assert_eq!(plan.combo_ms(), 0);
+    }
+
+    #[test]
+    fn clicker_click_drops_presses_on_failed_gates_and_blocks() {
+        let module = Module::new(
+            "AutoClicker",
+            COMBAT,
+            vec![
+                boolean("Attack", true),
+                choice("AttackTechnique", "Constant", &["Human", "Constant"]),
+                int_range("AttackCPS", 1, 1, 1, 30),
+                int("AttackMaxPerTick", 2, 1, 5),
+                boolean("AttackMissCooldown", true),
+                float_range("AttackItemCooldownMinimum", 1.0, 1.0, 0.0, 2.0),
+                boolean("AttackDelayOnBroken", true),
+                choice("AttackObjective", "Any", &["Enemy", "Entity", "Block", "Any"]),
+                choice("AttackOnItemUse", "Wait", &["Wait", "Stop", "Ignore"]),
+                multi_choice("AttackWeapon", &["Any"], &WEAPON_TYPE_TAGS),
+                choice("AttackCriticals", "Smart", &["Smart", "Ignore", "Always"]),
+                int("AttackDelayPostStopUse", 0, 0, 20),
+                boolean("Use", false),
+                choice("UseTechnique", "Human", &["Human", "Constant"]),
+                int_range("UseCPS", 11, 14, 1, 30),
+                int("UseMaxPerTick", 2, 1, 5),
+                items("UseHoldingItemsForIgnore", &[]),
+                items("UseBlocksForIgnore", &[]),
+                boolean("UseDelayStart", false),
+                boolean("UseOnlyBlock", false),
+                boolean("UseRequiresNoInput", false),
+            ],
+        );
+        let mut clicker = Clicker::new(0, true, "Attack", true, 30, 11, true, always_pass_progress());
+        clicker.running = true;
+        clicker.tick(&module, 0);
+
+        // One press due at tick 0 (interval 1000 ms at CPS 1).
+        assert_eq!(clicker.get_click_amount(0), 1);
+
+        let mut block = || true;
+        assert_eq!(clicker.click(&module, 0, &mut block, None), 1);
+        assert_eq!(clicker.click_amount, Some(1));
+        assert_eq!(clicker.ticks_since_last_click, 0);
+        // The plan consumed the tick's single press.
+        assert_eq!(clicker.click(&module, 0, &mut block, None), 0);
+
+        // Miss cooldown: a press is consumed but dropped.
+        clicker.tick(&module, 1000);
+        clicker.miss_time = 1;
+        assert_eq!(clicker.click(&module, 1000, &mut block, None), 0);
+        assert_eq!(clicker.click_amount, Some(0));
+        clicker.miss_time = 0;
+
+        // A failed block consumes the press but does not count as a click.
+        clicker.tick(&module, 2000);
+        let mut fail = || false;
+        assert_eq!(clicker.click(&module, 2000, &mut fail, None), 0);
+        assert_eq!(clicker.click_amount, Some(0));
+
+        // An open item-cooldown gate blocks the press too.
+        clicker.tick(&module, 3000);
+        clicker.item_cooldown.as_mut().unwrap().next_cooldown = 100.0;
+        assert_eq!(clicker.click(&module, 3000, &mut block, None), 0);
+    }
+
+    #[test]
+    fn clicker_group_player_press_replaces_a_planned_press() {
+        let module = Module::new("AutoClicker", COMBAT, vec![
+            boolean("Attack", true),
+            choice("AttackTechnique", "Constant", &["Human", "Constant"]),
+            int_range("AttackCPS", 2, 2, 1, 30),
+            int("AttackMaxPerTick", 2, 1, 5),
+            boolean("AttackMissCooldown", true),
+            float_range("AttackItemCooldownMinimum", 1.0, 1.0, 0.0, 2.0),
+            boolean("AttackDelayOnBroken", true),
+            choice("AttackObjective", "Any", &["Enemy", "Entity", "Block", "Any"]),
+            choice("AttackOnItemUse", "Wait", &["Wait", "Stop", "Ignore"]),
+            multi_choice("AttackWeapon", &["Any"], &WEAPON_TYPE_TAGS),
+            choice("AttackCriticals", "Smart", &["Smart", "Ignore", "Always"]),
+            int("AttackDelayPostStopUse", 0, 0, 20),
+            boolean("Use", false),
+            choice("UseTechnique", "Human", &["Human", "Constant"]),
+            int_range("UseCPS", 11, 14, 1, 30),
+            int("UseMaxPerTick", 2, 1, 5),
+            items("UseHoldingItemsForIgnore", &[]),
+            items("UseBlocksForIgnore", &[]),
+            boolean("UseDelayStart", false),
+            boolean("UseOnlyBlock", false),
+            boolean("UseRequiresNoInput", false),
+        ]);
+        let mut group = ClickerGroup::new(vec![Clicker::new(
+            0, true, "Attack", true, 30, 5, true, always_pass_progress(),
+        )]);
+        group.clickers[0].running = true;
+        group.tick(&module, 0);
+        assert_eq!(group.clickers[0].get_click_amount(10), 1);
+
+        group.on_player_press(0, true, false);
+        assert_eq!(group.clickers[0].get_click_amount(10), 0);
+
+        // A press with a screen open is not a click on the key.
+        group.on_player_press(0, true, true);
+        assert_eq!(group.clickers[0].get_click_amount(10), 0);
+    }
+
+    #[test]
+    fn clicker_group_other_clicker_follows_the_leader_plan() {
+        let module = Module::new("AutoClicker", COMBAT, vec![
+            boolean("Attack", true),
+            choice("AttackTechnique", "Constant", &["Human", "Constant"]),
+            int_range("AttackCPS", 2, 2, 1, 30),
+            int("AttackMaxPerTick", 2, 1, 5),
+            boolean("AttackMissCooldown", true),
+            float_range("AttackItemCooldownMinimum", 1.0, 1.0, 0.0, 2.0),
+            boolean("AttackDelayOnBroken", true),
+            choice("AttackObjective", "Any", &["Enemy", "Entity", "Block", "Any"]),
+            choice("AttackOnItemUse", "Wait", &["Wait", "Stop", "Ignore"]),
+            multi_choice("AttackWeapon", &["Any"], &WEAPON_TYPE_TAGS),
+            choice("AttackCriticals", "Smart", &["Smart", "Ignore", "Always"]),
+            int("AttackDelayPostStopUse", 0, 0, 20),
+            boolean("Use", false),
+            choice("UseTechnique", "Human", &["Human", "Constant"]),
+            int_range("UseCPS", 11, 14, 1, 30),
+            int("UseMaxPerTick", 2, 1, 5),
+            items("UseHoldingItemsForIgnore", &[]),
+            items("UseBlocksForIgnore", &[]),
+            boolean("UseDelayStart", false),
+            boolean("UseOnlyBlock", false),
+            boolean("UseRequiresNoInput", false),
+        ]);
+        let mut group = ClickerGroup::new(vec![
+            Clicker::new(0, true, "Attack", true, 30, 5, true, always_pass_progress()),
+            Clicker::new(0, true, "Attack", true, 30, 6, true, always_pass_progress()),
+        ]);
+        group.clickers[0].running = true;
+        group.clickers[1].running = true;
+        group.tick(&module, 0);
+
+        let mut block = || true;
+        let clicks = group.click(0, &module, 0, &mut block);
+        assert_eq!(clicks, 1);
+        // The follower adopted the leader's future presses (500 ms apart) in
+        // place of its own 1000 ms plan.
+        assert_eq!(group.clickers[1].get_click_amount(10), 1);
+        assert_eq!(group.clickers[1].get_click_amount(20), 1);
+    }
+
+    type SharedVec = std::cell::RefCell<Vec<u64>>;
+    type SharedBool = std::cell::RefCell<bool>;
+
+    fn attacker_deps<'a>(
+        crosshair_entity: Option<u64>,
+        using_item: bool,
+        now_ms: i64,
+        on_target: &'a SharedVec,
+        released: &'a SharedBool,
+        pressed: &'a SharedBool,
+    ) -> CrosshairAttackerDeps<'a> {
+        CrosshairAttackerDeps {
+            crosshair_entity,
+            crosshair_should_be_attacked: true,
+            player_is_using_item: using_item,
+            now_ms,
+            weapon_matches: Box::new(|_tags| true),
+            should_wait_for_crit: Box::new(|_ignore_state| false),
+            would_do_critical_hit: Box::new(|| true),
+            on_target: Box::new(move |entity| on_target.borrow_mut().push(entity)),
+            release_using_item: Box::new(|| *released.borrow_mut() = true),
+            press_attack_key: Box::new(|| {
+                *pressed.borrow_mut() = true;
+                true
+            }),
+        }
+    }
+
+    #[test]
+    fn crosshair_attacker_attack_clicks_or_waits() {
+        let mut module = Module::new("TriggerBot", COMBAT, vec![
+            choice("Technique", "Human", &["Human", "Constant"]),
+            int_range("CPS", 11, 14, 1, 30),
+            int("MaxPerTick", 2, 1, 5),
+            boolean("MissCooldown", true),
+            float_range("ItemCooldownMinimum", 1.0, 1.0, 0.0, 2.0),
+            choice("OnItemUse", "Wait", &["Wait", "Stop", "Ignore"]),
+            multi_choice("Weapon", &["Any"], &WEAPON_TYPE_TAGS),
+            choice("Criticals", "Smart", &["Smart", "Ignore", "Always"]),
+            int("DelayPostStopUse", 0, 0, 20),
+        ]);
+        let on_target = std::cell::RefCell::new(Vec::new());
+        let _released = std::cell::RefCell::new(false);
+        let pressed = std::cell::RefCell::new(false);
+        let mut clicker = Clicker::new(0, true, "", true, 30, 3, true, always_pass_progress());
+        clicker.running = true;
+
+        // A critical hit still pending (Smart + shouldWaitForCrit) returns
+        // true without clicking.
+        let mut deps = attacker_deps(Some(9), false, 0, &on_target, &_released, &pressed);
+        deps.should_wait_for_crit = Box::new(|_| true);
+        let mut attacker = CrosshairAttacker::new("");
+        assert!(attacker.attack(&module, &mut deps, &mut clicker));
+        assert_eq!(on_target.borrow().clone(), vec![9]);
+        assert!(clicker.click_amount.is_none() || clicker.click_amount == Some(0));
+
+        // Ignore mode: no critical gating, the click lands.
+        clicker.tick(&module, 0);
+        module.setting_mut("Criticals").unwrap().kind =
+            crate::value::ValueKind::Choice("Ignore".to_string(), vec!["Smart".to_string(), "Ignore".to_string(), "Always".to_string()]);
+        let mut deps = attacker_deps(Some(9), false, 0, &on_target, &_released, &pressed);
+        assert!(attacker.attack(&module, &mut deps, &mut clicker));
+        assert!(*pressed.borrow());
+
+        // Using an item with Wait: the tick is consumed, then the delay runs.
+        module.setting_mut("Criticals").unwrap().kind =
+            crate::value::ValueKind::Choice("Smart".to_string(), vec!["Smart".to_string(), "Ignore".to_string(), "Always".to_string()]);
+        *pressed.borrow_mut() = false;
+        let mut deps = attacker_deps(Some(9), true, 0, &on_target, &_released, &pressed);
+        assert!(!attacker.attack(&module, &mut deps, &mut clicker));
+        // Not using anymore: the Wait suspension releases into the delay.
+        let mut deps = attacker_deps(Some(9), false, 0, &on_target, &_released, &pressed);
+        assert!(!attacker.attack(&module, &mut deps, &mut clicker));
+        // DelayPostStopUse defaults to 0, so the next tick clicks.
+        clicker.tick(&module, 2000);
+        let mut deps = attacker_deps(Some(9), false, 2000, &on_target, &_released, &pressed);
+        assert!(attacker.attack(&module, &mut deps, &mut clicker));
+        assert!(*pressed.borrow());
+    }
+
+    #[test]
+    fn trigger_bot_attacks_the_crosshair_entity() {
+        let mut bot = TriggerBot::new(4, always_pass_progress());
+        let on_target = std::cell::RefCell::new(Vec::new());
+        let released = std::cell::RefCell::new(false);
+        let pressed = std::cell::RefCell::new(false);
+        let mut deps = attacker_deps(None, false, 0, &on_target, &released, &pressed);
+        assert!(!bot.on_tick(&mut deps));
+
+        let mut deps = attacker_deps(Some(3), false, 0, &on_target, &released, &pressed);
+        deps.crosshair_should_be_attacked = false;
+        assert!(!bot.on_tick(&mut deps));
+
+        bot.clicker.tick(&bot.module, 0);
+        let mut deps = attacker_deps(Some(3), false, 0, &on_target, &released, &pressed);
+        assert!(bot.on_tick(&mut deps));
+        assert_eq!(on_target.borrow().clone(), vec![3]);
+        assert!(*pressed.borrow());
+    }
+
+    #[test]
+    fn auto_clicker_on_tick_gates_and_clicks() {
+        let mut auto = AutoClicker::new(5, always_pass_progress());
+        auto.module
+            .setting_mut("AttackCriticals")
+            .unwrap()
+            .kind = crate::value::ValueKind::Choice(
+            "Ignore".to_string(),
+            vec!["Smart".to_string(), "Ignore".to_string(), "Always".to_string()],
+        );
+        auto.module.setting_mut("Use").unwrap().kind = crate::value::ValueKind::Bool(true);
+        auto.module
+            .setting_mut("UseRequiresNoInput")
+            .unwrap()
+            .kind = crate::value::ValueKind::Bool(true);
+
+        // Tick 1: attack pressed on open crosshair (Any objective), past the
+        // finish-break window.
+        let mut on_target: Vec<u64> = Vec::new();
+        let mut attack_pressed_flag = false;
+        {
+            auto.attack_clicker.tick(&auto.module, 1000);
+            let mut deps = AutoClickerTickDeps {
+                attack_pressed: true,
+                use_pressed: false,
+                is_destroying: false,
+                crosshair: CrosshairTarget::None,
+                main_hand_item: "minecraft:stone_sword",
+                off_hand_item: "minecraft:shield",
+                main_hand_custom_name: false,
+                main_hand_is_block_item: false,
+                off_hand_is_block_item: false,
+                crosshair_block: None,
+                press_use_key: Box::new(|| true),
+                now_ms: 1000,
+            };
+            let mut attacker_deps = CrosshairAttackerDeps {
+                crosshair_entity: None,
+                crosshair_should_be_attacked: true,
+                player_is_using_item: false,
+                now_ms: 1000,
+                weapon_matches: Box::new(|_| true),
+                should_wait_for_crit: Box::new(|_| false),
+                would_do_critical_hit: Box::new(|| true),
+                on_target: Box::new(|e| on_target.push(e)),
+                release_using_item: Box::new(|| {}),
+                press_attack_key: Box::new(|| {
+                    attack_pressed_flag = true;
+                    true
+                }),
+            };
+            let outcome = auto.on_tick(&mut deps, &mut attacker_deps);
+            assert_eq!(outcome.attack_clicks, 1);
+            assert_eq!(outcome.use_clicks, 0);
+        }
+        assert!(attack_pressed_flag);
+        assert!(on_target.is_empty());
+
+        // Tick 2: breaking a block, so no attack click.
+        {
+            auto.attack_clicker.tick(&auto.module, 2000);
+            let mut deps = AutoClickerTickDeps {
+                attack_pressed: true,
+                use_pressed: false,
+                is_destroying: true,
+                crosshair: CrosshairTarget::None,
+                main_hand_item: "minecraft:stone_sword",
+                off_hand_item: "minecraft:shield",
+                main_hand_custom_name: false,
+                main_hand_is_block_item: false,
+                off_hand_is_block_item: false,
+                crosshair_block: None,
+                press_use_key: Box::new(|| true),
+                now_ms: 2000,
+            };
+            let mut attacker_deps = CrosshairAttackerDeps {
+                crosshair_entity: None,
+                crosshair_should_be_attacked: true,
+                player_is_using_item: false,
+                now_ms: 2000,
+                weapon_matches: Box::new(|_| true),
+                should_wait_for_crit: Box::new(|_| false),
+                would_do_critical_hit: Box::new(|| true),
+                on_target: Box::new(|_| {}),
+                release_using_item: Box::new(|| {}),
+                press_attack_key: Box::new(|| true),
+            };
+            let outcome = auto.on_tick(&mut deps, &mut attacker_deps);
+            assert_eq!(outcome.attack_clicks, 0);
+        }
+
+        // Tick 3: a finished break 100 ms ago, within the DelayOnBroken
+        // window, so no attack click.
+        auto.on_player_action_packet("STOP_DESTROY_BLOCK", 2500);
+        {
+            auto.attack_clicker.tick(&auto.module, 2600);
+            let mut deps = AutoClickerTickDeps {
+                attack_pressed: true,
+                use_pressed: false,
+                is_destroying: false,
+                crosshair: CrosshairTarget::None,
+                main_hand_item: "minecraft:stone_sword",
+                off_hand_item: "minecraft:shield",
+                main_hand_custom_name: false,
+                main_hand_is_block_item: false,
+                off_hand_is_block_item: false,
+                crosshair_block: None,
+                press_use_key: Box::new(|| true),
+                now_ms: 2600,
+            };
+            let mut attacker_deps = CrosshairAttackerDeps {
+                crosshair_entity: None,
+                crosshair_should_be_attacked: true,
+                player_is_using_item: false,
+                now_ms: 2600,
+                weapon_matches: Box::new(|_| true),
+                should_wait_for_crit: Box::new(|_| false),
+                would_do_critical_hit: Box::new(|| true),
+                on_target: Box::new(|_| {}),
+                release_using_item: Box::new(|| {}),
+                press_attack_key: Box::new(|| true),
+            };
+            let outcome = auto.on_tick(&mut deps, &mut attacker_deps);
+            assert_eq!(outcome.attack_clicks, 0);
+        }
+
+        // Tick 4: objective Enemy with no entity under the crosshair, so no
+        // attack click; then an enemy appears and the attack click lands with
+        // AutoWeapon.onTarget called.
+        auto.module
+            .setting_mut("AttackObjective")
+            .unwrap()
+            .kind = crate::value::ValueKind::Choice(
+            "Enemy".to_string(),
+            vec!["Enemy".to_string(), "Entity".to_string(), "Block".to_string(), "Any".to_string()],
+        );
+        {
+            auto.attack_clicker.tick(&auto.module, 4000);
+            let mut deps = AutoClickerTickDeps {
+                attack_pressed: true,
+                use_pressed: false,
+                is_destroying: false,
+                crosshair: CrosshairTarget::None,
+                main_hand_item: "minecraft:stone_sword",
+                off_hand_item: "minecraft:shield",
+                main_hand_custom_name: false,
+                main_hand_is_block_item: false,
+                off_hand_is_block_item: false,
+                crosshair_block: None,
+                press_use_key: Box::new(|| true),
+                now_ms: 4000,
+            };
+            let mut attacker_deps = CrosshairAttackerDeps {
+                crosshair_entity: None,
+                crosshair_should_be_attacked: true,
+                player_is_using_item: false,
+                now_ms: 4000,
+                weapon_matches: Box::new(|_| true),
+                should_wait_for_crit: Box::new(|_| false),
+                would_do_critical_hit: Box::new(|| true),
+                on_target: Box::new(|_| {}),
+                release_using_item: Box::new(|| {}),
+                press_attack_key: Box::new(|| true),
+            };
+            let outcome = auto.on_tick(&mut deps, &mut attacker_deps);
+            assert_eq!(outcome.attack_clicks, 0);
+        }
+        {
+            auto.attack_clicker.tick(&auto.module, 5000);
+            let mut deps = AutoClickerTickDeps {
+                attack_pressed: true,
+                use_pressed: false,
+                is_destroying: false,
+                crosshair: CrosshairTarget::Entity { id: 7, should_be_attacked: true },
+                main_hand_item: "minecraft:stone_sword",
+                off_hand_item: "minecraft:shield",
+                main_hand_custom_name: false,
+                main_hand_is_block_item: false,
+                off_hand_is_block_item: false,
+                crosshair_block: None,
+                press_use_key: Box::new(|| true),
+                now_ms: 5000,
+            };
+            let mut attacker_deps = CrosshairAttackerDeps {
+                crosshair_entity: Some(7),
+                crosshair_should_be_attacked: true,
+                player_is_using_item: false,
+                now_ms: 5000,
+                weapon_matches: Box::new(|_| true),
+                should_wait_for_crit: Box::new(|_| false),
+                would_do_critical_hit: Box::new(|| true),
+                on_target: Box::new(|e| on_target.push(e)),
+                release_using_item: Box::new(|| {}),
+                press_attack_key: Box::new(|| true),
+            };
+            let outcome = auto.on_tick(&mut deps, &mut attacker_deps);
+            assert_eq!(outcome.attack_clicks, 1);
+        }
+        assert_eq!(on_target, vec![7]);
+    }
+
+    #[test]
+    fn auto_clicker_use_button_gates_and_delay_start() {
+        let mut auto = AutoClicker::new(9, always_pass_progress());
+        auto.module.setting_mut("Use").unwrap().kind = crate::value::ValueKind::Bool(true);
+        auto.module
+            .setting_mut("UseRequiresNoInput")
+            .unwrap()
+            .kind = crate::value::ValueKind::Bool(true);
+
+        // A held item on the ignore list blocks the use click.
+        {
+            auto.use_clicker.tick(&auto.module, 0);
+            let mut deps = AutoClickerTickDeps {
+                attack_pressed: false,
+                use_pressed: true,
+                is_destroying: false,
+                crosshair: CrosshairTarget::None,
+                main_hand_item: "minecraft:ender_pearl",
+                off_hand_item: "minecraft:shield",
+                main_hand_custom_name: false,
+                main_hand_is_block_item: false,
+                off_hand_is_block_item: false,
+                crosshair_block: None,
+                press_use_key: Box::new(|| true),
+                now_ms: 0,
+            };
+            let mut attacker_deps = CrosshairAttackerDeps {
+                crosshair_entity: None,
+                crosshair_should_be_attacked: false,
+                player_is_using_item: false,
+                now_ms: 0,
+                weapon_matches: Box::new(|_| true),
+                should_wait_for_crit: Box::new(|_| false),
+                would_do_critical_hit: Box::new(|| true),
+                on_target: Box::new(|_| {}),
+                release_using_item: Box::new(|| {}),
+                press_attack_key: Box::new(|| true),
+            };
+            let outcome = auto.on_tick(&mut deps, &mut attacker_deps);
+            assert_eq!(outcome.use_clicks, 0);
+        }
+
+        // OnlyBlock with no block item in either hand blocks the use click.
+        auto.module.setting_mut("UseOnlyBlock").unwrap().kind = crate::value::ValueKind::Bool(true);
+        {
+            auto.use_clicker.tick(&auto.module, 1000);
+            let mut deps = AutoClickerTickDeps {
+                attack_pressed: false,
+                use_pressed: true,
+                is_destroying: false,
+                crosshair: CrosshairTarget::None,
+                main_hand_item: "minecraft:stone_sword",
+                off_hand_item: "minecraft:shield",
+                main_hand_custom_name: false,
+                main_hand_is_block_item: false,
+                off_hand_is_block_item: false,
+                crosshair_block: None,
+                press_use_key: Box::new(|| true),
+                now_ms: 1000,
+            };
+            let mut attacker_deps = CrosshairAttackerDeps {
+                crosshair_entity: None,
+                crosshair_should_be_attacked: false,
+                player_is_using_item: false,
+                now_ms: 1000,
+                weapon_matches: Box::new(|_| true),
+                should_wait_for_crit: Box::new(|_| false),
+                would_do_critical_hit: Box::new(|| true),
+                on_target: Box::new(|_| {}),
+                release_using_item: Box::new(|| {}),
+                press_attack_key: Box::new(|| true),
+            };
+            let outcome = auto.on_tick(&mut deps, &mut attacker_deps);
+            assert_eq!(outcome.use_clicks, 0);
+        }
+        auto.module.setting_mut("UseOnlyBlock").unwrap().kind = crate::value::ValueKind::Bool(false);
+
+        // DelayStart: two ticks pass before the first use click.
+        auto.module.setting_mut("UseDelayStart").unwrap().kind = crate::value::ValueKind::Bool(true);
+        let mut use_clicked = 0;
+        for tick_ms in [2000_i64, 3000, 4000] {
+            auto.use_clicker.tick(&auto.module, tick_ms);
+            let mut deps = AutoClickerTickDeps {
+                attack_pressed: false,
+                use_pressed: true,
+                is_destroying: false,
+                crosshair: CrosshairTarget::None,
+                main_hand_item: "minecraft:stone_sword",
+                off_hand_item: "minecraft:shield",
+                main_hand_custom_name: false,
+                main_hand_is_block_item: false,
+                off_hand_is_block_item: false,
+                crosshair_block: None,
+                press_use_key: Box::new(|| {
+                    use_clicked += 1;
+                    true
+                }),
+                now_ms: tick_ms,
+            };
+            let mut attacker_deps = CrosshairAttackerDeps {
+                crosshair_entity: None,
+                crosshair_should_be_attacked: false,
+                player_is_using_item: false,
+                now_ms: tick_ms,
+                weapon_matches: Box::new(|_| true),
+                should_wait_for_crit: Box::new(|_| false),
+                would_do_critical_hit: Box::new(|| true),
+                on_target: Box::new(|_| {}),
+                release_using_item: Box::new(|| {}),
+                press_attack_key: Box::new(|| true),
+            };
+            let outcome = auto.on_tick(&mut deps, &mut attacker_deps);
+            assert_eq!(outcome.use_clicks, if tick_ms == 4000 { 1 } else { 0 });
+        }
+        assert_eq!(use_clicked, 1);
+        // The next use tick clicks straight away.
+        {
+            auto.use_clicker.tick(&auto.module, 5000);
+            let mut deps = AutoClickerTickDeps {
+                attack_pressed: false,
+                use_pressed: true,
+                is_destroying: false,
+                crosshair: CrosshairTarget::None,
+                main_hand_item: "minecraft:stone_sword",
+                off_hand_item: "minecraft:shield",
+                main_hand_custom_name: false,
+                main_hand_is_block_item: false,
+                off_hand_is_block_item: false,
+                crosshair_block: None,
+                press_use_key: Box::new(|| {
+                    use_clicked += 1;
+                    true
+                }),
+                now_ms: 5000,
+            };
+            let mut attacker_deps = CrosshairAttackerDeps {
+                crosshair_entity: None,
+                crosshair_should_be_attacked: false,
+                player_is_using_item: false,
+                now_ms: 5000,
+                weapon_matches: Box::new(|_| true),
+                should_wait_for_crit: Box::new(|_| false),
+                would_do_critical_hit: Box::new(|| true),
+                on_target: Box::new(|_| {}),
+                release_using_item: Box::new(|| {}),
+                press_attack_key: Box::new(|| true),
+            };
+            let outcome = auto.on_tick(&mut deps, &mut attacker_deps);
+            assert_eq!(outcome.use_clicks, 1);
+        }
+        assert_eq!(use_clicked, 2);
+    }
+}

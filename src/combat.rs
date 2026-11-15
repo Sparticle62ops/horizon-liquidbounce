@@ -6723,3 +6723,546 @@ mod tick_base_tests {
         assert_eq!(visuals[0].2, Some(hit.point));
     }
 }
+
+// ----- TickBaseVisuals.kt (GPL-3.0, (c) 2015-2026 CCBlueX) -----
+//
+// `TbHooks.visuals_show` / `visuals_clear` are the seams TickBase calls
+// this through. The GPU calls go out through a `TbRenderOp` recorder; the
+// geometry, fades and state machine stay computed here. `TbVisuals.world`
+// carries the per-frame world reads as fields instead of live entities.
+
+/// Upstream `Pose.STANDING`, the ghost's default pose; the world seam hands
+/// the player's pose through as its own value.
+pub const TB_POSE_STANDING: u8 = 0;
+
+/// Upstream `Color4b`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TbColor {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+    pub a: u8,
+}
+
+impl TbColor {
+    /// Upstream `Color4b.LIQUID_BOUNCE`.
+    pub fn liquid_bounce() -> Self {
+        TbColor { r: 0x46, g: 0x77, b: 0xFF, a: 0xFF }
+    }
+
+    /// Upstream `Color4b.fade(fade)`: at or above 1.0 the color is unchanged,
+    /// below it the alpha becomes `(a * fade).toInt()`.
+    pub fn fade(&self, fade: f32) -> Self {
+        if fade >= 1.0 {
+            *self
+        } else {
+            TbColor { r: self.r, g: self.g, b: self.b, a: (self.a as f32 * fade) as u8 }
+        }
+    }
+}
+
+/// Upstream `TickBaseVisuals.Afterimage`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TbAfterimage {
+    pub pos: [f64; 3],
+    pub y_rot: f32,
+    pub pose: u8,
+    pub time: u64,
+}
+
+/// Upstream `WireframePlayer`, the ghost's state the visuals drive.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TbGhostPlayer {
+    pub pos: [f64; 3],
+    pub y_rot: f32,
+    pub x_rot: f32,
+    pub pose: u8,
+}
+
+impl TbGhostPlayer {
+    pub fn standing() -> Self {
+        TbGhostPlayer { pos: [0.0; 3], y_rot: 0.0, x_rot: 0.0, pose: TB_POSE_STANDING }
+    }
+
+    /// Upstream `WireframePlayer.setRotation(rotation)`.
+    pub fn set_rotation(&mut self, y_rot: f32, x_rot: f32) {
+        self.y_rot = y_rot;
+        self.x_rot = x_rot;
+    }
+}
+
+/// One upstream render call, recorded instead of drawn.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TbRenderOp {
+    /// Upstream `drawCircleOutline(radius, color)`, drawn at the anchor.
+    CircleOutline { radius: f32, color: TbColor },
+    /// Upstream `drawCustomMesh(ClientRenderPipelines.triangleStrip(noDepthTest
+    /// = true))`: `(x, z)` vertex, color pairs, two vertices per iteration.
+    TriangleStrip { pairs: Vec<((f32, f32), TbColor)> },
+    /// Upstream `drawLinesWithWidth(color.argb, 3f, lineStripAsLines())`,
+    /// vertex pairs in anchor-relative space.
+    LinesWithWidth { width: f32, segments: Vec<([f64; 3], [f64; 3])>, color: TbColor },
+    /// Upstream the two-vertex `drawCustomMesh(ClientRenderPipelines.lines(
+    /// noDepthTest = true))` strike from the eyes to the hit.
+    EyeLine { to_offset: [f64; 3], from_color: TbColor, to_color: TbColor },
+    /// Upstream `WireframePlayer.render(color, outlineColor, noDepthTest =
+    /// true)`, drawn at the ghost's position.
+    GhostRender { fill: TbColor, outline: TbColor },
+}
+
+/// Upstream `TickBaseVisuals`.
+pub struct TbVisuals {
+    /// Upstream the `Color` setting.
+    pub color: TbColor,
+    /// Upstream the `BalanceRing` setting.
+    pub balance_ring: bool,
+    /// Upstream `path`: the coming positions of the player from now up to
+    /// where the hit on `hit` lands. Empty without a hit.
+    pub path: Vec<[f64; 3]>,
+    pub hit: Option<[f64; 3]>,
+    /// Upstream `afterimage`: where the player was when the ticks started to
+    /// run ahead of real time.
+    pub afterimage: Option<TbAfterimage>,
+    pub ahead: bool,
+    pub ghost: TbGhostPlayer,
+}
+
+impl Default for TbVisuals {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TbVisuals {
+    pub fn new() -> Self {
+        TbVisuals {
+            color: TbColor::liquid_bounce(),
+            balance_ring: true,
+            path: Vec::new(),
+            hit: None,
+            afterimage: None,
+            ahead: false,
+            ghost: TbGhostPlayer::standing(),
+        }
+    }
+
+    /// Upstream `show(path, landing, hit)`: shows the coming positions of the
+    /// player from now, with the hit landing after `landing` ticks.
+    pub fn show(&mut self, path: &[[f64; 3]], landing: Option<usize>, hit: Option<[f64; 3]>) {
+        self.path = match (landing, hit) {
+            (Some(landing), Some(_)) if landing > 0 => {
+                path.iter().take(landing + 1).copied().collect()
+            }
+            _ => Vec::new(),
+        };
+        self.hit = hit;
+    }
+
+    /// Upstream `clear()`.
+    pub fn clear(&mut self) {
+        self.show(&[], None, None)
+    }
+
+    /// Upstream `TickBaseVisuals.tickHandler` on `PlayerPostTickEvent`:
+    /// remembers where the player was when the ticks started to run ahead of
+    /// real time.
+    pub fn tick_handler(
+        &mut self,
+        bursting: bool,
+        timer_speed: f64,
+        old_position: [f64; 3],
+        y_rot: f32,
+        pose: u8,
+        time_ms: u64,
+    ) {
+        let was_ahead = self.ahead;
+        self.ahead = bursting || timer_speed > 1.0;
+        if self.ahead && !was_ahead {
+            self.afterimage = Some(TbAfterimage {
+                pos: old_position,
+                y_rot,
+                pose,
+                time: time_ms,
+            });
+        }
+    }
+}
+
+/// The per-frame world reads of `WorldRenderEvent` and the player, handed
+/// through as fields.
+pub struct TbVisualsWorld {
+    /// Upstream `clientStartDurationMs`.
+    pub time_ms: u64,
+    /// Upstream `player.interpolateCurrentPosition(event.partialTicks)`.
+    pub origin: [f64; 3],
+    /// Upstream `player.getViewYRot(event.partialTicks)`.
+    pub view_y_rot: f32,
+    /// Upstream `player.eyeHeight`.
+    pub eye_height: f64,
+    /// Upstream `player.pose`.
+    pub player_pose: u8,
+    /// Upstream `camera.position()`.
+    pub camera_position: [f64; 3],
+    /// Upstream `Timer.balance`.
+    pub timer_balance: f64,
+    /// Upstream `ModuleTickBase.balance` as `(first, last)`.
+    pub balance_range: (i64, i64),
+}
+
+/// Upstream `Mth.wrapDegrees(float)`.
+fn tb_wrap_degrees(value: f32) -> f32 {
+    let mut f = value % 360.0;
+    if f >= 180.0 {
+        f -= 360.0;
+    }
+    if f < -180.0 {
+        f += 360.0;
+    }
+    f
+}
+
+/// Upstream `Rotation.lookingAt(point, from)` = `fromRotationVec(point - from)`:
+/// yaw `wrapDegrees(atan2(dz, dx).toDegrees() - 90)`, pitch
+/// `wrapDegrees(-atan2(dy, length(dx, dz)).toDegrees())`.
+fn tb_looking_at(point: [f64; 3], from: [f64; 3]) -> (f32, f32) {
+    let dx = point[0] - from[0];
+    let dy = point[1] - from[1];
+    let dz = point[2] - from[2];
+    let yaw = tb_wrap_degrees((dz.atan2(dx).to_degrees() as f32) - 90.0);
+    let pitch = tb_wrap_degrees(-(dy.atan2((dx * dx + dz * dz).sqrt()).to_degrees() as f32));
+    (yaw, pitch)
+}
+
+impl TbVisuals {
+    /// Upstream `renderHandler` on `WorldRenderEvent`: the balance ring, the
+    /// coming path with its landing, and the afterimage, recorded in order.
+    pub fn render_handler(&mut self, world: &TbVisualsWorld) -> Vec<TbRenderOp> {
+        let mut ops = Vec::new();
+        if self.balance_ring {
+            self.render_balance(world, &mut ops);
+        }
+        if let Some(hit) = self.hit.filter(|_| !self.path.is_empty()) {
+            self.render_path(world, &mut ops);
+            self.render_landing(world, hit, &mut ops);
+        }
+        self.render_afterimage(world, &mut ops);
+        ops
+    }
+
+    /// Upstream `renderBalance(origin, yRot)`: a ring around the feet filled
+    /// by the balance, centred on where the player looks.
+    fn render_balance(&self, world: &TbVisualsWorld, ops: &mut Vec<TbRenderOp>) {
+        let (first, last) = world.balance_range;
+        let fraction = if last > first {
+            (((world.timer_balance - first as f64) / (last - first) as f64) as f32).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+
+        ops.push(TbRenderOp::CircleOutline { radius: 0.6, color: self.color.fade(0.2) });
+        if fraction <= 0.0 {
+            return;
+        }
+
+        let sweep = fraction * std::f32::consts::TAU;
+        let start = (world.view_y_rot + 90.0).to_radians() - sweep / 2.0;
+        let segments = std::cmp::max(2, (48.0 * fraction) as i32);
+        let inner = 0.56;
+        let outer = 0.64;
+
+        let mut pairs = Vec::new();
+        for i in 0..=segments {
+            let angle = start + sweep * i as f32 / segments as f32;
+            let x = angle.cos();
+            let z = angle.sin();
+            pairs.push(((x * inner, z * inner), self.color.fade(0.35)));
+            pairs.push(((x * outer, z * outer), self.color));
+        }
+        ops.push(TbRenderOp::TriangleStrip { pairs });
+    }
+
+    /// Upstream `renderPath(origin)`: the coming ticks up to the landing as a
+    /// line on the ground.
+    fn render_path(&self, world: &TbVisualsWorld, ops: &mut Vec<TbRenderOp>) {
+        // The line starts where the player is drawn between ticks; the
+        // vertex list is relative to the anchor, so the first vertex is
+        // `Vec3.ZERO` and every following one is `path[i] - origin`
+        let mut vertices = Vec::with_capacity(self.path.len());
+        vertices.push([0.0; 3]);
+        for point in self.path.iter().skip(1) {
+            vertices.push([
+                point[0] - world.origin[0],
+                point[1] - world.origin[1],
+                point[2] - world.origin[2],
+            ]);
+        }
+        let segments = vertices.windows(2).map(|w| (w[0], w[1])).collect();
+        ops.push(TbRenderOp::LinesWithWidth { width: 3.0, segments, color: self.color });
+    }
+
+    /// Upstream `renderLanding(hit)`: the player where the hit lands, and the
+    /// strike from its eyes to the hit.
+    fn render_landing(&mut self, world: &TbVisualsWorld, hit: [f64; 3], ops: &mut Vec<TbRenderOp>) {
+        let pos = *self.path.last().expect("renderLanding runs with a non-empty path");
+        let eyes = [pos[0], pos[1] + world.eye_height, pos[2]];
+        let fade = tb_ghost_fade(world.camera_position, eyes);
+
+        if fade > 0.0 {
+            let (y_rot, x_rot) = tb_looking_at(hit, eyes);
+            self.ghost.pos = pos;
+            self.ghost.pose = world.player_pose;
+            self.ghost.set_rotation(y_rot, x_rot);
+            ops.push(TbRenderOp::GhostRender {
+                fill: self.color.fade(0.12 * fade),
+                outline: self.color.fade(0.9 * fade),
+            });
+        }
+
+        ops.push(TbRenderOp::EyeLine {
+            to_offset: [hit[0] - eyes[0], hit[1] - eyes[1], hit[2] - eyes[2]],
+            from_color: self.color.fade(0.05),
+            to_color: self.color,
+        });
+    }
+
+    /// Upstream `renderAfterimage(time)`: the player where the ticks started
+    /// to run ahead of real time, fading out.
+    fn render_afterimage(&mut self, world: &TbVisualsWorld, ops: &mut Vec<TbRenderOp>) {
+        let image = match self.afterimage {
+            Some(image) => image,
+            None => return,
+        };
+        let eyes = [image.pos[0], image.pos[1] + world.eye_height, image.pos[2]];
+        let fade = (1.0 - (world.time_ms - image.time) as f32 / 450.0)
+            * tb_ghost_fade(world.camera_position, eyes);
+        if fade <= 0.0 {
+            return;
+        }
+
+        self.ghost.pos = image.pos;
+        self.ghost.pose = image.pose;
+        self.ghost.set_rotation(image.y_rot, 0.0);
+        ops.push(TbRenderOp::GhostRender {
+            fill: self.color.fade(0.08 * fade),
+            outline: self.color.fade(0.6 * fade),
+        });
+    }
+}
+
+/// Upstream `WorldRenderEnvironment.ghostFade(eyes)`: ghosts close to the
+/// camera would fill the screen in first person.
+fn tb_ghost_fade(camera: [f64; 3], eyes: [f64; 3]) -> f32 {
+    let dx = camera[0] - eyes[0];
+    let dy = camera[1] - eyes[1];
+    let dz = camera[2] - eyes[2];
+    let distance = (dx * dx + dy * dy + dz * dz).sqrt();
+    (((distance - 0.8) / 1.2) as f32).clamp(0.0, 1.0)
+}
+
+#[cfg(test)]
+mod tick_base_visuals_tests {
+    use super::*;
+
+    fn visuals_world() -> TbVisualsWorld {
+        TbVisualsWorld {
+            time_ms: 112,
+            origin: [0.0, 64.0, 0.0],
+            view_y_rot: 0.0,
+            eye_height: 1.8,
+            player_pose: TB_POSE_STANDING,
+            camera_position: [5.0, 70.0, 0.0],
+            timer_balance: 1.0,
+            balance_range: (0, 4),
+        }
+    }
+
+    #[test]
+    fn visuals_show_cuts_the_path_to_the_landing_tick() {
+        let mut v = TbVisuals::new();
+        let path = vec![
+            [0.0, 64.0, 0.0],
+            [1.0, 64.0, 0.0],
+            [2.0, 64.0, 0.0],
+            [3.0, 64.0, 0.0],
+        ];
+
+        v.show(&path, Some(2), Some([5.0, 64.0, 0.0]));
+        assert_eq!(v.path.len(), 3);
+        assert_eq!(v.hit, Some([5.0, 64.0, 0.0]));
+
+        // Without a landing the path is empty
+        v.show(&path, None, Some([5.0, 64.0, 0.0]));
+        assert!(v.path.is_empty());
+
+        v.show(&path, Some(2), None);
+        assert!(v.path.is_empty());
+        assert_eq!(v.hit, None);
+
+        v.show(&path, Some(2), Some([5.0, 64.0, 0.0]));
+        v.clear();
+        assert!(v.path.is_empty());
+        assert_eq!(v.hit, None);
+    }
+
+    #[test]
+    fn visuals_tick_handler_captures_the_afterimage_when_ahead_starts() {
+        let mut v = TbVisuals::new();
+
+        v.tick_handler(false, 1.0, [0.0, 64.0, 0.0], 12.0, TB_POSE_STANDING, 100);
+        assert!(!v.ahead);
+        assert!(v.afterimage.is_none());
+
+        // Bursting starts the ahead state and takes the snapshot
+        v.tick_handler(true, 1.0, [1.0, 64.0, 0.0], 13.0, TB_POSE_STANDING, 150);
+        let image = v.afterimage.expect("afterimage captured");
+        assert_eq!(image.pos, [1.0, 64.0, 0.0]);
+        assert_eq!(image.y_rot, 13.0);
+        assert_eq!(image.time, 150);
+
+        // Already ahead: no new snapshot
+        v.tick_handler(true, 1.0, [2.0, 64.0, 0.0], 0.0, TB_POSE_STANDING, 200);
+        assert_eq!(v.afterimage.unwrap().time, 150);
+
+        // Ahead stays on while bursting, then turns off below speed 1
+        v.tick_handler(false, 1.0, [0.0, 64.0, 0.0], 0.0, TB_POSE_STANDING, 250);
+        assert!(!v.ahead);
+        assert_eq!(v.afterimage.unwrap().time, 150);
+
+        // A timer speed over 1 counts as ahead and takes a new snapshot
+        v.tick_handler(false, 1.5, [3.0, 64.0, 0.0], 0.0, TB_POSE_STANDING, 300);
+        assert_eq!(v.afterimage.unwrap().pos, [3.0, 64.0, 0.0]);
+    }
+
+    #[test]
+    fn visuals_render_balance_fills_the_ring_from_the_balance_range() {
+        let mut v = TbVisuals::new();
+        let world = visuals_world();
+
+        let ops = v.render_handler(&world);
+
+        // No hit and no afterimage: only the balance ring is drawn
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[0], TbRenderOp::CircleOutline { radius: 0.6, color: TbColor::liquid_bounce().fade(0.2) });
+
+        // Balance 1 of 0..4: fraction 0.25, segments max(2, 48 * 0.25) = 12,
+        // two vertices per segment plus the closing pair
+        match &ops[1] {
+            TbRenderOp::TriangleStrip { pairs } => {
+                assert_eq!(pairs.len(), 26);
+                let ((ix, iz), inner) = pairs[0];
+                let ((ox, oz), outer) = pairs[1];
+                // yRot 0: start = (0 + 90).toRadians() - sweep / 2
+                let sweep = 0.25 * std::f32::consts::TAU;
+                let start = (90.0f32).to_radians() - sweep / 2.0;
+                assert!((ix - inner_x(start, 0.56)).abs() < 1e-5);
+                assert!((iz - inner_z(start, 0.56)).abs() < 1e-5);
+                assert!((ox - outer_x(start, 0.64)).abs() < 1e-5);
+                assert_eq!(inner, TbColor::liquid_bounce().fade(0.35));
+                assert_eq!(outer, TbColor::liquid_bounce());
+            }
+            other => panic!("expected a triangle strip, got {:?}", other),
+        }
+    }
+
+    fn inner_x(start: f32, radius: f32) -> f32 {
+        start.cos() * radius
+    }
+    fn inner_z(start: f32, radius: f32) -> f32 {
+        start.sin() * radius
+    }
+    fn outer_x(start: f32, radius: f32) -> f32 {
+        start.cos() * radius
+    }
+    fn outer_z(start: f32, radius: f32) -> f32 {
+        start.sin() * radius
+    }
+
+    #[test]
+    fn visuals_render_handler_draws_path_landing_and_afterimage_in_order() {
+        let mut v = TbVisuals::new();
+        v.show(
+            &[[0.0, 64.0, 0.0], [1.0, 64.5, 0.0], [2.0, 64.0, 0.0]],
+            Some(1),
+            Some([2.0, 64.0, 0.0]),
+        );
+        v.afterimage = Some(TbAfterimage {
+            pos: [0.0, 64.0, 0.0],
+            y_rot: 45.0,
+            pose: TB_POSE_STANDING,
+            time: 0,
+        });
+        let world = visuals_world();
+
+        let ops = v.render_handler(&world);
+        assert_eq!(ops.len(), 6);
+
+        // The path line: the player's drawn position, then the landing point
+        match &ops[2] {
+            TbRenderOp::LinesWithWidth { width, segments, color } => {
+                assert_eq!(*width, 3.0);
+                assert_eq!(*color, TbColor::liquid_bounce());
+                assert_eq!(segments.len(), 1);
+                assert_eq!(segments[0].0, [0.0, 0.0, 0.0]);
+                assert_eq!(segments[0].1, [1.0, 0.5, 0.0]);
+            }
+            other => panic!("expected the path line, got {:?}", other),
+        }
+
+        // The landing ghost looks at the hit
+        match &ops[3] {
+            TbRenderOp::GhostRender { fill, outline } => {
+                assert_eq!(fill.a, (255.0f32 * 0.12) as u8);
+                assert_eq!(outline.a, (255.0f32 * 0.9) as u8);
+            }
+            other => panic!("expected the landing ghost, got {:?}", other),
+        }
+
+        // The strike from the landing player's eyes to the hit
+        match &ops[4] {
+            TbRenderOp::EyeLine { to_offset, from_color, to_color } => {
+                assert!((to_offset[0] - 1.0).abs() < 1e-9);
+                assert!((to_offset[1] + 2.3).abs() < 1e-9);
+                assert_eq!(to_offset[2], 0.0);
+                assert_eq!(*from_color, TbColor::liquid_bounce().fade(0.05));
+                assert_eq!(*to_color, TbColor::liquid_bounce());
+            }
+            other => panic!("expected the eye line, got {:?}", other),
+        }
+
+        // The afterimage ghost fades out over 450 ms
+        match &ops[5] {
+            TbRenderOp::GhostRender { fill, outline } => {
+                // fade = (1 - 112/450) * ghostFade = 0.7511
+                assert_eq!(fill.a, (255.0f32 * 0.08 * 0.751111) as u8);
+                assert_eq!(outline.a, (255.0f32 * 0.6 * 0.751111) as u8);
+            }
+            other => panic!("expected the afterimage ghost, got {:?}", other),
+        }
+
+        // The ghost ends on the afterimage's pose and rotation
+        assert_eq!(v.ghost.pos, [0.0, 64.0, 0.0]);
+        assert_eq!(v.ghost.y_rot, 45.0);
+        assert_eq!(v.ghost.x_rot, 0.0);
+    }
+
+    #[test]
+    fn visuals_ghost_fade_clamps_around_the_camera() {
+        // A ghost under the camera fades out completely
+        assert_eq!(tb_ghost_fade([0.0, 66.0, 0.0], [0.0, 65.8, 0.0]), 0.0);
+        // At 0.8 blocks it starts to appear, at 2.0 it is fully visible
+        assert_eq!(tb_ghost_fade([0.8, 65.8, 0.0], [0.0, 65.8, 0.0]), 0.0);
+        assert_eq!(tb_ghost_fade([3.0, 70.0, 0.0], [0.0, 65.8, 0.0]), 1.0);
+    }
+
+    #[test]
+    fn visuals_looking_at_rotates_the_landing_ghost_toward_the_hit() {
+        // Facing +z is yaw 0
+        assert!((tb_looking_at([0.0, 0.0, 1.0], [0.0, 0.0, 0.0]).0).abs() < 1e-4);
+        // Facing +x is yaw -90
+        assert!((tb_looking_at([1.0, 0.0, 0.0], [0.0, 0.0, 0.0]).0 + 90.0).abs() < 1e-4);
+        // Straight up is pitch -90
+        assert!((tb_looking_at([0.0, 1.0, 0.0], [0.0, 0.0, 0.0]).1 + 90.0).abs() < 1e-4);
+        // Level on the ground keeps pitch 0
+        assert!((tb_looking_at([0.0, 0.0, 2.0], [0.0, 0.0, 0.0]).1).abs() < 1e-4);
+    }
+}

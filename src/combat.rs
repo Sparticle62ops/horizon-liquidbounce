@@ -21604,6 +21604,13 @@ pub fn crystal_aura() -> Module {
             // SubmoduleSetDead (ToggleableValueGroup "SetDead", true)
             boolean("SetDead", true),
             int("ConfirmTime", 150, 10, 2000),
+            // CrystalAuraDamageOptions (ValueGroup "Damage")
+            float("MaxSelfDamage", 2.0, 0.0, 10.0),
+            float("MaxFriendDamage", 1.0, 0.0, 10.0),
+            float("MinEnemyDamage", 5.0, 0.0, 10.0),
+            boolean("AntiSuicide", true),
+            boolean("Efficient", true),
+            boolean("Terrain", true),
             // SubmoduleIdPredict (ToggleableValueGroup "IDPredict", false)
             boolean("IDPredict", false),
             // CrystalAuraTriggerer (ValueGroup "Triggers"): NotWhileUsingItem /
@@ -26730,5 +26737,736 @@ mod ca_post_tests {
         pa_repeatable_tick(&mut hooks, &mut tracker, 1200);
         assert_eq!(hooks.timed_out, vec![5]);
         assert!(tracker.attacked_ids.is_empty());
+    }
+}
+
+// ----- combat/crystalaura/CrystalAuraDamageOptions.kt (GPL-3.0, (c)
+// 2015-2026 CCBlueX) — ported 1:1.
+
+/// Upstream `CrystalAuraDamageOptions` (ValueGroup "Damage") settings.
+#[derive(Clone, Copy, Debug)]
+pub struct CaDamageOptionsSettings {
+    /// `MaxSelfDamage` 2.0 0..10
+    pub max_self_damage: f32,
+    /// `MaxFriendDamage` 1.0 0..10
+    pub max_friend_damage: f32,
+    /// `MinEnemyDamage` 5.0 0..10
+    pub min_enemy_damage: f32,
+    /// `AntiSuicide` true: won't place / break crystals that would kill us.
+    pub anti_suicide: bool,
+    /// `Efficient` true: only places / breaks crystals that deal more damage
+    /// to the enemy than to us.
+    pub efficient: bool,
+    /// `Terrain` true: doesn't include blocks that will get blown away in the
+    /// exposure calculation used for the damage calculation.
+    pub terrain: bool,
+}
+
+impl Default for CaDamageOptionsSettings {
+    fn default() -> Self {
+        CaDamageOptionsSettings {
+            max_self_damage: 2.0,
+            max_friend_damage: 1.0,
+            min_enemy_damage: 5.0,
+            anti_suicide: true,
+            efficient: true,
+            terrain: true,
+        }
+    }
+}
+
+/// Upstream `RequestingSubmodule`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CaRequestingSubmodule {
+    /// `PLACE` (basePlace = false)
+    Place,
+    /// `DESTROY` (basePlace = false)
+    Destroy,
+    /// `BASE_PLACE` (basePlace = true)
+    BasePlace,
+}
+
+impl CaRequestingSubmodule {
+    pub fn base_place(self) -> bool {
+        matches!(self, CaRequestingSubmodule::BasePlace)
+    }
+}
+
+/// Which entity the damage is computed for: upstream `CheckedEntity`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CaCheckedEntity {
+    /// `SELF`
+    SelfEntity,
+    /// `TARGET`
+    Target,
+    /// `OTHER`
+    Other,
+}
+
+/// Upstream `DamageConstellation` (the cache key; the TODO about caching the
+/// damage values itself is upstream's).
+#[derive(Clone, Debug)]
+pub struct CaDamageConstellation {
+    pub entity: u64,
+    pub pos: CaBlockPos,
+    pub crystal: (f64, f64, f64),
+    pub requesting_submodule: CaRequestingSubmodule,
+}
+
+impl PartialEq for CaDamageConstellation {
+    fn eq(&self, other: &Self) -> bool {
+        self.entity == other.entity
+            && self.pos == other.pos
+            && self.crystal == other.crystal
+            && self.requesting_submodule == other.requesting_submodule
+    }
+}
+
+impl Eq for CaDamageConstellation {}
+
+impl std::hash::Hash for CaDamageConstellation {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.entity.hash(state);
+        self.pos.hash(state);
+        self.crystal.0.to_bits().hash(state);
+        self.crystal.1.to_bits().hash(state);
+        self.crystal.2.to_bits().hash(state);
+        self.requesting_submodule.hash(state);
+    }
+}
+
+/// Upstream `CrystalAuraDamageOptions.cacheMap` runtime state: an LRU of
+/// `LruCache<DamageConstellation, DamageProvider>(64)`.
+#[derive(Debug, Clone, Default)]
+pub struct CaDamageOptionsState {
+    pub cache_map: Vec<(CaDamageConstellation, DamageProvider)>,
+}
+
+/// A friend candidate the approximation reads: `FriendManager.isFriend(it) &&
+/// it.boundingBox.maxY > pos.y` (the maxY filter included in the seam), with
+/// what the damage calculation needs.
+#[derive(Clone, Copy, Debug)]
+pub struct CaFriendCandidate {
+    pub id: u64,
+    pub block_position: CaBlockPos,
+    pub is_living_entity: bool,
+    pub bounding_box_max_y: f64,
+}
+
+/// `targetTracker.target` and the local player as the approximation reads
+/// them.
+#[derive(Clone, Copy, Debug)]
+pub struct CaDamageTargetRef {
+    pub id: u64,
+    pub block_position: CaBlockPos,
+}
+
+/// The engine surfaces the damage-options reads: the target, the player and
+/// its health, the friend list, and the triggerer cache permission.
+pub trait CaDamageOptionsHooks {
+    /// `targetTracker.target ?: return null` (id + `blockPosition()`).
+    fn da_target(&self) -> Option<CaDamageTargetRef>;
+    /// `player` (id + `player.blockPosition()`).
+    fn da_player(&self) -> (u64, CaBlockPos);
+    /// `player.health + player.absorptionAmount`.
+    fn da_player_total_health(&self) -> f32;
+    /// `world.getEntitiesBoxInRange(pos, 6.0) { FriendManager.isFriend(it) &&
+    /// it.boundingBox.maxY > pos.y }`.
+    fn da_friends_in_range(&self, pos: (f64, f64, f64)) -> Vec<CaFriendCandidate>;
+    /// `CrystalAuraTriggerer.canCache()`.
+    fn da_can_cache(&self) -> bool;
+    /// `SubmoduleBasePlace.terrain`.
+    fn da_base_place_terrain(&self) -> bool;
+}
+
+/// Upstream `CheckedEntity.getDamage(entity, requestingSubmodule, crystal,
+/// maxBlastResistance, include)` and the private
+/// `LivingEntity.getDamage(crystal, requestingSubmodule, checkedEntity)`
+/// extension: builds the constellation, caches when the triggerer allows, and
+/// computes through the checked entity's provider.
+pub fn ca_entity_get_damage(
+    predict: &dyn CaPredictHooks,
+    options: &dyn CaDamageOptionsHooks,
+    settings: &CaDamageOptionsSettings,
+    self_settings: &PredictFeatureSettings,
+    target_settings: &PredictFeatureSettings,
+    state: &mut CaDamageOptionsState,
+    entity: u64,
+    block_position: CaBlockPos,
+    crystal: (f64, f64, f64),
+    requesting_submodule: CaRequestingSubmodule,
+    checked_entity: CaCheckedEntity,
+) -> DamageProvider {
+    let damage_constellation = CaDamageConstellation {
+        entity,
+        pos: block_position,
+        crystal,
+        requesting_submodule,
+    };
+    let calc = || -> DamageProvider {
+        let exclude_not_blast_resistant = settings.terrain
+            && (!requesting_submodule.base_place() || options.da_base_place_terrain());
+        let include = if requesting_submodule.base_place() {
+            let (x, y, z) = ca_block_pos_containing(crystal.0, crystal.1, crystal.2);
+            Some((x, y - 1, z)) // BlockPos.containing(crystal).below()
+        } else {
+            None
+        };
+        let max_blast_resistance = if exclude_not_blast_resistant {
+            Some(9.0f32)
+        } else {
+            None
+        };
+
+        match checked_entity {
+            CaCheckedEntity::SelfEntity => {
+                let ticks = predict_ticks_for(self_settings, requesting_submodule);
+                ca_predict_get_damage(
+                    predict,
+                    self_settings,
+                    PredictFeatureKind::SelfPredict,
+                    entity,
+                    ticks,
+                    crystal,
+                    max_blast_resistance,
+                    include,
+                )
+            }
+            CaCheckedEntity::Target => {
+                if !predict.ca_predict_target_is_player(entity) {
+                    return ca_checked_entity_other_get_damage(
+                        predict,
+                        entity,
+                        crystal,
+                        max_blast_resistance,
+                        include,
+                    );
+                }
+
+                let ticks = predict_ticks_for(target_settings, requesting_submodule);
+                ca_predict_get_damage(
+                    predict,
+                    target_settings,
+                    PredictFeatureKind::TargetPredict,
+                    entity,
+                    ticks,
+                    crystal,
+                    max_blast_resistance,
+                    include,
+                )
+            }
+            CaCheckedEntity::Other => ca_checked_entity_other_get_damage(
+                predict,
+                entity,
+                crystal,
+                max_blast_resistance,
+                include,
+            ),
+        }
+    };
+
+    if options.da_can_cache() {
+        ca_damage_cache_compute_if_absent(state, damage_constellation, calc)
+    } else {
+        calc()
+    }
+}
+
+/// Upstream `OTHER.getDamage`: `NormalDamageProvider(entity
+/// .getDamageFromExplosion(crystal, include, maxBlastResistance))`.
+fn ca_checked_entity_other_get_damage(
+    predict: &dyn CaPredictHooks,
+    entity: u64,
+    crystal: (f64, f64, f64),
+    max_blast_resistance: Option<f32>,
+    include: Option<CaBlockPos>,
+) -> DamageProvider {
+    DamageProvider::Normal {
+        damage: predict.ca_predict_damage_from_explosion(
+            entity,
+            crystal,
+            include,
+            max_blast_resistance,
+            None,
+        ),
+    }
+}
+
+/// Upstream `when (requestingSubmodule) { PLACE -> placeTicks, DESTROY ->
+/// destroyTicks, BASE_PLACE -> basePlaceTicks }`.
+fn predict_ticks_for(settings: &PredictFeatureSettings, requesting: CaRequestingSubmodule) -> i32 {
+    match requesting {
+        CaRequestingSubmodule::Place => settings.place_ticks,
+        CaRequestingSubmodule::Destroy => settings.destroy_ticks,
+        CaRequestingSubmodule::BasePlace => settings.base_place_ticks,
+    }
+}
+
+/// Upstream `LruCache.computeIfAbsent(constellation, calc)` with recency on
+/// hit and the 64-entry eviction.
+fn ca_damage_cache_compute_if_absent(
+    state: &mut CaDamageOptionsState,
+    key: CaDamageConstellation,
+    calc: impl FnOnce() -> DamageProvider,
+) -> DamageProvider {
+    if let Some(idx) = state.cache_map.iter().position(|(k, _)| *k == key) {
+        let (k, v) = state.cache_map.remove(idx);
+        state.cache_map.push((k, v));
+        return v;
+    }
+
+    let value = calc();
+    state.cache_map.push((key, value));
+    if state.cache_map.len() > 64 {
+        state.cache_map.remove(0);
+    }
+    value
+}
+
+/// Upstream `CrystalAuraDamageOptions.approximateExplosionDamage(pos,
+/// requestingSubmodule)`: approximates how favorable an explosion of a
+/// crystal at `pos` would be. Returns `(self-damage, enemy-damage)` or `None`
+/// when the constellation is unfavorable.
+pub fn ca_approximate_explosion_damage(
+    predict: &dyn CaPredictHooks,
+    options: &dyn CaDamageOptionsHooks,
+    settings: &CaDamageOptionsSettings,
+    self_settings: &PredictFeatureSettings,
+    target_settings: &PredictFeatureSettings,
+    state: &mut CaDamageOptionsState,
+    pos: (f64, f64, f64),
+    requesting_submodule: CaRequestingSubmodule,
+) -> Option<(f32, f32)> {
+    let target = match options.da_target() {
+        Some(target) => target,
+        None => return None,
+    };
+
+    let damage_to_target = ca_entity_get_damage(
+        predict,
+        options,
+        settings,
+        self_settings,
+        target_settings,
+        state,
+        target.id,
+        target.block_position,
+        pos,
+        requesting_submodule,
+        CaCheckedEntity::Target,
+    );
+    let not_enough_damage = damage_to_target.is_smaller_than(settings.min_enemy_damage);
+    if not_enough_damage {
+        return None;
+    }
+
+    let (player, player_block) = options.da_player();
+    let self_damage = ca_entity_get_damage(
+        predict,
+        options,
+        settings,
+        self_settings,
+        target_settings,
+        state,
+        player,
+        player_block,
+        pos,
+        requesting_submodule,
+        CaCheckedEntity::SelfEntity,
+    );
+    let will_kill = settings.anti_suicide
+        && self_damage.is_any_greater_than_or_equal(options.da_player_total_health());
+    let too_much_damage = self_damage.is_greater_than(settings.max_self_damage);
+    if will_kill || too_much_damage {
+        return None;
+    }
+
+    let mut too_much_damage_for_friend = false;
+    if settings.max_friend_damage < 10.0 {
+        // 10f is the maximum allowed by the setting
+        let friends = options.da_friends_in_range(pos);
+
+        if friends.iter().any(|friend| {
+            friend.is_living_entity
+                && ca_entity_get_damage(
+                    predict,
+                    options,
+                    settings,
+                    self_settings,
+                    target_settings,
+                    state,
+                    friend.id,
+                    friend.block_position,
+                    pos,
+                    requesting_submodule,
+                    CaCheckedEntity::Other,
+                )
+                .is_greater_than(settings.max_friend_damage)
+        }) {
+            too_much_damage_for_friend = true;
+        }
+    }
+
+    let is_not_efficient =
+        settings.efficient && damage_to_target.is_smaller_than_or_equal_other(&self_damage);
+    if too_much_damage_for_friend || is_not_efficient {
+        return None;
+    }
+
+    Some((self_damage.get_fixed(), damage_to_target.get_fixed()))
+}
+
+mod ca_damage_options_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    struct DamageMock {
+        // CaDamageOptionsHooks
+        target: Option<CaDamageTargetRef>,
+        player: (u64, CaBlockPos),
+        player_total_health: f32,
+        friends: Vec<CaFriendCandidate>,
+        friend_reads: RefCell<usize>,
+        can_cache: bool,
+        base_place_terrain: bool,
+        // CaPredictHooks
+        is_player: bool,
+        explosion: HashMap<u64, f32>,
+        explosion_calls: RefCell<Vec<(u64, Option<f32>, Option<CaBlockPos>)>>,
+        snapshots: RefCell<Vec<(PredictFeatureKind, i32)>>,
+    }
+
+    impl Default for DamageMock {
+        fn default() -> Self {
+            DamageMock {
+                target: Some(CaDamageTargetRef {
+                    id: 100,
+                    block_position: (5, 64, 5),
+                }),
+                player: (1, (0, 64, 0)),
+                player_total_health: 20.0,
+                friends: Vec::new(),
+                friend_reads: RefCell::new(0),
+                can_cache: false,
+                base_place_terrain: true,
+                is_player: true,
+                explosion: HashMap::new(),
+                explosion_calls: RefCell::new(Vec::new()),
+                snapshots: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl CaPredictHooks for DamageMock {
+        fn ca_predict_snapshot_pos(
+            &self,
+            kind: PredictFeatureKind,
+            _player: Option<u64>,
+            ticks: i32,
+        ) -> (f64, f64, f64) {
+            self.snapshots.borrow_mut().push((kind, ticks));
+            (0.0, 64.0, 0.0)
+        }
+        fn ca_predict_bounding_box(&self, _player: Option<u64>) -> (f64, f64, f64, f64, f64, f64) {
+            (0.0, 64.0, 0.0, 1.0, 65.0, 1.0)
+        }
+        fn ca_predict_damage_from_explosion(
+            &self,
+            player: u64,
+            _crystal: (f64, f64, f64),
+            include: Option<CaBlockPos>,
+            max_blast_resistance: Option<f32>,
+            _entity_bounding_box: Option<(f64, f64, f64, f64, f64, f64)>,
+        ) -> f32 {
+            self.explosion_calls
+                .borrow_mut()
+                .push((player, max_blast_resistance, include));
+            self.explosion.get(&player).copied().unwrap_or(0.0)
+        }
+        fn ca_predict_target_is_player(&self, _target: u64) -> bool {
+            self.is_player
+        }
+    }
+
+    impl CaDamageOptionsHooks for DamageMock {
+        fn da_target(&self) -> Option<CaDamageTargetRef> {
+            self.target
+        }
+        fn da_player(&self) -> (u64, CaBlockPos) {
+            self.player
+        }
+        fn da_player_total_health(&self) -> f32 {
+            self.player_total_health
+        }
+        fn da_friends_in_range(&self, _pos: (f64, f64, f64)) -> Vec<CaFriendCandidate> {
+            *self.friend_reads.borrow_mut() += 1;
+            self.friends.clone()
+        }
+        fn da_can_cache(&self) -> bool {
+            self.can_cache
+        }
+        fn da_base_place_terrain(&self) -> bool {
+            self.base_place_terrain
+        }
+    }
+
+    fn predict_settings(place: i32, destroy: i32, base: i32) -> PredictFeatureSettings {
+        let mut s = PredictFeatureSettings::default();
+        s.enabled = true;
+        s.place_ticks = place;
+        s.destroy_ticks = destroy;
+        s.base_place_ticks = base;
+        s.calculation_mode = PredictCalculationMode::PredictOnly;
+        s
+    }
+
+    fn run(
+        mock: &mut DamageMock,
+        settings: &CaDamageOptionsSettings,
+        pos: (f64, f64, f64),
+        requesting: CaRequestingSubmodule,
+    ) -> Option<(f32, f32)> {
+        let self_settings = predict_settings(2, 3, 1);
+        let target_settings = predict_settings(4, 5, 6);
+        let mut state = CaDamageOptionsState::default();
+        ca_approximate_explosion_damage(
+            mock,
+            mock,
+            settings,
+            &self_settings,
+            &target_settings,
+            &mut state,
+            pos,
+            requesting,
+        )
+    }
+
+    #[test]
+    fn da_no_target_returns_none() {
+        let mut mock = DamageMock::default();
+        mock.target = None;
+        assert!(run(&mut mock, &CaDamageOptionsSettings::default(), (1.0, 64.0, 1.0), CaRequestingSubmodule::Place).is_none());
+    }
+
+    #[test]
+    fn da_min_enemy_damage_gate() {
+        let mut mock = DamageMock::default();
+        mock.explosion.insert(100, 4.9);
+        assert!(run(&mut mock, &CaDamageOptionsSettings::default(), (1.0, 64.0, 1.0), CaRequestingSubmodule::Place).is_none());
+
+        mock.explosion.insert(100, 5.0);
+        mock.explosion.insert(1, 1.0);
+        assert_eq!(
+            run(&mut mock, &CaDamageOptionsSettings::default(), (1.0, 64.0, 1.0), CaRequestingSubmodule::Place),
+            Some((1.0, 5.0))
+        );
+    }
+
+    #[test]
+    fn da_anti_suicide_and_max_self_gates() {
+        let settings = CaDamageOptionsSettings::default();
+        let mut mock = DamageMock::default();
+        mock.explosion.insert(100, 5.0);
+
+        // killing itself: self damage >= health + absorption
+        mock.explosion.insert(1, 20.0);
+        assert!(run(&mut mock, &settings, (1.0, 64.0, 1.0), CaRequestingSubmodule::Place).is_none());
+
+        // over MaxSelfDamage but not killing
+        mock.player_total_health = 40.0;
+        mock.explosion.insert(1, 2.5);
+        assert!(run(&mut mock, &settings, (1.0, 64.0, 1.0), CaRequestingSubmodule::Place).is_none());
+
+        // acceptable self damage
+        mock.explosion.insert(1, 2.0);
+        assert!(run(&mut mock, &settings, (1.0, 64.0, 1.0), CaRequestingSubmodule::Place).is_some());
+
+        // anti suicide off: the kill is allowed
+        let mut settings = settings.clone();
+        settings.anti_suicide = false;
+        mock.explosion.insert(1, 25.0);
+        assert!(run(&mut mock, &settings, (1.0, 64.0, 1.0), CaRequestingSubmodule::Place).is_none(), "still over MaxSelfDamage");
+    }
+
+    #[test]
+    fn da_efficient_gate() {
+        let settings = CaDamageOptionsSettings::default();
+        let mut mock = DamageMock::default();
+        mock.explosion.insert(100, 5.0);
+
+        // enemy damage equal to self damage is not efficient
+        mock.explosion.insert(1, 5.0);
+        assert!(run(&mut mock, &settings, (1.0, 64.0, 1.0), CaRequestingSubmodule::Place).is_none());
+
+        // strictly better for the enemy
+        mock.explosion.insert(1, 1.0);
+        assert!(run(&mut mock, &settings, (1.0, 64.0, 1.0), CaRequestingSubmodule::Place).is_some());
+
+        // efficient off: equality is fine
+        let mut settings = settings.clone();
+        settings.efficient = false;
+        mock.explosion.insert(1, 5.0);
+        assert!(run(&mut mock, &settings, (1.0, 64.0, 1.0), CaRequestingSubmodule::Place).is_none(), "self damage 5 > MaxSelfDamage 2");
+
+        let mut settings = settings.clone();
+        settings.efficient = false;
+        settings.max_self_damage = 6.0;
+        assert!(run(&mut mock, &settings, (1.0, 64.0, 1.0), CaRequestingSubmodule::Place).is_some());
+    }
+
+    #[test]
+    fn da_friend_gate() {
+        let settings = CaDamageOptionsSettings::default();
+        let mut mock = DamageMock::default();
+        mock.explosion.insert(100, 5.0);
+        mock.explosion.insert(1, 1.0);
+        mock.friends = vec![CaFriendCandidate {
+            id: 7,
+            block_position: (3, 64, 3),
+            is_living_entity: true,
+            bounding_box_max_y: 65.0,
+        }];
+
+        // the friend takes more than MaxFriendDamage (1.0)
+        mock.explosion.insert(7, 1.5);
+        assert!(run(&mut mock, &settings, (1.0, 64.0, 1.0), CaRequestingSubmodule::Place).is_none());
+        assert_eq!(*mock.friend_reads.borrow(), 1);
+
+        // within the limit
+        mock.explosion.insert(7, 1.0);
+        assert!(run(&mut mock, &settings, (1.0, 64.0, 1.0), CaRequestingSubmodule::Place).is_some());
+
+        // a non-living friend is skipped
+        mock.friends[0].is_living_entity = false;
+        mock.explosion.insert(7, 5.0);
+        assert!(run(&mut mock, &settings, (1.0, 64.0, 1.0), CaRequestingSubmodule::Place).is_some());
+
+        // MaxFriendDamage 10.0 skips the friend read entirely
+        let mut settings = settings.clone();
+        settings.max_friend_damage = 10.0;
+        let reads_before = *mock.friend_reads.borrow();
+        mock.explosion.insert(7, 9.0);
+        assert!(run(&mut mock, &settings, (1.0, 64.0, 1.0), CaRequestingSubmodule::Place).is_some());
+        assert_eq!(*mock.friend_reads.borrow(), reads_before, "no friend read at MaxFriendDamage 10");
+    }
+
+    #[test]
+    fn da_terrain_mbr_and_include() {
+        let settings = CaDamageOptionsSettings::default();
+        let mut mock = DamageMock::default();
+        mock.explosion.insert(100, 5.0);
+        mock.explosion.insert(1, 1.0);
+
+        // PLACE: terrain on and not base place -> blast resistance 9, no include
+        run(&mut mock, &settings, (1.7, 64.0, 2.3), CaRequestingSubmodule::Place);
+        let calls = mock.explosion_calls.borrow().clone();
+        assert!(calls.iter().all(|(_, mbr, include)| *mbr == Some(9.0) && include.is_none()));
+
+        // BASE_PLACE with SubmoduleBasePlace.terrain: mbr 9 + the block below the crystal
+        mock.explosion_calls.borrow_mut().clear();
+        run(&mut mock, &settings, (1.7, 64.0, 2.3), CaRequestingSubmodule::BasePlace);
+        let calls = mock.explosion_calls.borrow().clone();
+        assert!(calls.iter().all(|(_, mbr, include)| *mbr == Some(9.0) && *include == Some((1, 63, 2))));
+
+        // BASE_PLACE with SubmoduleBasePlace.terrain off: no blast resistance
+        mock.base_place_terrain = false;
+        mock.explosion_calls.borrow_mut().clear();
+        run(&mut mock, &settings, (1.7, 64.0, 2.3), CaRequestingSubmodule::BasePlace);
+        let calls = mock.explosion_calls.borrow().clone();
+        assert!(calls.iter().all(|(_, mbr, include)| mbr.is_none() && *include == Some((1, 63, 2))));
+        mock.base_place_terrain = true;
+
+        // Terrain setting off: no blast resistance anywhere
+        let mut settings = settings.clone();
+        settings.terrain = false;
+        mock.explosion_calls.borrow_mut().clear();
+        run(&mut mock, &settings, (1.7, 64.0, 2.3), CaRequestingSubmodule::Place);
+        let calls = mock.explosion_calls.borrow().clone();
+        assert!(calls.iter().all(|(_, mbr, _)| mbr.is_none()));
+    }
+
+    #[test]
+    fn da_target_non_player_falls_to_other() {
+        let settings = CaDamageOptionsSettings::default();
+        let mut mock = DamageMock::default();
+        mock.is_player = false;
+        mock.explosion.insert(100, 5.0);
+        mock.explosion.insert(1, 1.0);
+
+        assert_eq!(
+            run(&mut mock, &settings, (1.0, 64.0, 1.0), CaRequestingSubmodule::Place),
+            Some((1.0, 5.0))
+        );
+        // the non-player target is computed at its current position: no
+        // snapshot simulation for it (only the self tick snapshot ran)
+        let snapshots = mock.snapshots.borrow().clone();
+        assert_eq!(snapshots, vec![(PredictFeatureKind::SelfPredict, 2)]);
+        assert!(!mock.snapshots.borrow().iter().any(|(k, _)| *k == PredictFeatureKind::TargetPredict));
+    }
+
+    #[test]
+    fn da_self_ticks_per_requesting_submodule() {
+        let settings = CaDamageOptionsSettings::default();
+        let mut mock = DamageMock::default();
+        mock.explosion.insert(100, 5.0);
+        mock.explosion.insert(1, 1.0);
+        mock.can_cache = false;
+
+        run(&mut mock, &settings, (1.0, 64.0, 1.0), CaRequestingSubmodule::Destroy);
+        let snapshots = mock.snapshots.borrow().clone();
+        // the target is simulated first (TargetPredict ticks), then self
+        assert_eq!(
+            snapshots,
+            vec![(PredictFeatureKind::TargetPredict, 5), (PredictFeatureKind::SelfPredict, 3)]
+        );
+
+        mock.snapshots.borrow_mut().clear();
+        run(&mut mock, &settings, (1.0, 64.0, 1.0), CaRequestingSubmodule::BasePlace);
+        let snapshots = mock.snapshots.borrow().clone();
+        assert_eq!(
+            snapshots,
+            vec![(PredictFeatureKind::TargetPredict, 6), (PredictFeatureKind::SelfPredict, 1)]
+        );
+    }
+
+    #[test]
+    fn da_cache_hit_miss_and_eviction() {
+        let settings = CaDamageOptionsSettings::default();
+        let mut mock = DamageMock::default();
+        mock.explosion.insert(100, 5.0);
+        mock.explosion.insert(1, 1.0);
+
+        // can_cache false: every call recomputes
+        let self_settings = predict_settings(2, 3, 1);
+        let target_settings = predict_settings(4, 5, 6);
+        let mut state = CaDamageOptionsState::default();
+        ca_approximate_explosion_damage(&mock, &mock, &settings, &self_settings, &target_settings, &mut state, (1.0, 64.0, 1.0), CaRequestingSubmodule::Place);
+        ca_approximate_explosion_damage(&mock, &mock, &settings, &self_settings, &target_settings, &mut state, (1.0, 64.0, 1.0), CaRequestingSubmodule::Place);
+        assert_eq!(mock.explosion_calls.borrow().len(), 4, "two per call (target + self)");
+        assert!(state.cache_map.is_empty());
+
+        // can_cache true: the same constellation is computed once
+        mock.can_cache = true;
+        mock.explosion_calls.borrow_mut().clear();
+        ca_approximate_explosion_damage(&mock, &mock, &settings, &self_settings, &target_settings, &mut state, (1.0, 64.0, 1.0), CaRequestingSubmodule::Place);
+        let first = mock.explosion_calls.borrow().len();
+        ca_approximate_explosion_damage(&mock, &mock, &settings, &self_settings, &target_settings, &mut state, (1.0, 64.0, 1.0), CaRequestingSubmodule::Place);
+        assert_eq!(mock.explosion_calls.borrow().len(), first, "the second call was a cache hit");
+        assert_eq!(state.cache_map.len(), 2, "target + self constellations");
+
+        // a different crystal pos is a miss
+        ca_approximate_explosion_damage(&mock, &mock, &settings, &self_settings, &target_settings, &mut state, (2.0, 64.0, 1.0), CaRequestingSubmodule::Place);
+        assert_eq!(state.cache_map.len(), 4);
+
+        // eviction past 64 entries keeps the recency order
+        for i in 0..70 {
+            let pos = (i as f64, 64.0, i as f64);
+            ca_approximate_explosion_damage(&mock, &mock, &settings, &self_settings, &target_settings, &mut state, pos, CaRequestingSubmodule::Place);
+        }
+        assert!(state.cache_map.len() <= 64);
+        // the very first entries are gone
+        let oldest = state.cache_map.first().unwrap().0.clone();
+        assert_ne!(oldest.crystal, (1.0, 64.0, 1.0));
     }
 }

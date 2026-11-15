@@ -853,6 +853,8 @@ pub enum BlinkAction {
     Queue,
     /// Upstream `BlinkManager.Action.PASS` (set by CriticalsBlink).
     Pass,
+    /// Upstream `BlinkManager.Action.FLUSH` (set by ModuleBacktrack).
+    Flush,
 }
 
 /// The packets FakeLag's logic distinguishes, flattened to their
@@ -888,15 +890,28 @@ pub struct BlinkPacketEvent {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Chronometer {
     last_reset_ms: u64,
+    /// Upstream `waitForAtLeast` floor (`ModuleBacktrack`).
+    pub wait_at_least_ms: u64,
 }
 
 impl Chronometer {
     pub fn reset(&mut self, now_ms: u64) {
         self.last_reset_ms = now_ms;
+        self.wait_at_least_ms = 0;
     }
 
     pub fn has_at_least_elapsed(&self, ms: u64, now_ms: u64) -> bool {
         now_ms.saturating_sub(self.last_reset_ms) >= ms
+    }
+
+    /// Upstream `Chronometer.waitForAtLeast(time)`.
+    pub fn wait_for_at_least(&mut self, time_ms: u64) {
+        self.wait_at_least_ms = time_ms;
+    }
+
+    /// Upstream `Chronometer.hasElapsed(time)`, honoring the floor.
+    pub fn has_elapsed(&self, now_ms: u64, time_ms: u64) -> bool {
+        self.has_at_least_elapsed(self.wait_at_least_ms.max(time_ms), now_ms)
     }
 }
 
@@ -17499,5 +17514,948 @@ mod criticals_tests {
         }
         let grounded = CritPlayer::default();
         assert!(criticals_visuals_attack_handler(&module, &hooks, &grounded, &living_event()).is_some());
+    }
+}
+
+// ----- Seams + ModuleBacktrack.kt -----
+
+/// Upstream `BlinkManager.Action.FLUSH`.
+#[derive(Clone, Copy, Debug)]
+pub enum BtIncomingPacket {
+    /// Upstream `ServerboundChatPacket | ClientboundSystemChatPacket |
+    /// ServerboundChatCommandPacket` arm: message-related packets.
+    ChatLike,
+    ClientboundPlayerPosition,
+    ClientboundDisconnect,
+    /// `ClientboundSoundPacket` with `sound.value() == SoundEvents.PLAYER_HURT`.
+    OwnHurtSound,
+    /// `ClientboundSoundPacket`, anything else.
+    OtherSound,
+    /// `ClientboundSetHealthPacket` with `health <= 0`.
+    OwnDeath,
+    /// `ClientboundSetHealthPacket` with `health > 0`.
+    OtherHealth,
+    /// Any further packet carrying the target's position.
+    TargetPosition,
+}
+
+/// Upstream `PacketEvent` flattened for Backtrack's queue handler: the
+/// `BlinkPacketEvent.packet` nullable read becomes `Option`.
+pub struct BtPacketEvent {
+    pub origin: TransferOrigin,
+    pub packet: Option<BtIncomingPacket>,
+    pub action: Option<BlinkAction>,
+}
+
+/// The module and engine surfaces `ModuleBacktrack` reads.
+pub trait BacktrackHooks {
+    fn now_ms(&self) -> u64 {
+        0
+    }
+    /// `player.tickCount`.
+    fn player_tick_count(&self) -> i64 {
+        0
+    }
+    /// `VelocityReduce.ownsIncomingBlinkQueue`.
+    fn velocity_owns_incoming_blink_queue(&self) -> bool {
+        false
+    }
+    /// `VelocityReduce.backtrackBlocked`.
+    fn velocity_backtrack_blocked(&self) -> bool {
+        false
+    }
+    /// `requires.all { it.asBoolean }` over the `KillAuraRequirements`
+    /// multi-choice (Click/MouseMovement/Weapon/EmptyHand/VanillaName/NotBreaking).
+    fn requirements_met(&self) -> bool {
+        true
+    }
+    /// `target.shouldBeAttacked()` for the tracked target.
+    fn target_should_be_attacked(&self) -> bool {
+        false
+    }
+    /// `target.isAlive`.
+    fn target_is_alive(&self) -> bool {
+        false
+    }
+    /// `target.boxedDistanceTo(player)`.
+    fn target_boxed_distance(&self) -> f64 {
+        0.0
+    }
+    /// `world.findEnemy(range) != null` (the Range target mode).
+    fn find_enemy(&self, max_range: f32) -> bool {
+        false
+    }
+    /// `target.squareBoxedDistanceTo(player, pos)` (distance to the given position).
+    fn target_square_boxed_distance_to_player(&self, pos: Vec3) -> f64 {
+        0.0
+    }
+    /// `target.squaredBoxedDistanceTo(player)`.
+    fn target_squared_boxed_distance_to_player(&self) -> f64 {
+        0.0
+    }
+    /// `percentageChance("Chance").asBoolean` roll.
+    fn chance_roll(&self, percentage: f64) -> bool {
+        true
+    }
+    /// A 0..1 roll for `IntRange.random()` / `FloatRange.random()`.
+    fn rand01(&self) -> f64 {
+        0.5
+    }
+    /// `TrackedEntityPosition.handlePacket(packet, world, target)`: update the
+    /// tracked position from the packet, returning the new base when present.
+    fn position_handle_packet(&mut self, packet: &BtIncomingPacket) -> Option<Vec3>;
+    /// `TrackedEntityPosition.setBaseFrom(entity)` (instant box placement).
+    fn position_set_base_from_entity(&mut self) {}
+    /// `BlinkManager.packetQueue.any { it.origin == INCOMING }`.
+    fn has_queued_incoming(&self) -> bool {
+        false
+    }
+    /// `BlinkManager.flush(TransferOrigin.INCOMING)`.
+    fn flush_incoming(&mut self) {}
+    /// `BlinkManager.packetQueue.removeIf { it.origin == INCOMING }`.
+    fn remove_queued_incoming(&mut self) {}
+    /// `BlinkManager.flush { snapshot.origin == INCOMING && snapshot.timestamp <= cutoff }`.
+    fn flush_older_than(&mut self, cutoff_ms: u64) {}
+    /// `player.inGame`.
+    fn in_game(&self) -> bool {
+        true
+    }
+}
+
+/// The module-tree state (`ModuleBacktrack` object state).
+#[derive(Clone, Debug)]
+pub struct BacktrackState {
+    /// Upstream `currentDelay` (`delay.random()`, default 100..150 midpoint via rand01).
+    pub current_delay: i64,
+    /// Upstream `chancePassed`.
+    pub chance_passed: bool,
+    /// Upstream `shouldPause` (the hurt-time flag; consulted only when PauseOnHurtTime is on).
+    pub should_pause: bool,
+    /// Upstream `target != null` (+ its identity for enemy-change resets).
+    pub target: bool,
+    pub target_id: Option<u64>,
+    /// Upstream `position.base` (`TrackedEntityPosition`), ZERO when cleared.
+    pub target_pos: Vec3,
+    pub chronometer: Chronometer,
+    pub tracking_buffer_chronometer: Chronometer,
+    pub attack_chronometer: Chronometer,
+}
+
+impl Default for BacktrackState {
+    fn default() -> Self {
+        BacktrackState {
+            current_delay: 125,
+            chance_passed: true,
+            should_pause: false,
+            target: false,
+            target_id: None,
+            target_pos: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            chronometer: Chronometer::default(),
+            tracking_buffer_chronometer: Chronometer::default(),
+            attack_chronometer: Chronometer::default(),
+        }
+    }
+}
+
+/// Upstream `ModuleBacktrack` — delays incoming packets so you can hit the
+/// enemy with its tracked (older) position. The Esp renderer choice is
+/// flattened as a plain choice (Box/Model/Wireframe/None, default Wireframe =
+/// upstream `choices("Esp", 2)`); the BlinkManager queue access lives on the
+/// hooks.
+pub fn backtrack() -> Module {
+    Module::new(
+        "Backtrack",
+        COMBAT,
+        vec![
+            float_range("Range", 1.0, 3.0, 0.0, 10.0),
+            int_range("Delay", 100, 150, 0, 1000),
+            int_range("NextBacktrackDelay", 0, 10, 0, 2000),
+            int("TrackingBuffer", 500, 0, 2000),
+            float("Chance", 50.0, 0.0, 100.0),
+            // Upstream `multiEnumChoice<KillAuraRequirements>("Requires")`.
+            multi_choice("Requires", &[], &["Click", "MouseMovement", "Weapon", "EmptyHand", "VanillaName", "NotBreaking"]),
+            // PauseOnHurtTime group ("PauseOnHurtTime", false)
+            boolean("PauseOnHurtTime", false),
+            int("HurtTime", 3, 0, 10),
+            choice("TargetMode", "Attack", &["Attack", "Range"]),
+            int("LastAttackTimeToWork", 1000, 0, 5000),
+            choice("Esp", "Wireframe", &["Box", "Model", "Wireframe", "None"]),
+        ],
+    )
+}
+
+fn bt_target_mode(module: &Module) -> BtTargetMode {
+    match module.setting("TargetMode").map(|v| &v.kind) {
+        Some(ValueKind::Choice(sel, _)) if sel == "Range" => BtTargetMode::Range,
+        _ => BtTargetMode::Attack,
+    }
+}
+
+/// Upstream `ModuleBacktrack.Mode`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BtTargetMode {
+    Attack,
+    Range,
+}
+
+/// Upstream `ModuleBacktrack.delay.random()`.
+pub fn backtrack_delay_random(module: &Module, roll: f64) -> i64 {
+    let (from, to) = setting_int_range(module, "Delay", (100, 150));
+    let len = (to - from + 1).max(1) as f64;
+    (from as f64 + roll * len).floor().clamp(from as f64, to as f64) as i64
+}
+
+/// Upstream `ModuleBacktrack.nextBacktrackDelay.random()`.
+pub fn backtrack_next_delay_random(module: &Module, roll: f64) -> i64 {
+    let (from, to) = setting_int_range(module, "NextBacktrackDelay", (0, 10));
+    let len = (to - from + 1).max(1) as f64;
+    (from as f64 + roll * len).floor().clamp(from as f64, to as f64) as i64
+}
+
+/// Upstream `ModuleBacktrack.shouldPause()`.
+fn backtrack_should_pause(module: &Module, state: &BacktrackState) -> bool {
+    setting_bool(module, "PauseOnHurtTime", false) && state.should_pause
+}
+
+/// Upstream `ModuleBacktrack.hasQueuedIncoming()` lives on the hooks.
+pub fn backtrack_has_queued_incoming(hooks: &dyn BacktrackHooks) -> bool {
+    hooks.has_queued_incoming()
+}
+
+/// Upstream `ModuleBacktrack.isLagging()`.
+pub fn backtrack_is_lagging(module: &Module, hooks: &dyn BacktrackHooks) -> bool {
+    module.running && hooks.has_queued_incoming()
+}
+
+/// Upstream `ModuleBacktrack.clear(handlePackets = true, clearOnly = false,
+/// resetChronometer = true)`.
+pub fn backtrack_clear(
+    module: &Module,
+    hooks: &mut dyn BacktrackHooks,
+    state: &mut BacktrackState,
+    handle_packets: bool,
+    clear_only: bool,
+    reset_chronometer: bool,
+) {
+    if handle_packets && !clear_only {
+        hooks.flush_incoming();
+    } else if clear_only {
+        hooks.remove_queued_incoming();
+    }
+
+    if state.target && reset_chronometer {
+        state
+            .chronometer
+            .wait_for_at_least(backtrack_next_delay_random(module, hooks.rand01()) as u64);
+    }
+
+    state.target = false;
+    state.target_id = None;
+    state.target_pos = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+}
+
+/// Upstream `ModuleBacktrack.onEnabled()` / `onDisabled()`.
+pub fn backtrack_on_enabled(module: &Module, hooks: &mut dyn BacktrackHooks, state: &mut BacktrackState) {
+    backtrack_clear(module, hooks, state, false, false, true);
+}
+
+pub fn backtrack_on_disabled(module: &Module, hooks: &mut dyn BacktrackHooks, state: &mut BacktrackState) {
+    backtrack_clear(module, hooks, state, true, false, true);
+}
+
+/// Upstream `ModuleBacktrack.shouldBacktrack(target)`. `inRange` resets the
+/// tracking-buffer chronometer as a side effect, like upstream.
+pub fn backtrack_should_backtrack(
+    module: &Module,
+    hooks: &dyn BacktrackHooks,
+    state: &mut BacktrackState,
+) -> bool {
+    let distance = hooks.target_boxed_distance();
+    let (range_from, range_to) = setting_float_range(module, "Range", (1.0, 3.0));
+    let in_range = distance >= range_from && distance <= range_to;
+
+    if in_range {
+        state.tracking_buffer_chronometer.reset(hooks.now_ms());
+    }
+
+    (in_range
+        || !state
+            .tracking_buffer_chronometer
+            .has_elapsed(hooks.now_ms(), setting_int(module, "TrackingBuffer", 500) as u64))
+        && hooks.target_should_be_attacked()
+        && hooks.player_tick_count() > 10
+        && state.chance_passed
+        && hooks.requirements_met()
+        && state.chronometer.has_elapsed(hooks.now_ms(), 0)
+        && !backtrack_should_pause(module, state)
+        && !state
+            .attack_chronometer
+            .has_elapsed(hooks.now_ms(), setting_int(module, "LastAttackTimeToWork", 1000) as u64)
+        && !hooks.velocity_backtrack_blocked()
+}
+
+/// Upstream `ModuleBacktrack.shouldCancelPackets()`.
+pub fn backtrack_should_cancel_packets(
+    module: &Module,
+    hooks: &dyn BacktrackHooks,
+    state: &mut BacktrackState,
+) -> bool {
+    state.target && hooks.target_is_alive() && backtrack_should_backtrack(module, hooks, state)
+}
+
+/// Upstream `ModuleBacktrack.processTarget(enemy)`.
+pub fn backtrack_process_target(
+    module: &Module,
+    hooks: &mut dyn BacktrackHooks,
+    state: &mut BacktrackState,
+    enemy_id: u64,
+    enemy_is_living: bool,
+    enemy_hurt_time: i32,
+) {
+    state.should_pause =
+        enemy_is_living && enemy_hurt_time as i64 >= setting_int(module, "HurtTime", 3);
+
+    if !backtrack_should_backtrack(module, hooks, state) {
+        return;
+    }
+
+    // Reset on enemy change.
+    if Some(enemy_id) != state.target_id {
+        backtrack_clear(module, hooks, state, true, false, false);
+
+        // Instantly set new position, so it does not look like the box was
+        // created with delay.
+        hooks.position_set_base_from_entity();
+    }
+
+    state.target_id = Some(enemy_id);
+    state.target = true;
+}
+
+/// Upstream `queuePacketHandler` (`handler<BlinkPacketEvent>`).
+pub fn backtrack_queue_packet_handler(
+    module: &Module,
+    hooks: &mut dyn BacktrackHooks,
+    state: &mut BacktrackState,
+    event: &mut BtPacketEvent,
+) {
+    if event.origin != TransferOrigin::Incoming {
+        return;
+    }
+
+    if hooks.velocity_owns_incoming_blink_queue() {
+        return;
+    }
+
+    let should_cancel = backtrack_should_cancel_packets(module, hooks, state);
+    let has_queued_incoming = hooks.has_queued_incoming();
+
+    let packet = match event.packet {
+        None => {
+            if should_cancel || has_queued_incoming {
+                event.action = Some(BlinkAction::Pass);
+            }
+            return;
+        }
+        Some(packet) => packet,
+    };
+
+    if !has_queued_incoming && !should_cancel {
+        return;
+    }
+
+    match packet {
+        // Ignore message-related packets
+        BtIncomingPacket::ChatLike => {
+            event.action = Some(BlinkAction::Pass);
+            return;
+        }
+
+        // Flush on teleport or disconnect
+        BtIncomingPacket::ClientboundPlayerPosition | BtIncomingPacket::ClientboundDisconnect => {
+            backtrack_clear(module, hooks, state, true, false, true);
+            return;
+        }
+
+        // Ignore own hurt sounds
+        BtIncomingPacket::OwnHurtSound => {
+            event.action = Some(BlinkAction::Pass);
+            return;
+        }
+
+        // Flush on own death
+        BtIncomingPacket::OwnDeath => {
+            backtrack_clear(module, hooks, state, true, false, true);
+            return;
+        }
+        BtIncomingPacket::OtherSound | BtIncomingPacket::OtherHealth => {}
+        BtIncomingPacket::TargetPosition => {}
+    }
+
+    // Update box position with these packets
+    if !state.target {
+        return;
+    }
+    if let Some(pos) = hooks.position_handle_packet(&packet) {
+        // Is the target's actual position closer than its tracked position?
+        if hooks.target_square_boxed_distance_to_player(pos)
+            < hooks.target_squared_boxed_distance_to_player()
+        {
+            // Process all packets. We want to be able to hit the enemy, not the
+            // opposite.
+            event.action = Some(BlinkAction::Flush);
+            // And stop right here. No need to cancel further packets.
+            return;
+        }
+    }
+
+    event.action = Some(BlinkAction::Queue);
+}
+
+/// Upstream `worldChangeHandler` (`handler<WorldChangeEvent>`): clear packets
+/// on disconnect only.
+pub fn backtrack_world_change_handler(
+    module: &Module,
+    hooks: &mut dyn BacktrackHooks,
+    state: &mut BacktrackState,
+    world_present: bool,
+) {
+    if !world_present {
+        backtrack_clear(module, hooks, state, true, true, true);
+    }
+}
+
+/// Upstream `tickPacketProcessHandler` (`handler<TickPacketProcessEvent>`).
+pub fn backtrack_tick_packet_process_handler(
+    module: &Module,
+    hooks: &mut dyn BacktrackHooks,
+    state: &mut BacktrackState,
+) {
+    if !hooks.in_game() {
+        backtrack_clear(module, hooks, state, true, true, true);
+        return;
+    }
+
+    if hooks.velocity_owns_incoming_blink_queue() {
+        return;
+    }
+
+    let had_queued_incoming = hooks.has_queued_incoming();
+
+    if backtrack_should_cancel_packets(module, hooks, state) {
+        let now = hooks.now_ms();
+        hooks.flush_older_than(now.saturating_sub(state.current_delay as u64));
+    } else if had_queued_incoming {
+        hooks.flush_incoming();
+        backtrack_clear(module, hooks, state, true, false, true);
+    }
+
+    if !hooks.has_queued_incoming() {
+        state.current_delay = backtrack_delay_random(module, hooks.rand01());
+    }
+}
+
+/// Upstream `attackHandler` (`handler<AttackEntityEvent>`).
+pub fn backtrack_attack_handler(
+    module: &Module,
+    hooks: &mut dyn BacktrackHooks,
+    state: &mut BacktrackState,
+) {
+    state.attack_chronometer.reset(hooks.now_ms()); // Update the last attack time
+    state.chance_passed = hooks.chance_roll(crit_float(module, "Chance", 50.0));
+
+    if bt_target_mode(module) != BtTargetMode::Attack {
+        return;
+    }
+
+    // The engine feeds the attacked entity's identity and hurt state into
+    // processTarget.
+}
+
+/// Upstream `rangeTargetHandler` (`handler<GameTickEvent>`, Range mode only).
+pub fn backtrack_range_target_handler(
+    module: &Module,
+    hooks: &mut dyn BacktrackHooks,
+    state: &mut BacktrackState,
+) {
+    if bt_target_mode(module) != BtTargetMode::Range {
+        return;
+    }
+
+    let range = setting_float_range(module, "Range", (1.0, 3.0)).1 as f32;
+    if !hooks.find_enemy(range) {
+        backtrack_clear(module, hooks, state, true, false, true);
+        return;
+    }
+}
+
+/// Upstream `getEspData()`: the tracked box position plus the target's
+/// rotation; None when there is no target.
+pub fn backtrack_get_esp_data(
+    hooks: &dyn BacktrackHooks,
+    state: &BacktrackState,
+    target_rotation_yaw: f32,
+) -> Option<(Vec3, f32)> {
+    if !state.target {
+        return None;
+    }
+    Some((state.target_pos, target_rotation_yaw))
+}
+
+#[cfg(test)]
+mod backtrack_tests {
+    use super::*;
+
+    struct BtMock {
+        now: u64,
+        ticks: i64,
+        velocity_owns: bool,
+        velocity_blocked: bool,
+        requirements: bool,
+        should_be_attacked: bool,
+        alive: bool,
+        distance: f64,
+        enemy: bool,
+        square_dist_pos: f64,
+        squared_dist: f64,
+        chance: bool,
+        rand: f64,
+        handled_pos: Option<Vec3>,
+        base_set: u32,
+        queued_incoming: bool,
+        flushes: u32,
+        removes: u32,
+        older_flushes: Vec<u64>,
+        in_game: bool,
+    }
+
+    impl Default for BtMock {
+        fn default() -> Self {
+            BtMock {
+                now: 100,
+                ticks: 100,
+                velocity_owns: false,
+                velocity_blocked: false,
+                requirements: true,
+                should_be_attacked: true,
+                alive: true,
+                distance: 2.0,
+                enemy: true,
+                square_dist_pos: 100.0,
+                squared_dist: 200.0,
+                chance: true,
+                rand: 0.5,
+                handled_pos: None,
+                base_set: 0,
+                queued_incoming: false,
+                flushes: 0,
+                removes: 0,
+                older_flushes: Vec::new(),
+                in_game: true,
+            }
+        }
+    }
+
+    impl BacktrackHooks for BtMock {
+        fn now_ms(&self) -> u64 {
+            self.now
+        }
+        fn player_tick_count(&self) -> i64 {
+            self.ticks
+        }
+        fn velocity_owns_incoming_blink_queue(&self) -> bool {
+            self.velocity_owns
+        }
+        fn velocity_backtrack_blocked(&self) -> bool {
+            self.velocity_blocked
+        }
+        fn requirements_met(&self) -> bool {
+            self.requirements
+        }
+        fn target_should_be_attacked(&self) -> bool {
+            self.should_be_attacked
+        }
+        fn target_is_alive(&self) -> bool {
+            self.alive
+        }
+        fn target_boxed_distance(&self) -> f64 {
+            self.distance
+        }
+        fn find_enemy(&self, _max_range: f32) -> bool {
+            self.enemy
+        }
+        fn target_square_boxed_distance_to_player(&self, _pos: Vec3) -> f64 {
+            self.square_dist_pos
+        }
+        fn target_squared_boxed_distance_to_player(&self) -> f64 {
+            self.squared_dist
+        }
+        fn chance_roll(&self, _percentage: f64) -> bool {
+            self.chance
+        }
+        fn rand01(&self) -> f64 {
+            self.rand
+        }
+        fn position_handle_packet(&mut self, _packet: &BtIncomingPacket) -> Option<Vec3> {
+            self.handled_pos
+        }
+        fn position_set_base_from_entity(&mut self) {
+            self.base_set += 1;
+        }
+        fn has_queued_incoming(&self) -> bool {
+            self.queued_incoming
+        }
+        fn flush_incoming(&mut self) {
+            self.flushes += 1;
+        }
+        fn remove_queued_incoming(&mut self) {
+            self.removes += 1;
+        }
+        fn flush_older_than(&mut self, cutoff_ms: u64) {
+            self.older_flushes.push(cutoff_ms);
+        }
+        fn in_game(&self) -> bool {
+            self.in_game
+        }
+    }
+
+    fn bt_event(origin: TransferOrigin, packet: Option<BtIncomingPacket>) -> BtPacketEvent {
+        BtPacketEvent { origin, packet, action: None }
+    }
+
+    fn bt_target(module: &Module, hooks: &mut BtMock, state: &mut BacktrackState) {
+        backtrack_process_target(module, hooks, state, 7, true, 0);
+    }
+
+    #[test]
+    fn queue_handler_gates_and_passes() {
+        let module = backtrack();
+        let mut state = BacktrackState::default();
+
+        // Outgoing traffic is never touched.
+        let mut hooks = BtMock::default();
+        let mut event = bt_event(TransferOrigin::Outgoing, Some(BtIncomingPacket::TargetPosition));
+        backtrack_queue_packet_handler(&module, &mut hooks, &mut state, &mut event);
+        assert_eq!(event.action, None);
+
+        // Velocity owning the queue opts us out.
+        let mut hooks = BtMock::default();
+        hooks.velocity_owns = true;
+        let mut event = bt_event(TransferOrigin::Incoming, Some(BtIncomingPacket::TargetPosition));
+        backtrack_queue_packet_handler(&module, &mut hooks, &mut state, &mut event);
+        assert_eq!(event.action, None);
+
+        // Null packet with nothing pending: nothing; with pending: PASS.
+        let mut hooks = BtMock::default();
+        let mut event = bt_event(TransferOrigin::Incoming, None);
+        backtrack_queue_packet_handler(&module, &mut hooks, &mut state, &mut event);
+        assert_eq!(event.action, None);
+        hooks.queued_incoming = true;
+        let mut event = bt_event(TransferOrigin::Incoming, None);
+        backtrack_queue_packet_handler(&module, &mut hooks, &mut state, &mut event);
+        assert_eq!(event.action, Some(BlinkAction::Pass));
+    }
+
+    #[test]
+    fn queue_handler_packet_branches() {
+        let mut module = backtrack();
+        let mut hooks = BtMock::default();
+        let mut state = BacktrackState::default();
+        bt_target(&module, &mut hooks, &mut state);
+        assert!(state.target);
+
+        // Message-related packets always pass.
+        let mut event = bt_event(TransferOrigin::Incoming, Some(BtIncomingPacket::ChatLike));
+        backtrack_queue_packet_handler(&module, &mut hooks, &mut state, &mut event);
+        assert_eq!(event.action, Some(BlinkAction::Pass));
+
+        // Own hurt sound passes.
+        let mut event = bt_event(TransferOrigin::Incoming, Some(BtIncomingPacket::OwnHurtSound));
+        backtrack_queue_packet_handler(&module, &mut hooks, &mut state, &mut event);
+        assert_eq!(event.action, Some(BlinkAction::Pass));
+
+        // Teleport and own death flush (clear) instead.
+        let mut event = bt_event(TransferOrigin::Incoming, Some(BtIncomingPacket::ClientboundPlayerPosition));
+        backtrack_queue_packet_handler(&module, &mut hooks, &mut state, &mut event);
+        assert_eq!(event.action, None);
+        assert!(!state.target);
+        // One flush from the handler's clear, one from processTarget's
+        // enemy-change clear inside bt_target.
+        assert_eq!(hooks.flushes, 2);
+
+        bt_target(&module, &mut hooks, &mut state);
+        let mut event = bt_event(TransferOrigin::Incoming, Some(BtIncomingPacket::OwnDeath));
+        backtrack_queue_packet_handler(&module, &mut hooks, &mut state, &mut event);
+        assert_eq!(event.action, None);
+        assert!(!state.target);
+
+        // A non-player-hurt sound falls through to the tracking arms.
+        bt_target(&module, &mut hooks, &mut state);
+        let mut event = bt_event(TransferOrigin::Incoming, Some(BtIncomingPacket::OtherSound));
+        backtrack_queue_packet_handler(&module, &mut hooks, &mut state, &mut event);
+        assert_eq!(event.action, Some(BlinkAction::Queue));
+
+        // Target's actual position closer than the tracked one: flush.
+        hooks.handled_pos = Some(Vec3 { x: 1.0, y: 0.0, z: 0.0 });
+        hooks.square_dist_pos = 1.0;
+        let mut event = bt_event(TransferOrigin::Incoming, Some(BtIncomingPacket::TargetPosition));
+        backtrack_queue_packet_handler(&module, &mut hooks, &mut state, &mut event);
+        assert_eq!(event.action, Some(BlinkAction::Flush));
+
+        // No target: tracking arms do nothing.
+        state.target = false;
+        let mut event = bt_event(TransferOrigin::Incoming, Some(BtIncomingPacket::TargetPosition));
+        backtrack_queue_packet_handler(&module, &mut hooks, &mut state, &mut event);
+        assert_eq!(event.action, None);
+    }
+
+    #[test]
+    fn should_backtrack_gates() {
+        let mut module = backtrack();
+        let mut hooks = BtMock::default();
+        let mut state = BacktrackState::default();
+
+        assert!(backtrack_should_backtrack(&module, &hooks, &mut state));
+
+        // Out of range but inside the tracking buffer: still tracks.
+        hooks.distance = 50.0;
+        assert!(backtrack_should_backtrack(&module, &hooks, &mut state));
+
+        // Out of range and buffer elapsed: stops.
+        hooks.now = 100_000;
+        assert!(!backtrack_should_backtrack(&module, &hooks, &mut state));
+        hooks.distance = 2.0;
+
+        // Not attackable.
+        hooks.should_be_attacked = false;
+        assert!(!backtrack_should_backtrack(&module, &hooks, &mut state));
+        hooks.should_be_attacked = true;
+
+        // Too early after join.
+        hooks.ticks = 5;
+        assert!(!backtrack_should_backtrack(&module, &hooks, &mut state));
+        hooks.ticks = 100;
+
+        // Chance gate.
+        state.chance_passed = false;
+        assert!(!backtrack_should_backtrack(&module, &hooks, &mut state));
+        state.chance_passed = true;
+
+        // Requires gate.
+        hooks.requirements = false;
+        assert!(!backtrack_should_backtrack(&module, &hooks, &mut state));
+        hooks.requirements = true;
+
+        // Pause-on-hurt-time.
+        state.should_pause = true;
+        assert!(!backtrack_should_backtrack(&module, &hooks, &mut state));
+        state.should_pause = false;
+
+        // Recent attack inside LastAttackTimeToWork keeps it working; elapsed blocks.
+        hooks.now = 100;
+        assert!(backtrack_should_backtrack(&module, &hooks, &mut state));
+        hooks.now = 100_000;
+        assert!(!backtrack_should_backtrack(&module, &hooks, &mut state));
+        hooks.now = 100;
+
+        // Velocity blocking backtrack.
+        hooks.velocity_blocked = true;
+        assert!(!backtrack_should_backtrack(&module, &hooks, &mut state));
+    }
+
+    #[test]
+    fn should_cancel_packets_needs_target() {
+        let mut module = backtrack();
+        let mut hooks = BtMock::default();
+        let mut state = BacktrackState::default();
+
+        assert!(!backtrack_should_cancel_packets(&module, &hooks, &mut state));
+        bt_target(&module, &mut hooks, &mut state);
+        assert!(backtrack_should_cancel_packets(&module, &hooks, &mut state));
+
+        hooks.alive = false;
+        assert!(!backtrack_should_cancel_packets(&module, &hooks, &mut state));
+    }
+
+    #[test]
+    fn process_target_resets_on_enemy_change() {
+        let mut module = backtrack();
+        let mut hooks = BtMock::default();
+        let mut state = BacktrackState::default();
+
+        bt_target(&module, &mut hooks, &mut state);
+        assert_eq!(hooks.base_set, 1);
+        assert!(state.target);
+
+        // Same enemy: no second reset.
+        bt_target(&module, &mut hooks, &mut state);
+        assert_eq!(hooks.base_set, 1);
+
+        // Enemy change: clear + instant base placement, chronometer untouched.
+        backtrack_process_target(&module, &mut hooks, &mut state, 9, true, 0);
+        assert_eq!(hooks.base_set, 2);
+        assert_eq!(state.target_id, Some(9));
+        assert_eq!(state.chronometer.wait_at_least_ms, 0);
+    }
+
+    #[test]
+    fn process_target_pauses_on_hurt_time() {
+        let mut module = backtrack();
+        let mut hooks = BtMock::default();
+        let mut state = BacktrackState::default();
+
+        // hurtTime 3 >= HurtTime 3 with PauseOnHurtTime on: no backtrack.
+        for value in &mut module.settings {
+            if value.name == "PauseOnHurtTime" {
+                value.kind = ValueKind::Bool(true);
+            }
+        }
+        backtrack_process_target(&module, &mut hooks, &mut state, 7, true, 3);
+        assert!(state.should_pause);
+        assert!(!state.target);
+
+        // hurtTime below the threshold: tracks.
+        backtrack_process_target(&module, &mut hooks, &mut state, 7, true, 2);
+        assert!(state.target);
+    }
+
+    #[test]
+    fn tick_packet_process_flushes_and_rerolls_delay() {
+        let mut module = backtrack();
+        let mut hooks = BtMock::default();
+        let mut state = BacktrackState::default();
+        bt_target(&module, &mut hooks, &mut state);
+
+        // Should cancel: flush packets older than now - currentDelay.
+        state.attack_chronometer.reset(10_000);
+        hooks.now = 10_000;
+        backtrack_tick_packet_process_handler(&module, &mut hooks, &mut state);
+        assert_eq!(hooks.older_flushes, vec![10_000 - state.current_delay as u64]);
+
+        // Nothing queued: delay rerolls (rand 0.5 over 100..150 -> 125).
+        assert_eq!(state.current_delay, 125);
+
+        // Not in game: clear-only.
+        hooks.in_game = false;
+        hooks.now = 100;
+        backtrack_tick_packet_process_handler(&module, &mut hooks, &mut state);
+        assert_eq!(hooks.removes, 1);
+        assert!(!state.target);
+    }
+
+    #[test]
+    fn tick_packet_process_flushes_queued_without_cancel() {
+        let mut module = backtrack();
+        let mut hooks = BtMock::default();
+        let mut state = BacktrackState::default();
+        bt_target(&module, &mut hooks, &mut state);
+
+        // Not attacking (elapsed attack chronometer) but queue holds packets:
+        // flush + clear.
+        hooks.queued_incoming = true;
+        hooks.now = 100_000;
+        backtrack_tick_packet_process_handler(&module, &mut hooks, &mut state);
+        // One from bt_target's enemy-change clear, one from the handler's
+        // flush, one from its clear.
+        assert_eq!(hooks.flushes, 3);
+        assert!(!state.target);
+    }
+
+    #[test]
+    fn attack_handler_rerolls_chance_and_clears_on_range_mode() {
+        let mut module = backtrack();
+        let mut hooks = BtMock::default();
+        let mut state = BacktrackState::default();
+        bt_target(&module, &mut hooks, &mut state);
+
+        // Attack mode: nothing further happens in the handler itself.
+        backtrack_attack_handler(&module, &mut hooks, &mut state);
+        assert!(state.target);
+
+        // Range mode ignores attack events as target source.
+        for value in &mut module.settings {
+            if value.name == "TargetMode" {
+                value.kind = ValueKind::Choice("Range".to_string(), Vec::new());
+            }
+        }
+        backtrack_attack_handler(&module, &mut hooks, &mut state);
+        assert!(state.target);
+
+        // Range tick handler with no enemy clears the target.
+        hooks.enemy = false;
+        backtrack_range_target_handler(&module, &mut hooks, &mut state);
+        assert!(!state.target);
+        assert_eq!(hooks.flushes, 2);
+    }
+
+    #[test]
+    fn clear_sets_next_backtrack_delay_and_disabled_flushes() {
+        let mut module = backtrack();
+        let mut hooks = BtMock::default();
+        let mut state = BacktrackState::default();
+        bt_target(&module, &mut hooks, &mut state);
+
+        // resetChronometer only when a target existed: rand 0.5 over 0..10 -> 5.
+        backtrack_clear(&module, &mut hooks, &mut state, true, false, true);
+        assert_eq!(state.chronometer.wait_at_least_ms, 5);
+        assert_eq!(hooks.flushes, 2);
+
+        // clearOnly removes instead of flushing.
+        bt_target(&module, &mut hooks, &mut state);
+        backtrack_clear(&module, &mut hooks, &mut state, true, true, true);
+        assert_eq!(hooks.removes, 1);
+
+        // onDisabled flushes; onEnabled does not.
+        bt_target(&module, &mut hooks, &mut state);
+        backtrack_on_disabled(&module, &mut hooks, &mut state);
+        assert_eq!(hooks.flushes, 5);
+        bt_target(&module, &mut hooks, &mut state);
+        backtrack_on_enabled(&module, &mut hooks, &mut state);
+        assert_eq!(hooks.flushes, 6);
+        assert!(!state.target);
+    }
+
+    #[test]
+    fn is_lagging_and_delay_random() {
+        let module = backtrack();
+        let hooks = BtMock::default();
+        let mut state = BacktrackState::default();
+
+        assert!(!backtrack_is_lagging(&module, &hooks));
+        state.target = false;
+
+        let (from, to) = setting_int_range(&module, "Delay", (100, 150));
+        assert_eq!((from, to), (100, 150));
+        assert_eq!(backtrack_delay_random(&module, 0.0), 100);
+        assert_eq!(backtrack_delay_random(&module, 1.0), 150);
+    }
+
+    #[test]
+    fn world_change_clears_only_on_disconnect() {
+        let mut module = backtrack();
+        let mut hooks = BtMock::default();
+        let mut state = BacktrackState::default();
+        bt_target(&module, &mut hooks, &mut state);
+
+        // A world still present: nothing.
+        backtrack_world_change_handler(&module, &mut hooks, &mut state, true);
+        assert!(state.target);
+
+        // Disconnect: clear-only.
+        backtrack_world_change_handler(&module, &mut hooks, &mut state, false);
+        assert_eq!(hooks.removes, 1);
+        assert!(!state.target);
+    }
+
+    #[test]
+    fn esp_data_follows_target() {
+        let mut module = backtrack();
+        let mut hooks = BtMock::default();
+        let mut state = BacktrackState::default();
+
+        assert!(backtrack_get_esp_data(&hooks, &state, 90.0).is_none());
+        bt_target(&module, &mut hooks, &mut state);
+        let data = backtrack_get_esp_data(&hooks, &state, 90.0);
+        assert_eq!(data, Some((Vec3 { x: 0.0, y: 0.0, z: 0.0 }, 90.0)));
     }
 }

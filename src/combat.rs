@@ -14543,3 +14543,1355 @@ mod autoclicker_triggerbot_tests {
         assert_eq!(use_clicked, 2);
     }
 }
+
+// ---------------------------------------------------------------------------
+// AutoArmor (upstream utils/item/armor/* + combat/autoarmor/*)
+// ---------------------------------------------------------------------------
+
+/// Upstream `EquipmentSlot` (the four wearable player slots).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum ArmorEquipSlot {
+    Head,
+    Chest,
+    Legs,
+    Feet,
+}
+
+impl ArmorEquipSlot {
+    /// Upstream `EquipmentSlot.index`.
+    pub fn index(self) -> i32 {
+        match self {
+            ArmorEquipSlot::Head => 0,
+            ArmorEquipSlot::Chest => 1,
+            ArmorEquipSlot::Legs => 2,
+            ArmorEquipSlot::Feet => 3,
+        }
+    }
+}
+
+/// Upstream `ItemSlot.Type` (the slice the armor modules read).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AaSlotType {
+    Armor,
+    Inventory,
+    Hotbar,
+}
+
+/// Upstream enchantments referenced by the armor comparator and the curse
+/// filter.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AaEnchantment {
+    Protection,
+    ProjectileProtection,
+    FireProtection,
+    BlastProtection,
+    FeatherFalling,
+    Thorns,
+    Respiration,
+    AquaAffinity,
+    Unbreaking,
+}
+
+/// The item-stack slice the armor modules and the comparator read:
+/// `armorValue`/`armorToughness`/`armorKnockbackResistance`/`durability`,
+/// `DataComponents.ENCHANTMENTS`/`ENCHANTABLE` and the two curse effects.
+#[derive(Clone, Debug, Default)]
+pub struct AaItemStack {
+    pub is_empty: bool,
+    /// Upstream `isPlayerArmor` (filters animal armor out).
+    pub is_player_armor: bool,
+    pub is_glider: bool,
+    /// Upstream `itemStack.equipmentSlot!!`.
+    pub equipment_slot: Option<ArmorEquipSlot>,
+    pub armor_value: i32,
+    pub armor_toughness: i32,
+    pub armor_knockback_resistance: i32,
+    /// Upstream `durability` (remaining durability).
+    pub durability: i32,
+    /// Upstream `get(DataComponents.ENCHANTABLE)?.value ?: 0`.
+    pub enchantable: i32,
+    /// Upstream `DataComponents.ENCHANTMENTS` levels.
+    pub enchantments: Vec<(AaEnchantment, i32)>,
+    /// Upstream `getEnchantmentCount`.
+    pub enchantment_count: i32,
+    /// `EnchantmentEffectComponents.PREVENT_ARMOR_CHANGE` (Binding curse).
+    pub has_binding_curse: bool,
+    /// `EnchantmentEffectComponents.PREVENT_EQUIPMENT_DROP` (Vanishing curse).
+    pub has_vanishing_curse: bool,
+}
+
+impl AaItemStack {
+    /// Upstream `getEnchantment`.
+    pub fn enchantment_level(&self, enchantment: AaEnchantment) -> i32 {
+        self.enchantments
+            .iter()
+            .find(|(kind, _)| *kind == enchantment)
+            .map(|(_, level)| *level)
+            .unwrap_or(0)
+    }
+}
+
+/// Upstream `ItemSlot`.
+#[derive(Clone, Debug)]
+pub struct AaItemSlot {
+    pub slot_type: AaSlotType,
+    /// Hotbar slot index 0..8 for `HotbarItemSlot` (upstream
+    /// `HotbarItemSlot.OFFHAND` is a `HotbarItemSlot` too), `None` elsewhere.
+    pub hotbar_index: Option<i32>,
+    pub stack: AaItemStack,
+}
+
+/// Upstream `ArmorPiece`.
+#[derive(Clone, Debug)]
+pub struct ArmorPiece {
+    pub item_slot: AaItemSlot,
+}
+
+impl ArmorPiece {
+    pub fn new(item_slot: AaItemSlot) -> Self {
+        ArmorPiece { item_slot }
+    }
+
+    pub fn slot_type(&self) -> ArmorEquipSlot {
+        self.item_slot
+            .stack
+            .equipment_slot
+            .expect("armor piece without an equipment slot")
+    }
+
+    pub fn entity_slot_id(&self) -> i32 {
+        self.slot_type().index()
+    }
+
+    pub fn inventory_slot(&self) -> i32 {
+        36 + self.entity_slot_id()
+    }
+
+    pub fn is_already_equipped(&self) -> bool {
+        self.item_slot.slot_type == AaSlotType::Armor
+    }
+
+    pub fn is_reachable_by_hand(&self) -> bool {
+        self.item_slot.hotbar_index.is_some()
+    }
+
+    pub fn toughness(&self) -> f32 {
+        self.item_slot.stack.armor_toughness as f32
+    }
+
+    pub fn defense_points(&self) -> f32 {
+        self.item_slot.stack.armor_value as f32
+    }
+
+    pub fn knockback_resistance(&self) -> f32 {
+        self.item_slot.stack.armor_knockback_resistance as f32
+    }
+}
+
+/// Upstream `EnchantmentValueEstimator.WeightedEnchantment`.
+#[derive(Clone, Copy, Debug)]
+pub struct WeightedEnchantment {
+    pub enchantment: AaEnchantment,
+    pub factor: f32,
+}
+
+/// Upstream `EnchantmentValueEstimator.estimateValue`: the weighted sum of the
+/// stack's enchantment levels (`0` when the stack has no enchantments).
+pub fn estimate_value(stack: &AaItemStack, weighted: &[WeightedEnchantment]) -> f32 {
+    if stack.enchantments.is_empty() {
+        return 0.0;
+    }
+
+    let mut sum = 0.0_f32;
+    for entry in weighted {
+        sum += stack.enchantment_level(entry.enchantment) as f32 * entry.factor;
+    }
+    sum
+}
+
+/// Upstream `roundToDecimalPlaces` (half away from zero).
+pub fn round_to_decimal_places(value: f64, places: i32) -> f64 {
+    let factor = 10_f64.powi(places);
+    (value * factor).round() / factor
+}
+
+/// Upstream `ArmorComparatorMode`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ArmorComparatorMode {
+    Smart,
+    RawDefense,
+}
+
+/// Upstream `ArmorParameter`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ArmorParameter {
+    pub defense_points: f32,
+    pub toughness: f32,
+}
+
+impl ArmorParameter {
+    pub const ZERO: ArmorParameter = ArmorParameter {
+        defense_points: 0.0,
+        toughness: 0.0,
+    };
+}
+
+/// Upstream `ArmorKitParameters`: per slot the summed armor parameters
+/// without that slot. Slots without a piece in the current kit hold the
+/// unchanged total (upstream only ever looks the kit's own slots up).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ArmorKitParameters {
+    slots: [ArmorParameter; 4],
+}
+
+impl ArmorKitParameters {
+    pub fn get_parameters_for_slot(&self, slot: ArmorEquipSlot) -> ArmorParameter {
+        self.slots[slot.index() as usize]
+    }
+
+    /// Upstream `getParametersForSlots`.
+    pub fn get_parameters_for_slots(current_kit: &[Option<ArmorPiece>; 4]) -> ArmorKitParameters {
+        let mut total = ArmorParameter::ZERO;
+        for piece in current_kit.iter().flatten() {
+            total.defense_points += piece.defense_points();
+            total.toughness += piece.toughness();
+        }
+
+        let mut slots = [ArmorParameter::ZERO; 4];
+        for (index, piece) in current_kit.iter().enumerate() {
+            slots[index] = match piece {
+                Some(piece) => ArmorParameter {
+                    defense_points: total.defense_points - piece.defense_points(),
+                    toughness: total.toughness - piece.toughness(),
+                },
+                None => total,
+            };
+        }
+        ArmorKitParameters { slots }
+    }
+}
+
+/// Upstream `ArmorComparator`.
+pub struct ArmorComparator {
+    expected_damage: f32,
+    kit: ArmorKitParameters,
+    durability_threshold: i32,
+    mode: ArmorComparatorMode,
+    consider_projectile_protection: bool,
+}
+
+impl ArmorComparator {
+    /// Upstream `DAMAGE_REDUCTION_ESTIMATOR`.
+    fn damage_reduction_estimator() -> Vec<WeightedEnchantment> {
+        vec![
+            WeightedEnchantment { enchantment: AaEnchantment::Protection, factor: 1.2 * 0.04 },
+            WeightedEnchantment { enchantment: AaEnchantment::ProjectileProtection, factor: 0.4 * 0.08 },
+            WeightedEnchantment { enchantment: AaEnchantment::FireProtection, factor: 0.39 * 0.15 },
+            WeightedEnchantment { enchantment: AaEnchantment::BlastProtection, factor: 0.38 * 0.08 },
+        ]
+    }
+
+    /// Upstream `OTHER_ENCHANTMENT_ESTIMATOR`.
+    fn other_enchantment_estimator() -> Vec<WeightedEnchantment> {
+        vec![
+            WeightedEnchantment { enchantment: AaEnchantment::FeatherFalling, factor: 3.0 },
+            WeightedEnchantment { enchantment: AaEnchantment::Thorns, factor: 1.0 },
+            WeightedEnchantment { enchantment: AaEnchantment::Respiration, factor: 0.1 },
+            WeightedEnchantment { enchantment: AaEnchantment::AquaAffinity, factor: 0.05 },
+            WeightedEnchantment { enchantment: AaEnchantment::Unbreaking, factor: 0.01 },
+        ]
+    }
+
+    /// Legacy (1.8) armor model: one armor point is a flat 4% reduction,
+    /// capped at 80%.
+    const LEGACY_REDUCTION_PER_POINT: f32 = 0.04;
+    const LEGACY_REDUCTION_CAP: f32 = 0.8;
+    /// Upstream `PROTECTION_EPF_MODIFIER` / `PROJECTILE_PROTECTION_EPF_MODIFIER` /
+    /// `EPF_REDUCTION_PER_POINT` (pre-1.9 enchantment-protection formula).
+    const PROTECTION_EPF_MODIFIER: f32 = 0.75;
+    const PROJECTILE_PROTECTION_EPF_MODIFIER: f32 = 1.5;
+    const EPF_REDUCTION_PER_POINT: f32 = 0.04;
+
+    pub fn new(
+        expected_damage: f32,
+        kit: ArmorKitParameters,
+        durability_threshold: i32,
+        mode: ArmorComparatorMode,
+        consider_projectile_protection: bool,
+    ) -> Self {
+        ArmorComparator {
+            expected_damage,
+            kit,
+            durability_threshold,
+            mode,
+            consider_projectile_protection,
+        }
+    }
+
+    /// Upstream `compare` (ComparatorChain: the first non-equal step decides,
+    /// and a greater piece is the better one for `maxWithOrNull`).
+    pub fn compare(&self, o1: &ArmorPiece, o2: &ArmorPiece) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+
+        let shared = |this: &Self| {
+            let other_1 = estimate_value(&o1.item_slot.stack, &Self::other_enchantment_estimator());
+            let other_2 = estimate_value(&o2.item_slot.stack, &Self::other_enchantment_estimator());
+            other_1
+                .partial_cmp(&other_2)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(o1.item_slot.stack.enchantment_count.cmp(&o2.item_slot.stack.enchantment_count))
+                .then(o1.item_slot.stack.enchantable.cmp(&o2.item_slot.stack.enchantable))
+                .then(o1.is_already_equipped().cmp(&o2.is_already_equipped()))
+                .then(o1.is_reachable_by_hand().cmp(&o2.is_reachable_by_hand()))
+        };
+
+        match self.mode {
+            ArmorComparatorMode::Smart => {
+                let dur_1 = o1.item_slot.stack.durability > self.durability_threshold;
+                let dur_2 = o2.item_slot.stack.durability > self.durability_threshold;
+                let red_1 = round_to_decimal_places(
+                    self.get_thresholded_damage_reduction(&o1.item_slot.stack, o1.slot_type()) as f64,
+                    3,
+                );
+                let red_2 = round_to_decimal_places(
+                    self.get_thresholded_damage_reduction(&o2.item_slot.stack, o2.slot_type()) as f64,
+                    3,
+                );
+                dur_1
+                    .cmp(&dur_2)
+                    .then(red_1.partial_cmp(&red_2).unwrap_or(Ordering::Equal))
+                    .then(shared(self))
+            }
+            ArmorComparatorMode::RawDefense => {
+                let dur_1 = o1.item_slot.stack.durability > self.durability_threshold;
+                let dur_2 = o2.item_slot.stack.durability > self.durability_threshold;
+                let red_1 = round_to_decimal_places(
+                    self.get_legacy_damage_reduction(&o1.item_slot.stack, o1.slot_type()) as f64,
+                    4,
+                );
+                let red_2 = round_to_decimal_places(
+                    self.get_legacy_damage_reduction(&o2.item_slot.stack, o2.slot_type()) as f64,
+                    4,
+                );
+                dur_1
+                    .cmp(&dur_2)
+                    .then(red_1.partial_cmp(&red_2).unwrap_or(Ordering::Equal))
+                    .then(
+                        o1.item_slot
+                            .stack
+                            .enchantment_level(AaEnchantment::Protection)
+                            .cmp(&o2.item_slot.stack.enchantment_level(AaEnchantment::Protection)),
+                    )
+                    .then(shared(self))
+            }
+        }
+    }
+
+    /// EPF a protection enchantment level contributes under the legacy formula
+    /// (upstream `legacyEpf`; `0` for non-positive levels).
+    fn legacy_epf(level: i32, modifier: f32) -> i32 {
+        if level <= 0 {
+            return 0;
+        }
+
+        ((6 + level * level) as f32 * modifier / 3.0).floor() as i32
+    }
+
+    /// Upstream `getLegacyDamageReduction`: this piece's own armor points on
+    /// top of the rest of the kit, plus its own protection enchantments, under
+    /// the legacy (1.8) armor model.
+    pub fn get_legacy_damage_reduction(
+        &self,
+        stack: &AaItemStack,
+        slot: ArmorEquipSlot,
+    ) -> f32 {
+        let parameters = self.kit.get_parameters_for_slot(slot);
+        let total_armor_points = parameters.defense_points + stack.armor_value as f32;
+
+        let armor_reduction = (total_armor_points * Self::LEGACY_REDUCTION_PER_POINT)
+            .min(Self::LEGACY_REDUCTION_CAP);
+
+        let mut epf = Self::legacy_epf(
+            stack.enchantment_level(AaEnchantment::Protection),
+            Self::PROTECTION_EPF_MODIFIER,
+        );
+        if self.consider_projectile_protection {
+            let projectile_level = stack.enchantment_level(AaEnchantment::ProjectileProtection);
+            epf += Self::legacy_epf(projectile_level, Self::PROJECTILE_PROTECTION_EPF_MODIFIER);
+        }
+
+        let enchant_reduction = ((epf as f32) * Self::EPF_REDUCTION_PER_POINT)
+            .min(Self::LEGACY_REDUCTION_CAP);
+
+        // Armor and enchantments apply one after the other, each with its own
+        // 80% ceiling, so the combined reduction can reach 96%.
+        1.0 - (1.0 - armor_reduction) * (1.0 - enchant_reduction)
+    }
+
+    /// Upstream `getThresholdedDamageReduction`: the complement of the damage
+    /// the piece leaves over under the modern damage model. Higher is better.
+    fn get_thresholded_damage_reduction(&self, stack: &AaItemStack, slot: ArmorEquipSlot) -> f32 {
+        let parameters = self.kit.get_parameters_for_slot(slot);
+
+        let damage_factor = Self::get_damage_factor(
+            self.expected_damage,
+            parameters.defense_points + stack.armor_value as f32,
+            parameters.toughness + stack.armor_toughness as f32,
+        ) * (1.0 - estimate_value(stack, &Self::damage_reduction_estimator()));
+
+        1.0 - damage_factor
+    }
+
+    /// Upstream `getDamageFactor` (the base damage factor:
+    /// `totalDamage = damage x damageFactor`).
+    pub fn get_damage_factor(damage: f32, defense_points: f32, toughness: f32) -> f32 {
+        let f = 2.0 + toughness / 4.0;
+        let g = (defense_points - damage / f)
+            .clamp(defense_points * 0.2, 20.0);
+
+        1.0 - g / 25.0
+    }
+}
+
+/// Upstream `ArmorEvaluation`.
+pub struct ArmorEvaluation;
+
+impl ArmorEvaluation {
+    /// We expect damage to be around diamond sword hits
+    pub const EXPECTED_DAMAGE: f32 = 6.0;
+
+    /// Upstream `findBestArmorPieces`: an initial best-per-slot pick by
+    /// toughness, then two passes re-ranked against the previous pass's kit.
+    pub fn find_best_armor_pieces(
+        slots: &[AaItemSlot],
+        durability_threshold: i32,
+        mode: ArmorComparatorMode,
+        consider_projectile_protection: bool,
+    ) -> [Option<ArmorPiece>; 4] {
+        let grouped = Self::group_armor_by_type(slots);
+
+        // We start with assuming that the best pieces are those which have the
+        // most damage points.
+        let mut current_best: [Option<ArmorPiece>; 4] = [None, None, None, None];
+        for (index, pieces) in grouped.iter().enumerate() {
+            current_best[index] = first_max(pieces, &|a, b| {
+                a.toughness()
+                    .partial_cmp(&b.toughness())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .cloned();
+        }
+
+        // Run some passes in which we try to find best armor pieces based on
+        // the parameters of the last pass
+        for _ in 0..2 {
+            let comparator = Self::get_armor_comparator_for(
+                &current_best,
+                durability_threshold,
+                mode,
+                consider_projectile_protection,
+            );
+
+            for (index, pieces) in grouped.iter().enumerate() {
+                current_best[index] =
+                    first_max(pieces, &|a, b| comparator.compare(a, b)).cloned();
+            }
+        }
+
+        current_best
+    }
+
+    /// Upstream `getArmorComparatorFor`.
+    pub fn get_armor_comparator_for(
+        current_kit: &[Option<ArmorPiece>; 4],
+        durability_threshold: i32,
+        mode: ArmorComparatorMode,
+        consider_projectile_protection: bool,
+    ) -> ArmorComparator {
+        Self::get_armor_comparator_for_parameters(
+            ArmorKitParameters::get_parameters_for_slots(current_kit),
+            durability_threshold,
+            mode,
+            consider_projectile_protection,
+        )
+    }
+
+    /// Upstream `getArmorComparatorForParameters`.
+    pub fn get_armor_comparator_for_parameters(
+        current_parameters: ArmorKitParameters,
+        durability_threshold: i32,
+        mode: ArmorComparatorMode,
+        consider_projectile_protection: bool,
+    ) -> ArmorComparator {
+        ArmorComparator::new(
+            Self::EXPECTED_DAMAGE,
+            current_parameters,
+            durability_threshold,
+            mode,
+            consider_projectile_protection,
+        )
+    }
+
+    /// Upstream `groupArmorByType` (`isPlayerArmor` filters animal armor out).
+    fn group_armor_by_type(slots: &[AaItemSlot]) -> [Vec<ArmorPiece>; 4] {
+        let mut grouped: [Vec<ArmorPiece>; 4] =
+            [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+        for slot in slots {
+            if !slot.stack.is_player_armor {
+                continue;
+            }
+            let piece = ArmorPiece::new(slot.clone());
+            grouped[piece.slot_type().index() as usize].push(piece);
+        }
+        grouped
+    }
+}
+
+/// `maxByOrNull` / `maxWithOrNull` semantics: the FIRST maximal element wins
+/// on ties.
+fn first_max<'a>(
+    pieces: &'a [ArmorPiece],
+    compare: &dyn Fn(&ArmorPiece, &ArmorPiece) -> std::cmp::Ordering,
+) -> Option<&'a ArmorPiece> {
+    let mut best: Option<&ArmorPiece> = None;
+    for piece in pieces {
+        match best {
+            None => best = Some(piece),
+            Some(current) => {
+                if compare(piece, current) == std::cmp::Ordering::Greater {
+                    best = Some(piece);
+                }
+            }
+        }
+    }
+    best
+}
+
+// -- ModuleAutoArmor -------------------------------------------------------
+
+/// Upstream `ModuleAutoArmor` — automatically puts on the best armor.
+/// Upstream's `Mode` choice carries the comparator; `ConsiderProjectileProtection`
+/// is RawDefense's mode setting (upstream reads it unconditionally). The
+/// `UseHotbar` and `AutoArmorSaveArmor` toggleable value groups are flattened
+/// into `Hotbar`/`CanSwapArmor` and `SaveArmor`/`DurabilityThreshold`/
+/// `AutoOpenInventory` like the other flattened groups.
+pub fn auto_armor() -> Module {
+    Module::new(
+        "AutoArmor",
+        COMBAT,
+        vec![
+            crate::value::choice("Mode", "Smart", &["Smart", "RawDefense"]),
+            boolean("ConsiderProjectileProtection", true),
+            boolean("Hotbar", true),
+            boolean("CanSwapArmor", false),
+            boolean("SaveArmor", true),
+            int("DurabilityThreshold", 24, 0, 100),
+            boolean("AutoOpenInventory", true),
+            multi_choice("SkipCursed", &[], &["Binding", "Vanishing"]),
+        ],
+    )
+}
+
+/// Upstream `Curse`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Curse {
+    Binding,
+    Vanishing,
+}
+
+/// Upstream `ModuleAutoArmor.skipCursed`, read from the `SkipCursed`
+/// multi-enum setting (empty by default).
+pub fn auto_armor_skip_curses(module: &Module) -> Vec<Curse> {
+    match module.setting("SkipCursed").map(|v| &v.kind) {
+        Some(ValueKind::MultiChoice(selected, _)) => selected
+            .iter()
+            .map(|tag| {
+                if tag == "Vanishing" {
+                    Curse::Vanishing
+                } else {
+                    Curse::Binding
+                }
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Upstream `ModuleAutoArmor.candidateSlots`: worn pieces always count, as a
+/// bound one cannot be swapped out anyway.
+pub fn auto_armor_candidate_slots(skip_curses: &[Curse], slots: &[AaItemSlot]) -> Vec<AaItemSlot> {
+    if skip_curses.is_empty() {
+        return slots.to_vec();
+    }
+
+    slots
+        .iter()
+        .filter(|slot| {
+            slot.slot_type == AaSlotType::Armor
+                || skip_curses.iter().all(|curse| match curse {
+                    Curse::Binding => !slot.stack.has_binding_curse,
+                    Curse::Vanishing => !slot.stack.has_vanishing_curse,
+                })
+        })
+        .cloned()
+        .collect()
+}
+
+/// Upstream `Priority.IMPORTANT_FOR_PLAYER_LIFE` (the only priority this
+/// module schedules with).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AaPriority {
+    ImportantForPlayerLife,
+}
+
+/// The slot a Click action addresses: the worn-slot replacement
+/// `ArmorItemSlot(armorPiece.slotType)` or the piece's own `itemSlot`.
+#[derive(Clone, Debug)]
+pub enum AaClickTarget {
+    Armor(ArmorEquipSlot),
+    Item(AaItemSlot),
+}
+
+/// Upstream `InventoryAction` (the actions this module schedules; the screen
+/// of every Click action is `null` here).
+#[derive(Clone, Debug)]
+pub enum AaInventoryAction {
+    /// `InventoryAction.UseItem(slot)`
+    UseItem { hotbar_index: i32 },
+    /// `InventoryAction.Click.performThrow(screen = null, slot)`
+    ClickThrow { target: AaClickTarget },
+    /// `InventoryAction.Click.performQuickMove(screen = null, slot)`
+    ClickQuickMove { target: AaClickTarget },
+}
+
+/// Upstream `PlayerInventoryConstraints` (the slice the armor modules read).
+#[derive(Clone, Copy, Debug)]
+pub struct PlayerInventoryConstraints {
+    /// `requiresOpenInventory`: `InventoryRequirements.OPEN_INVENTORY in requirements`.
+    pub requires_open_inventory: bool,
+    /// Upstream `closeDelay` (`intRange("CloseDelay", 1..2, 0..20, "ticks")`).
+    pub close_delay_from: i32,
+    pub close_delay_to: i32,
+}
+
+impl Default for PlayerInventoryConstraints {
+    fn default() -> Self {
+        PlayerInventoryConstraints {
+            requires_open_inventory: false,
+            close_delay_from: 1,
+            close_delay_to: 2,
+        }
+    }
+}
+
+impl PlayerInventoryConstraints {
+    /// Upstream `IntRange.random()`: a uniform integer in the inclusive range.
+    pub fn close_delay_random(&self, roll: f64) -> i32 {
+        let from = self.close_delay_from;
+        let to = self.close_delay_to;
+        let len = (to - from + 1).max(1) as f64;
+        (from as f64 + roll * len).floor().clamp(from as f64, to as f64) as i32
+    }
+}
+
+/// Upstream `ScheduleInventoryActionEvent` (the schedule surface this module
+/// uses; the inventory manager checks the constraints around the call).
+#[derive(Default)]
+pub struct AutoArmorScheduleEvent {
+    pub scheduled: Vec<(AaInventoryAction, AaPriority)>,
+}
+
+impl AutoArmorScheduleEvent {
+    pub fn schedule(
+        &mut self,
+        _constraints: &PlayerInventoryConstraints,
+        action: AaInventoryAction,
+    ) {
+        self.scheduled.push((action, AaPriority::ImportantForPlayerLife));
+    }
+}
+
+/// The slice of the upstream `player` (and inventory manager) the armor
+/// modules read.
+#[derive(Clone, Debug, Default)]
+pub struct AaPlayer {
+    pub is_spectator: bool,
+    pub is_creative: bool,
+    /// Upstream `player.armorValue` attribute.
+    pub armor_value: i32,
+    /// Upstream `player.inventory.getItem(index)` (raw upstream indices; the
+    /// equip path reads index `36 + entitySlotId`).
+    pub inventory: Vec<AaItemStack>,
+    /// Upstream `hasInventorySpace()`.
+    pub has_inventory_space: bool,
+    /// Upstream `InventoryManager.isInventoryOpen`.
+    pub inventory_open: bool,
+}
+
+/// The active comparator mode: upstream `(modes.activeMode as? RawDefense)
+/// ?.comparatorMode ?: Smart.comparatorMode`.
+fn auto_armor_comparator_mode(module: &Module) -> ArmorComparatorMode {
+    match module.setting("Mode").map(|v| &v.kind) {
+        Some(ValueKind::Choice(sel, _)) if sel == "RawDefense" => ArmorComparatorMode::RawDefense,
+        _ => ArmorComparatorMode::Smart,
+    }
+}
+
+/// Upstream `ModuleAutoArmor.scheduleHandler` on
+/// `ScheduleInventoryActionEvent`.
+pub fn auto_armor_schedule_handler(
+    module: &Module,
+    constraints: &PlayerInventoryConstraints,
+    player: &AaPlayer,
+    slots: &[AaItemSlot],
+    event: &mut AutoArmorScheduleEvent,
+) {
+    if player.is_spectator {
+        return;
+    }
+
+    // Filter out already equipped armor pieces
+    let save_armor_enabled = setting_bool(module, "SaveArmor", true);
+    let durability_threshold = if save_armor_enabled {
+        setting_int(module, "DurabilityThreshold", 24) as i32
+    } else {
+        i32::MIN
+    };
+
+    let comparator_mode = auto_armor_comparator_mode(module);
+    let consider_projectile_protection = setting_bool(module, "ConsiderProjectileProtection", true);
+    let skip_curses = auto_armor_skip_curses(module);
+    let candidate_slots = auto_armor_candidate_slots(&skip_curses, slots);
+
+    let best = ArmorEvaluation::find_best_armor_pieces(
+        &candidate_slots,
+        durability_threshold,
+        comparator_mode,
+        consider_projectile_protection,
+    );
+
+    for piece in best.into_iter().flatten() {
+        if piece.is_already_equipped() {
+            continue;
+        }
+        let Some(action) = auto_armor_equip_piece(module, player, &piece) else {
+            continue;
+        };
+        event.schedule(constraints, action);
+    }
+}
+
+/// Upstream `ModuleAutoArmor.equipArmorPiece`: `false`-equivalent is `None`
+/// (a move was not possible), `Some` schedules a move.
+pub fn auto_armor_equip_piece(
+    module: &Module,
+    player: &AaPlayer,
+    armor_piece: &ArmorPiece,
+) -> Option<AaInventoryAction> {
+    let stack_in_armor = player
+        .inventory
+        .get(armor_piece.inventory_slot() as usize)?;
+
+    if stack_in_armor.is_glider {
+        return None;
+    }
+
+    Some(auto_armor_perform_move_or_hotbar_click(
+        module,
+        player,
+        armor_piece,
+        !stack_in_armor.is_empty,
+    ))
+}
+
+/// Upstream `ModuleAutoArmor.performMoveOrHotbarClick`, the central
+/// move-function of the module.
+pub fn auto_armor_perform_move_or_hotbar_click(
+    module: &Module,
+    player: &AaPlayer,
+    armor_piece: &ArmorPiece,
+    is_in_armor_slot: bool,
+) -> AaInventoryAction {
+    let target = if is_in_armor_slot {
+        AaClickTarget::Armor(armor_piece.slot_type())
+    } else {
+        AaClickTarget::Item(armor_piece.item_slot.clone())
+    };
+
+    let use_hotbar = setting_bool(module, "Hotbar", true);
+    let can_swap_armor = setting_bool(module, "CanSwapArmor", false);
+    let can_try_hotbar_move = use_hotbar
+        && !player.inventory_open
+        && (!is_in_armor_slot || can_swap_armor);
+
+    if armor_piece.item_slot.slot_type == AaSlotType::Hotbar && can_try_hotbar_move {
+        return AaInventoryAction::UseItem {
+            hotbar_index: armor_piece.item_slot.hotbar_index.unwrap_or(0),
+        };
+    }
+
+    // Should the item be just thrown out of the inventory
+    let should_throw = is_in_armor_slot && !player.has_inventory_space;
+
+    if should_throw {
+        AaInventoryAction::ClickThrow { target }
+    } else {
+        AaInventoryAction::ClickQuickMove { target }
+    }
+}
+
+// -- AutoArmorSaveArmor ----------------------------------------------------
+
+/// Upstream screen kinds the save-armor handler branches on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AaScreen {
+    None,
+    Inventory,
+    Container,
+    Other,
+}
+
+/// What the save-armor tick handler asks the client to do this tick.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SaveArmorAction {
+    None,
+    /// Upstream `player.closeContainer()`.
+    CloseContainer,
+    /// Upstream `screen.onClose()` (closes ClickGUI, game chat, ...).
+    CloseScreen,
+    /// Upstream `mc.gui.setScreen(InventoryScreen(player))`.
+    SetScreenInventory,
+}
+
+/// Upstream `AutoArmorSaveArmor` coroutine state, flattened into a per-tick
+/// state machine (upstream suspends with `waitTicks` inside `closeInventory`
+/// and `openInventory`; the early conditions are only checked on an idle
+/// tick, like a resumed coroutine skips them).
+#[derive(Clone, Debug)]
+pub struct SaveArmorState {
+    pub has_opened_inventory: bool,
+    /// Upstream `prevArmor`.
+    pub prev_armor: i32,
+    phase: SaveArmorPhase,
+    wait_ticks_left: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SaveArmorPhase {
+    Idle,
+    CloseWait,
+    OpenWait,
+}
+
+pub fn auto_armor_save_armor_state() -> SaveArmorState {
+    SaveArmorState {
+        has_opened_inventory: false,
+        prev_armor: 0,
+        phase: SaveArmorPhase::Idle,
+        wait_ticks_left: 0,
+    }
+}
+
+/// One tick of upstream `AutoArmorSaveArmor.armorAutoSaveHandler`. The
+/// `close_delay_roll` feeds `constraints.closeDelay.random()`.
+#[allow(clippy::too_many_arguments)]
+pub fn auto_armor_save_armor_tick(
+    module: &Module,
+    constraints: &PlayerInventoryConstraints,
+    state: &mut SaveArmorState,
+    player: &AaPlayer,
+    screen: AaScreen,
+    slots: &[AaItemSlot],
+    close_delay_roll: f64,
+) -> SaveArmorAction {
+    match state.phase {
+        SaveArmorPhase::CloseWait => {
+            state.wait_ticks_left -= 1;
+            if state.wait_ticks_left > 0 {
+                return SaveArmorAction::None;
+            }
+            state.phase = SaveArmorPhase::Idle;
+
+            // closeInventory tail: the current screen might have changed while
+            // waiting, so close it only when it is still the inventory.
+            let has_armor_to_replace = auto_armor_has_armor_to_replace(module, slots);
+            if screen == AaScreen::Inventory {
+                if has_armor_to_replace {
+                    state.phase = SaveArmorPhase::OpenWait;
+                }
+                return SaveArmorAction::CloseContainer;
+            }
+            return auto_armor_open_inventory_pass(state, module, slots, screen);
+        }
+        SaveArmorPhase::OpenWait => {
+            return auto_armor_open_inventory_pass(state, module, slots, screen)
+        }
+        SaveArmorPhase::Idle => {}
+    }
+
+    let save_armor_enabled = setting_bool(module, "SaveArmor", true);
+    let auto_open = setting_bool(module, "AutoOpenInventory", true);
+
+    let conditions = [
+        // Module checks
+        module.running,
+        save_armor_enabled,
+        // Game modes
+        !player.is_spectator,
+        !player.is_creative,
+        // The module will automatically save armor if opening the inventory
+        // isn't required.
+        constraints.requires_open_inventory,
+        auto_open,
+    ];
+
+    // All conditions must be met for this feature to work.
+    if conditions.iter().any(|c| !*c) {
+        return SaveArmorAction::None;
+    }
+
+    let has_lost_armor_piece =
+        auto_armor_should_track_armor(screen) && player.armor_value < state.prev_armor;
+    state.prev_armor = player.armor_value;
+
+    // closes the current screen so that the armor slots are synced again
+    if has_lost_armor_piece {
+        return SaveArmorAction::CloseContainer;
+    }
+
+    let armor_to_equip = auto_armor_armor_to_equip(slots);
+    let use_hotbar = setting_bool(module, "Hotbar", true);
+    let can_swap_armor = setting_bool(module, "CanSwapArmor", false);
+    let has_any_hotbar_replacement =
+        use_hotbar && can_swap_armor && armor_to_equip.iter().any(|p| p.is_reachable_by_hand());
+
+    // the new pieces from the hotbar have a higher priority due to the
+    // replacement speed (it's much faster, it makes sense to replace them
+    // first), so it waits until all pieces from hotbar are replaced
+    if has_any_hotbar_replacement {
+        return SaveArmorAction::None;
+    }
+
+    let slots_to_equip: Vec<ArmorEquipSlot> =
+        armor_to_equip.iter().map(|p| p.slot_type()).collect();
+    let has_armor_to_equip = !slots_to_equip.is_empty();
+    let has_armor_to_replace = auto_armor_has_armor_to_replace(module, slots);
+
+    // closeInventory(hasArmorToEquip)
+    if state.has_opened_inventory && !has_armor_to_equip {
+        state.has_opened_inventory = false;
+        let wait = constraints.close_delay_random(close_delay_roll);
+        if wait > 0 {
+            state.phase = SaveArmorPhase::CloseWait;
+            state.wait_ticks_left = wait;
+            return SaveArmorAction::None;
+        }
+        if screen == AaScreen::Inventory {
+            if has_armor_to_replace {
+                state.phase = SaveArmorPhase::OpenWait;
+            }
+            return SaveArmorAction::CloseContainer;
+        }
+    }
+
+    // openInventory(hasArmorToReplace)
+    auto_armor_open_inventory_pass(state, module, slots, screen)
+}
+
+/// Upstream `shouldTrackArmor`: in a handled screen other than the inventory
+/// the server does not sync the armor items' state.
+fn auto_armor_should_track_armor(screen: AaScreen) -> bool {
+    screen != AaScreen::Inventory && screen == AaScreen::Container
+}
+
+/// Upstream `ArmorEvaluation.findBestArmorPieces(slots =
+/// ModuleAutoArmor.candidateSlots, durabilityThreshold = durabilityThreshold)`
+/// with the default mode and projectile handling, filtered to pieces that are
+/// not already equipped and are player armor.
+fn auto_armor_armor_to_equip(slots: &[AaItemSlot]) -> Vec<ArmorPiece> {
+    ArmorEvaluation::find_best_armor_pieces(slots, i32::MIN, ArmorComparatorMode::Smart, true)
+        .into_iter()
+        .flatten()
+        .filter(|p| !p.is_already_equipped() && p.item_slot.stack.is_player_armor)
+        .collect()
+}
+
+/// The threshold SaveArmor works with (its own `DurabilityThreshold`).
+fn save_armor_threshold(module: &Module) -> i32 {
+    setting_int(module, "DurabilityThreshold", 24) as i32
+}
+
+/// Upstream `hasArmorToReplace`: `Slots.Armor.any { !empty && durability <=
+/// durabilityThreshold && ArmorPiece(it).slotType in armorSlotsToEquip }`.
+fn auto_armor_has_armor_to_replace(module: &Module, slots: &[AaItemSlot]) -> bool {
+    let threshold = save_armor_threshold(module);
+    let slots_to_equip: Vec<ArmorEquipSlot> =
+        auto_armor_armor_to_equip(slots).iter().map(|p| p.slot_type()).collect();
+
+    slots
+        .iter()
+        .filter(|slot| slot.slot_type == AaSlotType::Armor)
+        .any(|slot| {
+            !slot.stack.is_empty
+                && slot.stack.durability <= threshold
+                && slots_to_equip.contains(&slot.stack.equipment_slot.unwrap_or(ArmorEquipSlot::Head))
+        })
+}
+
+/// One tick of upstream `openInventory`'s `while` loop: close whatever screen
+/// is open, and once no screen is left, open the inventory.
+fn auto_armor_open_inventory_pass(
+    state: &mut SaveArmorState,
+    module: &Module,
+    slots: &[AaItemSlot],
+    screen: AaScreen,
+) -> SaveArmorAction {
+    let has_armor_to_replace = auto_armor_has_armor_to_replace(module, slots);
+
+    if !has_armor_to_replace || screen == AaScreen::Inventory {
+        state.phase = SaveArmorPhase::Idle;
+        return SaveArmorAction::None;
+    }
+
+    state.phase = SaveArmorPhase::OpenWait;
+    match screen {
+        AaScreen::Container => SaveArmorAction::CloseContainer,
+        AaScreen::Other => SaveArmorAction::CloseScreen,
+        AaScreen::None => {
+            state.has_opened_inventory = true;
+            state.phase = SaveArmorPhase::Idle;
+            SaveArmorAction::SetScreenInventory
+        }
+        AaScreen::Inventory => unreachable!(),
+    }
+}
+
+#[cfg(test)]
+mod auto_armor_tests {
+    use super::*;
+
+    fn armor_stack(slot: ArmorEquipSlot, armor_value: i32, toughness: i32) -> AaItemStack {
+        AaItemStack {
+            is_player_armor: true,
+            equipment_slot: Some(slot),
+            armor_value,
+            armor_toughness: toughness,
+            durability: 100,
+            ..Default::default()
+        }
+    }
+
+    fn slot(slot_type: AaSlotType, stack: AaItemStack) -> AaItemSlot {
+        AaItemSlot {
+            slot_type,
+            hotbar_index: None,
+            stack,
+        }
+    }
+
+    fn player_with_inventory(len: usize) -> AaPlayer {
+        let mut inventory = vec![AaItemStack::default(); len];
+        for stack in &mut inventory {
+            stack.is_empty = true;
+        }
+        AaPlayer {
+            inventory,
+            has_inventory_space: true,
+            inventory_open: false,
+            ..Default::default()
+        }
+    }
+
+    fn constraints() -> PlayerInventoryConstraints {
+        PlayerInventoryConstraints {
+            requires_open_inventory: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn damage_factor_matches_the_formula() {
+        // f = 2 + 0/4 = 2; g = clamp(20 - 6/2, 4, 20) = 17; 1 - 17/25 = 0.32
+        assert!((ArmorComparator::get_damage_factor(6.0, 20.0, 0.0) - 0.32).abs() < 1e-6);
+        // lower clamp: g = max(2 - 3, 0.4) = 0.4 -> 1 - 0.4/25 = 0.984
+        assert!((ArmorComparator::get_damage_factor(6.0, 2.0, 0.0) - 0.984).abs() < 1e-6);
+    }
+
+    #[test]
+    fn legacy_epf_and_damage_reduction() {
+        // floor((6 + 4^2) * 0.75 / 3) = floor(5.5) = 5
+        assert_eq!(ArmorComparator::legacy_epf(4, 0.75), 5);
+        // floor((6 + 4^2) * 1.5 / 3) = 11
+        assert_eq!(ArmorComparator::legacy_epf(4, 1.5), 11);
+        assert_eq!(ArmorComparator::legacy_epf(0, 0.75), 0);
+
+        let comparator = ArmorComparator::new(
+            ArmorEvaluation::EXPECTED_DAMAGE,
+            ArmorKitParameters::default(),
+            i32::MIN,
+            ArmorComparatorMode::RawDefense,
+            true,
+        );
+        let mut stack = armor_stack(ArmorEquipSlot::Chest, 8, 0);
+        stack.enchantments = vec![(AaEnchantment::Protection, 4)];
+        // armor 8 * 0.04 = 0.32; epf 5 * 0.04 = 0.2; 1 - 0.68 * 0.8 = 0.456
+        assert!(
+            (comparator.get_legacy_damage_reduction(&stack, ArmorEquipSlot::Chest) - 0.456).abs()
+                < 1e-5
+        );
+    }
+
+    #[test]
+    fn find_best_prefers_diamond_over_iron() {
+        let iron = slot(AaSlotType::Inventory, armor_stack(ArmorEquipSlot::Head, 2, 0));
+        let diamond = slot(AaSlotType::Inventory, armor_stack(ArmorEquipSlot::Head, 3, 2));
+
+        let best = ArmorEvaluation::find_best_armor_pieces(
+            &[iron, diamond],
+            i32::MIN,
+            ArmorComparatorMode::Smart,
+            true,
+        );
+        assert_eq!(
+            best[ArmorEquipSlot::Head.index() as usize]
+                .as_ref()
+                .unwrap()
+                .defense_points(),
+            3.0
+        );
+    }
+
+    #[test]
+    fn raw_defense_projectile_protection_toggle() {
+        let with_proj = {
+            let mut stack = armor_stack(ArmorEquipSlot::Head, 8, 0);
+            stack.enchantments = vec![(AaEnchantment::ProjectileProtection, 4)];
+            stack.enchantment_count = 1;
+            slot(AaSlotType::Inventory, stack)
+        };
+        let with_prot = {
+            let mut stack = armor_stack(ArmorEquipSlot::Head, 8, 0);
+            stack.enchantments = vec![(AaEnchantment::Protection, 4)];
+            stack.enchantment_count = 1;
+            slot(AaSlotType::Inventory, stack)
+        };
+
+        // Projectile Protection counts as a deciding argument by default.
+        let considered = ArmorEvaluation::find_best_armor_pieces(
+            &[with_proj.clone(), with_prot.clone()],
+            i32::MIN,
+            ArmorComparatorMode::RawDefense,
+            true,
+        );
+        assert_eq!(
+            considered[0]
+                .as_ref()
+                .unwrap()
+                .item_slot
+                .stack
+                .enchantment_level(AaEnchantment::ProjectileProtection),
+            4
+        );
+
+        // Without it, plain Protection decides.
+        let ignored = ArmorEvaluation::find_best_armor_pieces(
+            &[with_proj, with_prot],
+            i32::MIN,
+            ArmorComparatorMode::RawDefense,
+            false,
+        );
+        assert_eq!(
+            ignored[0]
+                .as_ref()
+                .unwrap()
+                .item_slot
+                .stack
+                .enchantment_level(AaEnchantment::Protection),
+            4
+        );
+    }
+
+    #[test]
+    fn candidate_slots_keep_worn_and_drop_cursed() {
+        let cursed = {
+            let mut stack = armor_stack(ArmorEquipSlot::Head, 2, 0);
+            stack.has_binding_curse = true;
+            slot(AaSlotType::Inventory, stack)
+        };
+        let worn = slot(AaSlotType::Armor, armor_stack(ArmorEquipSlot::Chest, 6, 0));
+        let clean = slot(AaSlotType::Inventory, armor_stack(ArmorEquipSlot::Legs, 5, 0));
+
+        let kept = auto_armor_candidate_slots(&[Curse::Binding], &[cursed.clone(), worn, clean]);
+        assert_eq!(kept.len(), 2);
+        assert!(kept.iter().any(|s| s.slot_type == AaSlotType::Armor));
+
+        // No curses selected: every slot is a candidate (upstream `Slots.All`).
+        assert_eq!(auto_armor_candidate_slots(&[], &[cursed.clone()]).len(), 1);
+    }
+
+    #[test]
+    fn schedule_handler_equips_hotbar_piece_with_use_item() {
+        let module = auto_armor();
+        let player = player_with_inventory(45);
+        let piece = AaItemSlot {
+            slot_type: AaSlotType::Hotbar,
+            hotbar_index: Some(3),
+            stack: armor_stack(ArmorEquipSlot::Chest, 8, 2),
+        };
+
+        let mut event = AutoArmorScheduleEvent::default();
+        auto_armor_schedule_handler(&module, &constraints(), &player, &[piece], &mut event);
+
+        assert_eq!(event.scheduled.len(), 1);
+        assert!(matches!(
+            event.scheduled[0].0,
+            AaInventoryAction::UseItem { hotbar_index: 3 }
+        ));
+        assert_eq!(event.scheduled[0].1, AaPriority::ImportantForPlayerLife);
+    }
+
+    #[test]
+    fn occupied_armor_slot_without_space_throws() {
+        let module = auto_armor();
+        let mut player = player_with_inventory(45);
+        player.has_inventory_space = false;
+        // A worse chest is worn in the target armor slot (inventory index 37).
+        player.inventory[37] = armor_stack(ArmorEquipSlot::Chest, 6, 0);
+
+        let better = slot(AaSlotType::Inventory, armor_stack(ArmorEquipSlot::Chest, 8, 2));
+
+        let mut event = AutoArmorScheduleEvent::default();
+        auto_armor_schedule_handler(&module, &constraints(), &player, &[better], &mut event);
+
+        assert_eq!(event.scheduled.len(), 1);
+        match &event.scheduled[0].0 {
+            AaInventoryAction::ClickThrow { target } => {
+                assert!(matches!(target, AaClickTarget::Armor(ArmorEquipSlot::Chest)))
+            }
+            other => panic!("expected a throw, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn spectator_and_glider_are_skipped() {
+        let module = auto_armor();
+        let mut player = player_with_inventory(45);
+        player.is_spectator = true;
+        let piece = slot(AaSlotType::Inventory, armor_stack(ArmorEquipSlot::Head, 3, 0));
+
+        let mut event = AutoArmorScheduleEvent::default();
+        auto_armor_schedule_handler(&module, &constraints(), &player, &[piece.clone()], &mut event);
+        assert!(event.scheduled.is_empty());
+
+        player.is_spectator = false;
+        // The target armor slot holds a glider (legs slot, inventory index 38).
+        player.inventory[38].is_glider = true;
+        player.inventory[38].is_empty = false;
+        let legs = AaItemSlot {
+            slot_type: AaSlotType::Inventory,
+            hotbar_index: None,
+            stack: armor_stack(ArmorEquipSlot::Legs, 5, 0),
+        };
+        let mut event = AutoArmorScheduleEvent::default();
+        auto_armor_schedule_handler(&module, &constraints(), &player, &[legs], &mut event);
+        assert!(event.scheduled.is_empty());
+    }
+
+    #[test]
+    fn save_armor_closes_inventory_when_a_piece_is_lost() {
+        let mut module = auto_armor();
+        module.running = true;
+        let mut state = auto_armor_save_armor_state();
+        state.prev_armor = 20;
+        let player = AaPlayer {
+            armor_value: 10,
+            ..Default::default()
+        };
+
+        let action = auto_armor_save_armor_tick(
+            &module,
+            &constraints(),
+            &mut state,
+            &player,
+            AaScreen::Container,
+            &[],
+            0.5,
+        );
+        assert_eq!(action, SaveArmorAction::CloseContainer);
+        assert_eq!(state.prev_armor, 10);
+    }
+
+    #[test]
+    fn save_armor_opens_the_inventory_to_replace_a_worn_piece() {
+        let mut module = auto_armor();
+        module.running = true;
+        let mut state = auto_armor_save_armor_state();
+        let player = AaPlayer::default();
+
+        let worn = slot(AaSlotType::Armor, {
+            let mut stack = armor_stack(ArmorEquipSlot::Chest, 6, 0);
+            stack.durability = 10;
+            stack
+        });
+        let better = slot(AaSlotType::Inventory, armor_stack(ArmorEquipSlot::Chest, 8, 2));
+
+        // A chat/ClickGUI screen gets closed first to save some armor.
+        let action = auto_armor_save_armor_tick(
+            &module,
+            &constraints(),
+            &mut state,
+            &player,
+            AaScreen::Other,
+            &[worn.clone(), better.clone()],
+            0.5,
+        );
+        assert_eq!(action, SaveArmorAction::CloseScreen);
+
+        // Next tick the screen is gone, so the inventory opens.
+        let action = auto_armor_save_armor_tick(
+            &module,
+            &constraints(),
+            &mut state,
+            &player,
+            AaScreen::None,
+            &[worn, better],
+            0.5,
+        );
+        assert_eq!(action, SaveArmorAction::SetScreenInventory);
+        assert!(state.has_opened_inventory);
+    }
+
+    #[test]
+    fn save_armor_closes_the_inventory_after_the_replacement() {
+        let mut module = auto_armor();
+        module.running = true;
+        let mut state = auto_armor_save_armor_state();
+        state.has_opened_inventory = true;
+        let player = AaPlayer::default();
+
+        // Nothing left to equip: the inventory closes after its close delay
+        // (1..2 ticks; roll 0.0 draws 1).
+        let action = auto_armor_save_armor_tick(
+            &module,
+            &constraints(),
+            &mut state,
+            &player,
+            AaScreen::Inventory,
+            &[],
+            0.0,
+        );
+        assert_eq!(action, SaveArmorAction::None);
+
+        let action = auto_armor_save_armor_tick(
+            &module,
+            &constraints(),
+            &mut state,
+            &player,
+            AaScreen::Inventory,
+            &[],
+            0.0,
+        );
+        assert_eq!(action, SaveArmorAction::CloseContainer);
+        assert!(!state.has_opened_inventory);
+    }
+}

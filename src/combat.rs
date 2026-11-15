@@ -21605,6 +21605,18 @@ pub fn crystal_aura() -> Module {
             boolean("SetDead", true),
             // SubmoduleIdPredict (ToggleableValueGroup "IDPredict", false)
             boolean("IDPredict", false),
+            // CrystalAuraTriggerer (ValueGroup "Triggers"): NotWhileUsingItem /
+            // Off-Thread plus the eight trigger toggles
+            boolean("NotWhileUsingItem", false),
+            boolean("Off-Thread", true),
+            boolean("Tick", true),
+            boolean("BlockChange", true),
+            boolean("ClientBlockBreak", true),
+            boolean("CrystalSpawn", true),
+            boolean("CrystalDestroy", true),
+            boolean("ExplodeSound", true),
+            boolean("EntityMove", true),
+            boolean("SelfMove", false),
             // RotationMode modes(): NormalRotationMode (priority
             // IMPORTANT_FOR_USAGE_2) / NoRotationMode
             choice("RotationMode", "Normal", &["Normal", "None"]),
@@ -24845,5 +24857,1230 @@ mod predict_idpredict_tests {
         let (yaw, pitch) = hooks.sent_pos_rots[0];
         assert!((yaw - 91.05).abs() < 1e-4, "yaw {}", yaw);
         assert!((pitch - 30.0).abs() < 1e-4, "pitch {}", pitch);
+    }
+}
+
+// ----- combat/crystalaura/trigger/*.kt (GPL-3.0, (c) 2015-2026 CCBlueX) -----
+// Trigger.kt, CrystalAuraTriggerer.kt, triggers/{Tick,BlockChange,
+// ClientBlockBreak,CrystalSpawn,CrystalDestroy,ExplodeSound,EntityMove,
+// SelfMove}Trigger.kt — ported 1:1.
+
+/// Upstream `Trigger` options flattened: the `Triggers` group's eight trigger
+/// toggles plus `NotWhileUsingItem` and `Off-Thread`.
+#[derive(Debug, Clone)]
+pub struct CaTriggerSettings {
+    /// `NotWhileUsingItem` false
+    pub not_while_using_item: bool,
+    /// `Off-Thread` true
+    pub off_thread: bool,
+    /// `Tick` true (the only trigger with `allowsCaching == true`)
+    pub tick: bool,
+    /// `BlockChange` true
+    pub block_change: bool,
+    /// `ClientBlockBreak` true
+    pub client_block_break: bool,
+    /// `CrystalSpawn` true
+    pub crystal_spawn: bool,
+    /// `CrystalDestroy` true
+    pub crystal_destroy: bool,
+    /// `ExplodeSound` true
+    pub explode_sound: bool,
+    /// `EntityMove` true
+    pub entity_move: bool,
+    /// `SelfMove` false
+    pub self_move: bool,
+}
+
+impl Default for CaTriggerSettings {
+    fn default() -> Self {
+        CaTriggerSettings {
+            not_while_using_item: false,
+            off_thread: true,
+            tick: true,
+            block_change: true,
+            client_block_break: true,
+            crystal_spawn: true,
+            crystal_destroy: true,
+            explode_sound: true,
+            entity_move: true,
+            self_move: false,
+        }
+    }
+}
+
+/// Upstream `Trigger.running` is per-trigger: the triggerer's running AND the
+/// trigger's own option. `enabled` here is that option
+/// (`settings.tick` / `settings.block_change` / ...).
+pub fn ca_trigger_running(
+    hooks: &dyn CaTriggerHooks,
+    settings: &CaTriggerSettings,
+    enabled: bool,
+) -> bool {
+    ca_triggerer_running(hooks, settings) && enabled
+}
+
+/// Upstream `CrystalAuraTriggerer.running`: also pauses when the combat
+/// manager tells combat modules to pause or `NotWhileUsingItem` requires it.
+pub fn ca_triggerer_running(
+    hooks: &dyn CaTriggerHooks,
+    settings: &CaTriggerSettings,
+) -> bool {
+    hooks.ca_module_running()
+        && !hooks.ca_should_pause_combat()
+        && (!hooks.ca_player_using_item() || !settings.not_while_using_item)
+}
+
+/// Upstream `CrystalAuraTriggerer` task bookkeeping: `currentPlaceTask` /
+/// `currentDestroyTask` as "is done" flags (`None` upstream means done).
+#[derive(Debug, Clone, Copy)]
+pub struct CaTriggerState {
+    pub current_place_task_done: bool,
+    pub current_destroy_task_done: bool,
+}
+
+impl Default for CaTriggerState {
+    fn default() -> Self {
+        CaTriggerState {
+            current_place_task_done: true,
+            current_destroy_task_done: true,
+        }
+    }
+}
+
+/// The runnables the triggerer dispatches. The `CrystalSpawnTrigger` closure
+/// carries the entity id it looks up in the world.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CaTriggerRunnable {
+    /// `SubmoduleCrystalDestroyer.tick()`
+    DestroyerTick,
+    /// `SubmoduleCrystalPlacer.tick()`
+    PlacerTick,
+    /// `runDestroy { val entity = world.getEntity(id); if (entity !is
+    /// EndCrystal) return@runDestroy; SubmoduleCrystalDestroyer.tick() }`
+    CrystalSpawnDestroy { entity_id: i32 },
+}
+
+/// Upstream `ClientboundBlockUpdatePacket` (position + block state), also
+/// reused for the section-blocks updates of the chunk handler.
+#[derive(Debug, Clone, Copy)]
+pub struct CaBlockUpdatePacket {
+    pub pos: CaBlockPos,
+    pub is_air: bool,
+}
+
+/// Upstream `ClientboundRemoveEntitiesPacket` with the
+/// `ClientboundRemoveEntitiesPacketAddition` mixin's `containsCrystal` marker.
+#[derive(Debug, Clone)]
+pub struct CaRemoveEntitiesPacket {
+    pub entity_ids: Vec<i32>,
+    pub contains_crystal: bool,
+}
+
+/// Upstream `ClientboundAddEntityPacket` (type check is the engine's).
+#[derive(Debug, Clone, Copy)]
+pub struct CaAddEntityPacket {
+    pub id: i32,
+    /// `packet.type == EntityTypes.END_CRYSTAL`
+    pub type_is_end_crystal: bool,
+}
+
+/// Upstream `ClientboundTeleportEntityPacket`.
+#[derive(Debug, Clone, Copy)]
+pub struct CaTeleportEntityPacket {
+    pub id: i32,
+}
+
+/// Upstream `ClientboundSoundEntityPacket`.
+#[derive(Debug, Clone, Copy)]
+pub struct CaSoundEntityPacket {
+    pub id: i32,
+    /// `packet.sound == SoundEvents.GENERIC_EXPLODE`
+    pub is_generic_explode: bool,
+}
+
+/// `world.getEntity(id)`: the type and position the triggers read.
+#[derive(Debug, Clone, Copy)]
+pub struct CaTrackedEntity {
+    pub is_end_crystal: bool,
+    pub position: (f64, f64, f64),
+}
+
+/// The engine surfaces `CrystalAuraTriggerer` and the triggers read: the
+/// module's running state, the combat manager, the player, the world, the
+/// single-thread executor, and the submodule toggles the triggers read.
+pub trait CaTriggerHooks {
+    /// `ModuleCrystalAura.running`.
+    fn ca_module_running(&self) -> bool {
+        false
+    }
+    /// `CombatManager.shouldPauseCombat`.
+    fn ca_should_pause_combat(&self) -> bool {
+        false
+    }
+    /// `player.isUsingItem`.
+    fn ca_player_using_item(&self) -> bool {
+        false
+    }
+    /// `player.eyePosition` (x, y, z).
+    fn ca_player_eye_position(&self) -> (f64, f64, f64) {
+        (0.0, 0.0, 0.0)
+    }
+    /// `player.position()` (x, y, z).
+    fn ca_player_position(&self) -> (f64, f64, f64) {
+        (0.0, 0.0, 0.0)
+    }
+    /// `world.getEntity(id)`.
+    fn ca_world_get_entity(&mut self, id: i32) -> Option<CaTrackedEntity> {
+        let _ = id;
+        None
+    }
+    /// `SubmoduleCrystalPlacer.getMaxRange()`.
+    fn ca_placer_max_range(&self) -> f64 {
+        0.0
+    }
+    /// `SubmoduleCrystalDestroyer.getMaxRange()`.
+    fn ca_destroyer_max_range(&self) -> f64 {
+        0.0
+    }
+    /// `ModuleCrystalAura.targetTracker.maxRange`.
+    fn ca_target_tracker_max_range(&self) -> f64 {
+        0.0
+    }
+    /// `SubmoduleIdPredict.enabled`.
+    fn ca_idpredict_enabled(&self) -> bool {
+        false
+    }
+    /// `SubmoduleSetDead.enabled`.
+    fn ca_set_dead_enabled(&self) -> bool {
+        true
+    }
+    /// The single-thread executor (or `mc.execute` on-thread): runs the
+    /// runnable; `true` when the submitted task completed (upstream
+    /// `Future.isDone`).
+    fn ca_run_runnable(&mut self, runnable: CaTriggerRunnable) -> bool {
+        match runnable {
+            CaTriggerRunnable::DestroyerTick => {
+                self.ca_destroyer_tick();
+                true
+            }
+            CaTriggerRunnable::PlacerTick => {
+                self.ca_placer_tick();
+                true
+            }
+            CaTriggerRunnable::CrystalSpawnDestroy { entity_id } => {
+                if let Some(entity) = self.ca_world_get_entity(entity_id) {
+                    if entity.is_end_crystal {
+                        self.ca_destroyer_tick();
+                    }
+                }
+                true
+            }
+        }
+    }
+    /// `currentPlaceTask?.cancel(true)` (off-thread path's cancellation).
+    fn ca_cancel_place_task(&mut self) {}
+    /// `currentDestroyTask?.cancel(true)`.
+    fn ca_cancel_destroy_task(&mut self) {}
+    /// `mc.execute { ... }` wrapper (ordering seam for SelfMove).
+    fn ca_execute(&mut self) {}
+    /// `SubmoduleCrystalDestroyer.tick()`.
+    fn ca_destroyer_tick(&mut self);
+    /// `SubmoduleCrystalPlacer.tick()`.
+    fn ca_placer_tick(&mut self);
+}
+
+/// Upstream `CrystalAuraTriggerer.terminateRunningTasks()`.
+pub fn ca_triggerer_terminate_running_tasks(state: &mut CaTriggerState) {
+    // `currentPlaceTask?.cancel(true)` and `currentDestroyTask?.cancel(true)`
+    // both make the futures done.
+    state.current_place_task_done = true;
+    state.current_destroy_task_done = true;
+}
+
+/// Upstream `CrystalAuraTriggerer.runPlace(runnable)`.
+pub fn ca_triggerer_run_place(
+    hooks: &mut dyn CaTriggerHooks,
+    state: &mut CaTriggerState,
+    settings: &CaTriggerSettings,
+    runnable: CaTriggerRunnable,
+) {
+    if !state.current_place_task_done {
+        return;
+    }
+
+    if settings.off_thread {
+        state.current_place_task_done = hooks.ca_run_runnable(runnable);
+    } else {
+        hooks.ca_cancel_place_task();
+        state.current_place_task_done = hooks.ca_run_runnable(runnable);
+    }
+}
+
+/// Upstream `CrystalAuraTriggerer.runDestroy(runnable)`.
+pub fn ca_triggerer_run_destroy(
+    hooks: &mut dyn CaTriggerHooks,
+    state: &mut CaTriggerState,
+    settings: &CaTriggerSettings,
+    runnable: CaTriggerRunnable,
+) {
+    if !state.current_destroy_task_done {
+        return;
+    }
+
+    if settings.off_thread {
+        state.current_destroy_task_done = hooks.ca_run_runnable(runnable);
+    } else {
+        hooks.ca_cancel_destroy_task();
+        state.current_destroy_task_done = hooks.ca_run_runnable(runnable);
+    }
+}
+
+/// Upstream `CrystalAuraTriggerer.canCache()`: caching only makes sense
+/// on-thread, and only when every enabled trigger allows it. Only
+/// `TickTrigger.allowsCaching` is true.
+pub fn ca_triggerer_can_cache(settings: &CaTriggerSettings) -> bool {
+    if settings.off_thread {
+        return false;
+    }
+    !settings.block_change
+        && !settings.client_block_break
+        && !settings.crystal_spawn
+        && !settings.crystal_destroy
+        && !settings.explode_sound
+        && !settings.entity_move
+        && !settings.self_move
+}
+
+/// Upstream `AABB(blockPos).distanceToSqr(eyePos)`: the block's unit cube
+/// against a point.
+pub fn ca_block_aabb_distance_to_sqr(pos: CaBlockPos, point: (f64, f64, f64)) -> f64 {
+    let min = (pos.0 as f64, pos.1 as f64, pos.2 as f64);
+    let max = (min.0 + 1.0, min.1 + 1.0, min.2 + 1.0);
+    ca_aabb_point_distance_to_sqr(min, max, point)
+}
+
+/// Squared distance from a point to an AABB (0 when inside).
+pub fn ca_aabb_point_distance_to_sqr(
+    min: (f64, f64, f64),
+    max: (f64, f64, f64),
+    point: (f64, f64, f64),
+) -> f64 {
+    let dx = if point.0 < min.0 {
+        min.0 - point.0
+    } else if point.0 > max.0 {
+        point.0 - max.0
+    } else {
+        0.0
+    };
+    let dy = if point.1 < min.1 {
+        min.1 - point.1
+    } else if point.1 > max.1 {
+        point.1 - max.1
+    } else {
+        0.0
+    };
+    let dz = if point.2 < min.2 {
+        min.2 - point.2
+    } else if point.2 > max.2 {
+        point.2 - max.2
+    } else {
+        0.0
+    };
+    dx * dx + dy * dy + dz * dz
+}
+
+/// Squared distance between two positions.
+pub fn ca_vec3_distance_to_sqr(a: (f64, f64, f64), b: (f64, f64, f64)) -> f64 {
+    let (dx, dy, dz) = (a.0 - b.0, a.1 - b.1, a.2 - b.2);
+    dx * dx + dy * dy + dz * dz
+}
+
+// ----- TickTrigger.kt -----
+
+/// Upstream `TickTrigger`: runs placing and destroying every tick
+/// (`RotationUpdateEvent` handler).
+pub fn ca_trigger_tick(
+    hooks: &mut dyn CaTriggerHooks,
+    state: &mut CaTriggerState,
+    settings: &CaTriggerSettings,
+) {
+    if !ca_trigger_running(hooks, settings, settings.tick) {
+        return;
+    }
+
+    if settings.off_thread {
+        ca_triggerer_run_destroy(hooks, state, settings, CaTriggerRunnable::DestroyerTick);
+        ca_triggerer_run_place(hooks, state, settings, CaTriggerRunnable::PlacerTick);
+    } else {
+        // Make the crystal destroyer run
+        hooks.ca_destroyer_tick();
+        // Make the crystal placer run
+        hooks.ca_placer_tick();
+        if !hooks.ca_idpredict_enabled() {
+            // Make the crystal destroyer run
+            hooks.ca_destroyer_tick();
+        }
+    }
+}
+
+// ----- BlockChangeTrigger.kt -----
+
+/// Upstream `PostPacketTrigger.notify` + `BlockChangeTrigger.postPacketHandler`:
+/// runs placing right when a block was broken in the area where the aura
+/// operates (blocking enemy surrounds with immediate placements).
+pub fn ca_trigger_block_change_notify(
+    hooks: &mut dyn CaTriggerHooks,
+    state: &mut CaTriggerState,
+    settings: &CaTriggerSettings,
+    packet: &CaBlockUpdatePacket,
+) {
+    if !ca_trigger_running(hooks, settings, settings.block_change) {
+        return;
+    }
+
+    if !packet.is_air {
+        return;
+    }
+
+    let eye_pos = hooks.ca_player_eye_position();
+    let range_sq = sq(hooks.ca_placer_max_range().max(hooks.ca_destroyer_max_range())) + 1.0;
+    ca_block_change_tick_if_in_range(hooks, state, settings, packet.pos, eye_pos, range_sq);
+}
+
+/// Upstream `BlockChangeTrigger.postChunkUpdateHandler`
+/// (`ClientboundSectionBlocksUpdatePacket`).
+pub fn ca_trigger_block_change_chunk_notify(
+    hooks: &mut dyn CaTriggerHooks,
+    state: &mut CaTriggerState,
+    settings: &CaTriggerSettings,
+    updates: &[CaBlockUpdatePacket],
+) {
+    if !ca_trigger_running(hooks, settings, settings.block_change) {
+        return;
+    }
+
+    let eye_pos = hooks.ca_player_eye_position();
+    let range_sq = sq(hooks.ca_placer_max_range().max(hooks.ca_destroyer_max_range())) + 1.0;
+    for update in updates {
+        if update.is_air
+            && ca_block_change_tick_if_in_range(
+                hooks,
+                state,
+                settings,
+                update.pos,
+                eye_pos,
+                range_sq,
+            )
+        {
+            // return@runUpdates
+        }
+    }
+}
+
+/// Upstream `BlockChangeTrigger.tickIfInRange`.
+fn ca_block_change_tick_if_in_range(
+    hooks: &mut dyn CaTriggerHooks,
+    state: &mut CaTriggerState,
+    settings: &CaTriggerSettings,
+    block_pos: CaBlockPos,
+    eye_pos: (f64, f64, f64),
+    range_sq: f64,
+) -> bool {
+    if ca_block_aabb_distance_to_sqr(block_pos, eye_pos) < range_sq {
+        ca_triggerer_run_place(hooks, state, settings, CaTriggerRunnable::PlacerTick);
+        return true;
+    }
+
+    false
+}
+
+// ----- ClientBlockBreakTrigger.kt -----
+
+/// Upstream `ClientBlockBreakTrigger.clientBreakHandler()`: same as block
+/// change, but runs earlier for blocks broken client side.
+pub fn ca_trigger_client_block_break(
+    hooks: &mut dyn CaTriggerHooks,
+    state: &mut CaTriggerState,
+    settings: &CaTriggerSettings,
+) {
+    if !ca_trigger_running(hooks, settings, settings.client_block_break) {
+        return;
+    }
+
+    ca_triggerer_run_place(hooks, state, settings, CaTriggerRunnable::PlacerTick);
+}
+
+// ----- CrystalDestroyTrigger.kt -----
+
+/// Upstream `CrystalDestroyTrigger`'s `handler<PacketEvent>(-1)`: marks the
+/// packet when it removes a relevant crystal.
+pub fn ca_trigger_crystal_destroy_packet_listener(
+    hooks: &mut dyn CaTriggerHooks,
+    settings: &CaTriggerSettings,
+    packet: &mut CaRemoveEntitiesPacket,
+) {
+    if !ca_trigger_running(hooks, settings, settings.crystal_destroy) {
+        return;
+    }
+
+    let max_range_sq = sq(hooks.ca_placer_max_range());
+    let player_pos = hooks.ca_player_position();
+    let contains_relevant_crystal = packet.entity_ids.iter().any(|entity_id| {
+        match hooks.ca_world_get_entity(*entity_id) {
+            // is the entity a crystal and in range?
+            Some(entity) => {
+                entity.is_end_crystal
+                    && ca_vec3_distance_to_sqr(entity.position, player_pos) <= max_range_sq
+            }
+            None => false,
+        }
+    });
+
+    // mark the packet
+    if contains_relevant_crystal {
+        packet.contains_crystal = true;
+    }
+}
+
+/// Upstream `PostPacketTrigger.notify` +
+/// `CrystalDestroyTrigger.postPacketHandler`: runs placing when the
+/// information that a crystal is removed is received.
+pub fn ca_trigger_crystal_destroy_notify(
+    hooks: &mut dyn CaTriggerHooks,
+    state: &mut CaTriggerState,
+    settings: &CaTriggerSettings,
+    packet: &CaRemoveEntitiesPacket,
+) {
+    if !ca_trigger_running(hooks, settings, settings.crystal_destroy) {
+        return;
+    }
+
+    let packet_not_relevant = !packet.contains_crystal;
+    if packet_not_relevant {
+        return;
+    }
+
+    ca_triggerer_run_place(hooks, state, settings, CaTriggerRunnable::PlacerTick);
+}
+
+// ----- CrystalSpawnTrigger.kt -----
+
+/// Upstream `PostPacketTrigger.notify` + `CrystalSpawnTrigger.postPacketHandler`:
+/// runs destroying when the information that a crystal is spawned is
+/// received. When Set-Dead is enabled, this will also run placing.
+pub fn ca_trigger_crystal_spawn_notify(
+    hooks: &mut dyn CaTriggerHooks,
+    state: &mut CaTriggerState,
+    settings: &CaTriggerSettings,
+    packet: &CaAddEntityPacket,
+) {
+    if !ca_trigger_running(hooks, settings, settings.crystal_spawn) {
+        return;
+    }
+
+    if !packet.type_is_end_crystal {
+        return;
+    }
+
+    ca_triggerer_run_destroy(
+        hooks,
+        state,
+        settings,
+        CaTriggerRunnable::CrystalSpawnDestroy {
+            entity_id: packet.id,
+        },
+    );
+
+    if hooks.ca_set_dead_enabled() {
+        ca_triggerer_run_place(hooks, state, settings, CaTriggerRunnable::PlacerTick);
+    }
+}
+
+// ----- EntityMoveTrigger.kt -----
+
+/// Upstream `PostPacketTrigger.notify` + `EntityMoveTrigger.postPacketHandler`:
+/// runs placing and destroying when an entity moves.
+pub fn ca_trigger_entity_move_notify(
+    hooks: &mut dyn CaTriggerHooks,
+    state: &mut CaTriggerState,
+    settings: &CaTriggerSettings,
+    packet: &CaTeleportEntityPacket,
+) {
+    if !ca_trigger_running(hooks, settings, settings.entity_move) {
+        return;
+    }
+
+    let entity = match hooks.ca_world_get_entity(packet.id) {
+        Some(entity) => entity,
+        None => return,
+    };
+    let eye_pos = hooks.ca_player_eye_position();
+    if ca_vec3_distance_to_sqr(eye_pos, entity.position) > sq(hooks.ca_target_tracker_max_range())
+    {
+        return;
+    }
+
+    ca_triggerer_run_destroy(hooks, state, settings, CaTriggerRunnable::DestroyerTick);
+    ca_triggerer_run_place(hooks, state, settings, CaTriggerRunnable::PlacerTick);
+}
+
+// ----- ExplodeSoundTrigger.kt -----
+
+/// Upstream `PostPacketTrigger.notify` +
+/// `ExplodeSoundTrigger.postPacketHandler`: runs placing when an explosion
+/// sound is received.
+pub fn ca_trigger_explode_sound_notify(
+    hooks: &mut dyn CaTriggerHooks,
+    state: &mut CaTriggerState,
+    settings: &CaTriggerSettings,
+    packet: &CaSoundEntityPacket,
+) {
+    if !ca_trigger_running(hooks, settings, settings.explode_sound) {
+        return;
+    }
+
+    if !packet.is_generic_explode {
+        return;
+    }
+
+    if let Some(entity) = hooks.ca_world_get_entity(packet.id) {
+        // don't place if the sound is too far away
+        let max_range_sq = sq(hooks.ca_placer_max_range());
+        if ca_vec3_distance_to_sqr(entity.position, hooks.ca_player_position()) > max_range_sq {
+            return;
+        }
+    }
+
+    ca_triggerer_run_place(hooks, state, settings, CaTriggerRunnable::PlacerTick);
+}
+
+// ----- SelfMoveTrigger.kt -----
+
+/// Upstream `SelfMoveTrigger`'s `handler<PacketEvent>(-1)`: runs placing and
+/// destroying when you move.
+pub fn ca_trigger_self_move_packet_listener(
+    hooks: &mut dyn CaTriggerHooks,
+    state: &mut CaTriggerState,
+    settings: &CaTriggerSettings,
+    is_move_player_packet: bool,
+) {
+    if !ca_trigger_running(hooks, settings, settings.self_move) {
+        return;
+    }
+
+    if !is_move_player_packet {
+        return;
+    }
+
+    hooks.ca_execute();
+    ca_triggerer_run_destroy(hooks, state, settings, CaTriggerRunnable::DestroyerTick);
+    ca_triggerer_run_place(hooks, state, settings, CaTriggerRunnable::PlacerTick);
+}
+
+mod ca_trigger_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    struct TriggerMock {
+        module_running: bool,
+        pause_combat: bool,
+        using_item: bool,
+        eye: (f64, f64, f64),
+        pos: (f64, f64, f64),
+        placer_max: f64,
+        destroyer_max: f64,
+        tracker_max: f64,
+        entities: HashMap<i32, CaTrackedEntity>,
+        idpredict: bool,
+        set_dead: bool,
+        ran: Vec<CaTriggerRunnable>,
+        ticks: Vec<&'static str>,
+        cancels: Vec<&'static str>,
+        executed: usize,
+        runnables_complete: bool,
+    }
+
+    impl Default for TriggerMock {
+        fn default() -> Self {
+            TriggerMock {
+                module_running: true,
+                pause_combat: false,
+                using_item: false,
+                eye: (0.5, 65.0, 0.5),
+                pos: (0.5, 64.62, 0.5),
+                placer_max: 4.5,
+                destroyer_max: 4.5,
+                tracker_max: 4.5,
+                entities: HashMap::new(),
+                idpredict: false,
+                set_dead: true,
+                ran: Vec::new(),
+                ticks: Vec::new(),
+                cancels: Vec::new(),
+                executed: 0,
+                runnables_complete: true,
+            }
+        }
+    }
+
+    impl CaTriggerHooks for TriggerMock {
+        fn ca_module_running(&self) -> bool {
+            self.module_running
+        }
+        fn ca_should_pause_combat(&self) -> bool {
+            self.pause_combat
+        }
+        fn ca_player_using_item(&self) -> bool {
+            self.using_item
+        }
+        fn ca_player_eye_position(&self) -> (f64, f64, f64) {
+            self.eye
+        }
+        fn ca_player_position(&self) -> (f64, f64, f64) {
+            self.pos
+        }
+        fn ca_world_get_entity(&mut self, id: i32) -> Option<CaTrackedEntity> {
+            self.entities.get(&id).copied()
+        }
+        fn ca_placer_max_range(&self) -> f64 {
+            self.placer_max
+        }
+        fn ca_destroyer_max_range(&self) -> f64 {
+            self.destroyer_max
+        }
+        fn ca_target_tracker_max_range(&self) -> f64 {
+            self.tracker_max
+        }
+        fn ca_idpredict_enabled(&self) -> bool {
+            self.idpredict
+        }
+        fn ca_set_dead_enabled(&self) -> bool {
+            self.set_dead
+        }
+        fn ca_run_runnable(&mut self, runnable: CaTriggerRunnable) -> bool {
+            self.ran.push(runnable);
+            if let CaTriggerRunnable::CrystalSpawnDestroy { entity_id } = runnable {
+                if let Some(entity) = self.ca_world_get_entity(entity_id) {
+                    if entity.is_end_crystal {
+                        self.ca_destroyer_tick();
+                    }
+                }
+            }
+            self.runnables_complete
+        }
+        fn ca_cancel_place_task(&mut self) {
+            self.cancels.push("place");
+        }
+        fn ca_cancel_destroy_task(&mut self) {
+            self.cancels.push("destroy");
+        }
+        fn ca_execute(&mut self) {
+            self.executed += 1;
+        }
+        fn ca_destroyer_tick(&mut self) {
+            self.ticks.push("destroy");
+        }
+        fn ca_placer_tick(&mut self) {
+            self.ticks.push("place");
+        }
+    }
+
+    fn add_crystal(
+        entities: &mut HashMap<i32, CaTrackedEntity>,
+        id: i32,
+        pos: (f64, f64, f64),
+    ) {
+        entities.insert(
+            id,
+            CaTrackedEntity {
+                is_end_crystal: true,
+                position: pos,
+            },
+        );
+    }
+
+    #[test]
+    fn triggerer_running_gates_on_pause_and_using_item() {
+        let settings = CaTriggerSettings::default();
+
+        let mut hooks = TriggerMock::default();
+        hooks.module_running = false;
+        assert!(!ca_triggerer_running(&hooks, &settings));
+
+        let mut hooks = TriggerMock::default();
+        hooks.pause_combat = true;
+        assert!(!ca_triggerer_running(&hooks, &settings));
+
+        let mut hooks = TriggerMock::default();
+        hooks.using_item = true;
+        let mut settings = settings.clone();
+        settings.not_while_using_item = true;
+        assert!(!ca_triggerer_running(&hooks, &settings));
+        settings.not_while_using_item = false;
+        assert!(ca_triggerer_running(&hooks, &settings));
+    }
+
+    #[test]
+    fn run_place_skips_while_a_task_is_still_running() {
+        let mut hooks = TriggerMock::default();
+        let mut state = CaTriggerState::default();
+        state.current_place_task_done = false;
+
+        ca_triggerer_run_place(
+            &mut hooks,
+            &mut state,
+            &CaTriggerSettings::default(),
+            CaTriggerRunnable::PlacerTick,
+        );
+        assert!(hooks.ran.is_empty());
+    }
+
+    #[test]
+    fn run_place_off_thread_submits_and_marks_done() {
+        let mut hooks = TriggerMock::default();
+        let mut state = CaTriggerState::default();
+
+        ca_triggerer_run_place(
+            &mut hooks,
+            &mut state,
+            &CaTriggerSettings::default(),
+            CaTriggerRunnable::PlacerTick,
+        );
+        assert_eq!(hooks.ran, vec![CaTriggerRunnable::PlacerTick]);
+        assert!(state.current_place_task_done);
+
+        // a submitted task that has not completed yet blocks the next dispatch
+        hooks.runnables_complete = false;
+        ca_triggerer_run_place(
+            &mut hooks,
+            &mut state,
+            &CaTriggerSettings::default(),
+            CaTriggerRunnable::PlacerTick,
+        );
+        assert_eq!(hooks.ran.len(), 2);
+        assert!(!state.current_place_task_done);
+        ca_triggerer_run_place(
+            &mut hooks,
+            &mut state,
+            &CaTriggerSettings::default(),
+            CaTriggerRunnable::PlacerTick,
+        );
+        assert_eq!(hooks.ran.len(), 2, "second dispatch while pending is skipped");
+    }
+
+    #[test]
+    fn run_place_on_thread_cancels_then_executes() {
+        let mut hooks = TriggerMock::default();
+        let mut state = CaTriggerState::default();
+        let mut settings = CaTriggerSettings::default();
+        settings.off_thread = false;
+
+        ca_triggerer_run_place(&mut hooks, &mut state, &settings, CaTriggerRunnable::PlacerTick);
+        assert_eq!(hooks.cancels, vec!["place"]);
+        assert_eq!(hooks.ran, vec![CaTriggerRunnable::PlacerTick]);
+    }
+
+    #[test]
+    fn terminate_running_tasks_reenables_both_dispatches() {
+        let mut hooks = TriggerMock::default();
+        let mut state = CaTriggerState {
+            current_place_task_done: false,
+            current_destroy_task_done: false,
+        };
+
+        ca_triggerer_terminate_running_tasks(&mut state);
+        assert!(state.current_place_task_done);
+        assert!(state.current_destroy_task_done);
+
+        ca_triggerer_run_place(
+            &mut hooks,
+            &mut state,
+            &CaTriggerSettings::default(),
+            CaTriggerRunnable::PlacerTick,
+        );
+        ca_triggerer_run_destroy(
+            &mut hooks,
+            &mut state,
+            &CaTriggerSettings::default(),
+            CaTriggerRunnable::DestroyerTick,
+        );
+        assert_eq!(hooks.ran.len(), 2);
+    }
+
+    #[test]
+    fn can_cache_only_when_on_thread_and_non_tick_triggers_disabled() {
+        // off-thread default: never cache
+        assert!(!ca_triggerer_can_cache(&CaTriggerSettings::default()));
+
+        // on-thread, but the event triggers are enabled (only Tick allows caching)
+        let mut settings = CaTriggerSettings::default();
+        settings.off_thread = false;
+        assert!(!ca_triggerer_can_cache(&settings));
+
+        // all non-Tick triggers off: cache
+        settings.block_change = false;
+        settings.client_block_break = false;
+        settings.crystal_spawn = false;
+        settings.crystal_destroy = false;
+        settings.explode_sound = false;
+        settings.entity_move = false;
+        settings.self_move = false;
+        assert!(ca_triggerer_can_cache(&settings));
+
+        // SelfMove alone still blocks caching
+        settings.self_move = true;
+        assert!(!ca_triggerer_can_cache(&settings));
+    }
+
+    #[test]
+    fn tick_trigger_off_thread_dispatches_destroy_then_place() {
+        let mut hooks = TriggerMock::default();
+        let mut state = CaTriggerState::default();
+
+        ca_trigger_tick(&mut hooks, &mut state, &CaTriggerSettings::default());
+        assert_eq!(
+            hooks.ran,
+            vec![CaTriggerRunnable::DestroyerTick, CaTriggerRunnable::PlacerTick]
+        );
+        assert!(hooks.ticks.is_empty());
+    }
+
+    #[test]
+    fn tick_trigger_on_thread_runs_extra_destroy_without_idpredict() {
+        let mut hooks = TriggerMock::default();
+        let mut state = CaTriggerState::default();
+        let mut settings = CaTriggerSettings::default();
+        settings.off_thread = false;
+
+        ca_trigger_tick(&mut hooks, &mut state, &settings);
+        assert_eq!(hooks.ticks, vec!["destroy", "place", "destroy"]);
+
+        let mut hooks = TriggerMock::default();
+        hooks.idpredict = true;
+        ca_trigger_tick(&mut hooks, &mut state, &settings);
+        assert_eq!(hooks.ticks, vec!["destroy", "place"]);
+    }
+
+    #[test]
+    fn block_change_skips_non_air_and_out_of_range() {
+        let mut hooks = TriggerMock::default();
+        let mut state = CaTriggerState::default();
+        let settings = CaTriggerSettings::default();
+
+        // a non-air update never places
+        ca_trigger_block_change_notify(
+            &mut hooks,
+            &mut state,
+            &settings,
+            &CaBlockUpdatePacket {
+                pos: (0, 64, 0),
+                is_air: false,
+            },
+        );
+        assert!(hooks.ran.is_empty());
+
+        // air out of the placer/destroyer range: no placement
+        ca_trigger_block_change_notify(
+            &mut hooks,
+            &mut state,
+            &settings,
+            &CaBlockUpdatePacket {
+                pos: (100, 64, 100),
+                is_air: true,
+            },
+        );
+        assert!(hooks.ran.is_empty());
+
+        // air in range: place
+        ca_trigger_block_change_notify(
+            &mut hooks,
+            &mut state,
+            &settings,
+            &CaBlockUpdatePacket {
+                pos: (0, 64, 0),
+                is_air: true,
+            },
+        );
+        assert_eq!(hooks.ran, vec![CaTriggerRunnable::PlacerTick]);
+    }
+
+    #[test]
+    fn block_change_chunk_handler_runs_place_for_air_in_range() {
+        let mut hooks = TriggerMock::default();
+        let mut state = CaTriggerState::default();
+
+        ca_trigger_block_change_chunk_notify(
+            &mut hooks,
+            &mut state,
+            &CaTriggerSettings::default(),
+            &[
+                CaBlockUpdatePacket {
+                    pos: (0, 64, 0),
+                    is_air: false,
+                },
+                CaBlockUpdatePacket {
+                    pos: (1, 64, 0),
+                    is_air: true,
+                },
+            ],
+        );
+        assert_eq!(hooks.ran, vec![CaTriggerRunnable::PlacerTick]);
+    }
+
+    #[test]
+    fn client_block_break_gates_on_its_option() {
+        let mut hooks = TriggerMock::default();
+        let mut state = CaTriggerState::default();
+        let mut settings = CaTriggerSettings::default();
+        settings.client_block_break = false;
+
+        ca_trigger_client_block_break(&mut hooks, &mut state, &settings);
+        assert!(hooks.ran.is_empty());
+
+        settings.client_block_break = true;
+        ca_trigger_client_block_break(&mut hooks, &mut state, &settings);
+        assert_eq!(hooks.ran, vec![CaTriggerRunnable::PlacerTick]);
+    }
+
+    #[test]
+    fn crystal_destroy_listener_marks_and_post_runs_place() {
+        let mut hooks = TriggerMock::default();
+        add_crystal(&mut hooks.entities, 5, (2.0, 65.0, 0.0));
+        // an entity that is not a crystal
+        hooks.entities.insert(
+            6,
+            CaTrackedEntity {
+                is_end_crystal: false,
+                position: (2.0, 65.0, 0.0),
+            },
+        );
+        // a crystal out of range
+        add_crystal(&mut hooks.entities, 7, (100.0, 65.0, 100.0));
+        let mut settings = CaTriggerSettings::default();
+
+        let mut packet = CaRemoveEntitiesPacket {
+            entity_ids: vec![5, 6, 7],
+            contains_crystal: false,
+        };
+        ca_trigger_crystal_destroy_packet_listener(&mut hooks, &mut settings, &mut packet);
+        assert!(packet.contains_crystal);
+
+        let mut state = CaTriggerState::default();
+        ca_trigger_crystal_destroy_notify(&mut hooks, &mut state, &settings, &packet);
+        assert_eq!(hooks.ran, vec![CaTriggerRunnable::PlacerTick]);
+
+        // an unmarked packet never places
+        let mut hooks = TriggerMock::default();
+        let mut state = CaTriggerState::default();
+        ca_trigger_crystal_destroy_notify(
+            &mut hooks,
+            &mut state,
+            &settings,
+            &CaRemoveEntitiesPacket {
+                entity_ids: vec![9],
+                contains_crystal: false,
+            },
+        );
+        assert!(hooks.ran.is_empty());
+    }
+
+    #[test]
+    fn crystal_spawn_runs_destroy_and_place_with_set_dead() {
+        let mut hooks = TriggerMock::default();
+        add_crystal(&mut hooks.entities, 5, (2.0, 65.0, 0.0));
+        let mut state = CaTriggerState::default();
+        let settings = CaTriggerSettings::default();
+
+        // a non-crystal spawn does nothing
+        ca_trigger_crystal_spawn_notify(
+            &mut hooks,
+            &mut state,
+            &settings,
+            &CaAddEntityPacket {
+                id: 9,
+                type_is_end_crystal: false,
+            },
+        );
+        assert!(hooks.ran.is_empty());
+
+        // a crystal spawn destroys it and, with SetDead on, places
+        ca_trigger_crystal_spawn_notify(
+            &mut hooks,
+            &mut state,
+            &settings,
+            &CaAddEntityPacket {
+                id: 5,
+                type_is_end_crystal: true,
+            },
+        );
+        assert_eq!(
+            hooks.ran,
+            vec![
+                CaTriggerRunnable::CrystalSpawnDestroy { entity_id: 5 },
+                CaTriggerRunnable::PlacerTick
+            ]
+        );
+        assert_eq!(hooks.ticks, vec!["destroy"]);
+
+        // SetDead off: no placement
+        let mut hooks = TriggerMock::default();
+        add_crystal(&mut hooks.entities, 5, (2.0, 65.0, 0.0));
+        hooks.set_dead = false;
+        let mut state = CaTriggerState::default();
+        ca_trigger_crystal_spawn_notify(
+            &mut hooks,
+            &mut state,
+            &settings,
+            &CaAddEntityPacket {
+                id: 5,
+                type_is_end_crystal: true,
+            },
+        );
+        assert_eq!(
+            hooks.ran,
+            vec![CaTriggerRunnable::CrystalSpawnDestroy { entity_id: 5 }]
+        );
+
+        // the destroy runnable skips a non-crystal entity
+        let mut hooks = TriggerMock::default();
+        hooks.entities.insert(
+            5,
+            CaTrackedEntity {
+                is_end_crystal: false,
+                position: (2.0, 65.0, 0.0),
+            },
+        );
+        let mut state = CaTriggerState::default();
+        ca_triggerer_run_destroy(
+            &mut hooks,
+            &mut state,
+            &settings,
+            CaTriggerRunnable::CrystalSpawnDestroy { entity_id: 5 },
+        );
+        assert_eq!(hooks.ticks.len(), 0);
+    }
+
+    #[test]
+    fn entity_move_gates_on_tracker_range() {
+        let mut hooks = TriggerMock::default();
+        add_crystal(&mut hooks.entities, 5, (10.0, 65.0, 10.0));
+        let mut state = CaTriggerState::default();
+        let settings = CaTriggerSettings::default();
+
+        // out of the target tracker range: nothing runs
+        ca_trigger_entity_move_notify(
+            &mut hooks,
+            &mut state,
+            &settings,
+            &CaTeleportEntityPacket { id: 5 },
+        );
+        assert!(hooks.ran.is_empty());
+
+        // unknown entity: nothing runs
+        ca_trigger_entity_move_notify(
+            &mut hooks,
+            &mut state,
+            &settings,
+            &CaTeleportEntityPacket { id: 42 },
+        );
+        assert!(hooks.ran.is_empty());
+
+        // in range: destroy then place
+        add_crystal(&mut hooks.entities, 5, (3.0, 65.0, 0.0));
+        ca_trigger_entity_move_notify(
+            &mut hooks,
+            &mut state,
+            &settings,
+            &CaTeleportEntityPacket { id: 5 },
+        );
+        assert_eq!(
+            hooks.ran,
+            vec![CaTriggerRunnable::DestroyerTick, CaTriggerRunnable::PlacerTick]
+        );
+    }
+
+    #[test]
+    fn explode_sound_gates_on_sound_and_distance() {
+        let mut hooks = TriggerMock::default();
+        add_crystal(&mut hooks.entities, 5, (2.0, 65.0, 0.0));
+        add_crystal(&mut hooks.entities, 6, (50.0, 65.0, 0.0));
+        let mut state = CaTriggerState::default();
+        let settings = CaTriggerSettings::default();
+
+        // not an explosion sound: nothing runs
+        ca_trigger_explode_sound_notify(
+            &mut hooks,
+            &mut state,
+            &settings,
+            &CaSoundEntityPacket {
+                id: 5,
+                is_generic_explode: false,
+            },
+        );
+        assert!(hooks.ran.is_empty());
+
+        // explosion sound but the entity is too far away: nothing runs
+        ca_trigger_explode_sound_notify(
+            &mut hooks,
+            &mut state,
+            &settings,
+            &CaSoundEntityPacket {
+                id: 6,
+                is_generic_explode: true,
+            },
+        );
+        assert!(hooks.ran.is_empty());
+
+        // explosion sound for an entity we cannot see (unknown id): place runs
+        ca_trigger_explode_sound_notify(
+            &mut hooks,
+            &mut state,
+            &settings,
+            &CaSoundEntityPacket {
+                id: 42,
+                is_generic_explode: true,
+            },
+        );
+        assert_eq!(hooks.ran, vec![CaTriggerRunnable::PlacerTick]);
+
+        // explosion sound in range: place runs
+        let mut hooks = TriggerMock::default();
+        add_crystal(&mut hooks.entities, 5, (2.0, 65.0, 0.0));
+        let mut state = CaTriggerState::default();
+        ca_trigger_explode_sound_notify(
+            &mut hooks,
+            &mut state,
+            &settings,
+            &CaSoundEntityPacket {
+                id: 5,
+                is_generic_explode: true,
+            },
+        );
+        assert_eq!(hooks.ran, vec![CaTriggerRunnable::PlacerTick]);
+    }
+
+    #[test]
+    fn self_move_disabled_by_default_and_gates_on_packet_type() {
+        let mut hooks = TriggerMock::default();
+        let mut state = CaTriggerState::default();
+        let settings = CaTriggerSettings::default();
+
+        // default off
+        ca_trigger_self_move_packet_listener(&mut hooks, &mut state, &settings, true);
+        assert!(hooks.ran.is_empty());
+
+        // a non-move packet does nothing even when enabled
+        let mut settings = settings.clone();
+        settings.self_move = true;
+        ca_trigger_self_move_packet_listener(&mut hooks, &mut state, &settings, false);
+        assert!(hooks.ran.is_empty());
+
+        // enabled + move packet: mc.execute then destroy then place
+        ca_trigger_self_move_packet_listener(&mut hooks, &mut state, &settings, true);
+        assert_eq!(hooks.executed, 1);
+        assert_eq!(
+            hooks.ran,
+            vec![CaTriggerRunnable::DestroyerTick, CaTriggerRunnable::PlacerTick]
+        );
     }
 }

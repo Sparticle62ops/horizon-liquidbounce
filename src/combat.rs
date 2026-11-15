@@ -8820,3 +8820,364 @@ mod velocity_reversal_jump_tests {
         assert_eq!(state.limit_until_jump, 0);
     }
 }
+
+// ----- velocity/mode/VelocityLag.kt (GPL-3.0, (c) 2015-2026 CCBlueX) -----
+//
+// Lag mode. It delays some ticks of knockback. It is equals to "delay
+// velocity".
+
+pub fn velocity_lag() -> Module {
+    Module::new(
+        "Lag",
+        COMBAT,
+        vec![
+            // "ticks" suffix
+            int_range("LagTime", 5, 5, 1, 20),
+            boolean("JumpReset", false),
+            boolean("ConsiderExplosion", true),
+        ],
+    )
+}
+
+/// Upstream `VelocityLag.shouldLag`, `lagTicks` and `shouldJump`, plus the
+/// `waitTicks(2)` countdown that clears `shouldJump`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct VelocityLagState {
+    pub should_lag: bool,
+    pub lag_ticks: i64,
+    pub should_jump: bool,
+    /// `waitTicks(2)` bookkeeping: ticks left before `shouldJump` clears.
+    pub jump_wait_ticks: i64,
+}
+
+/// Upstream `VelocityLag.disable()`.
+pub fn velocity_lag_disable(state: &mut VelocityLagState) {
+    state.should_lag = false;
+    state.lag_ticks = 0;
+}
+
+/// Upstream `VelocityLag.packetHandler`, a `handler` on `PacketEvent`. The
+/// two booleans stand in for `packet.isLocalPlayerVelocity(considerExplosion)`
+/// (a `ClientboundSetEntityMotionPacket` on the local player, resp. a
+/// `ClientboundExplodePacket` with player knockback).
+pub fn velocity_lag_packet_handler(
+    module: &Module,
+    state: &mut VelocityLagState,
+    is_set_entity_motion_velocity: bool,
+    is_explode_player_knockback: bool,
+    lag_roll: f64,
+) {
+    let consider_explosion = tb_setting_bool(module, "ConsiderExplosion", true);
+    let is_local_velocity =
+        is_set_entity_motion_velocity || (is_explode_player_knockback && consider_explosion);
+    if !is_local_velocity {
+        return;
+    }
+
+    state.should_lag = true;
+    state.lag_ticks = velocity_jump_range_random(module, "LagTime", 5, 5, lag_roll);
+}
+
+/// What the blink queue handler did to a `BlinkPacketEvent`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum VelocityLagBlinkOutcome {
+    /// The event is untouched.
+    Untouched,
+    /// Upstream `event.action = Action.QUEUE`.
+    Queue,
+}
+
+/// Upstream `VelocityLag.queuePacketHandler`, a `handler` on
+/// `BlinkPacketEvent`.
+pub fn velocity_lag_blink_packet_handler(
+    state: &VelocityLagState,
+    origin_incoming: bool,
+    is_keep_alive: bool,
+) -> VelocityLagBlinkOutcome {
+    if !state.should_lag || !origin_incoming || is_keep_alive {
+        return VelocityLagBlinkOutcome::Untouched;
+    }
+
+    VelocityLagBlinkOutcome::Queue
+}
+
+/// Upstream `VelocityLag.tickHandler`, a `handler` on `GameTickEvent`.
+pub fn velocity_lag_tick_handler(state: &mut VelocityLagState) {
+    if state.should_lag {
+        state.lag_ticks -= 1;
+    }
+}
+
+/// What the tick-packet-process handler did.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum VelocityLagProcessOutcome {
+    /// The event is untouched.
+    Untouched,
+    /// Upstream the state reset, `BlinkManager.flush(TransferOrigin.INCOMING)`
+    /// ran, `shouldJump` armed and `waitTicks(2)` started.
+    Flushed,
+}
+
+/// Upstream `VelocityLag.tickPacketProcessHandler`, a `sequenceHandler` on
+/// `TickPacketProcessEvent`.
+pub fn velocity_lag_process_handler(state: &mut VelocityLagState) -> VelocityLagProcessOutcome {
+    if state.should_lag && state.lag_ticks == 0 {
+        state.should_lag = false;
+        state.lag_ticks = 0;
+        // BlinkManager.flush(TransferOrigin.INCOMING)
+        state.should_jump = true;
+        // waitTicks(2)
+        state.jump_wait_ticks = 2;
+        return VelocityLagProcessOutcome::Flushed;
+    }
+
+    VelocityLagProcessOutcome::Untouched
+}
+
+/// The tail of upstream `waitTicks(2)` in the tick-packet-process handler:
+/// one step per waited tick; on the last one `shouldJump = false`.
+pub fn velocity_lag_wait_ticks_step(state: &mut VelocityLagState) {
+    if state.jump_wait_ticks > 0 {
+        state.jump_wait_ticks -= 1;
+        if state.jump_wait_ticks == 0 {
+            state.should_jump = false;
+        }
+    }
+}
+
+/// Upstream `VelocityLag.movementInputHandler`, a `handler` on
+/// `MovementInputEvent`. Returns whether `event.jump` was set true.
+pub fn velocity_lag_input_handler(
+    module: &Module,
+    state: &mut VelocityLagState,
+    world: &dyn VelocityWorldExtended,
+) -> bool {
+    // To be able to alter velocity when receiving knockback, player must be
+    // sprinting.
+    if tb_setting_bool(module, "JumpReset", false)
+        && state.should_jump
+        && world.player_on_ground()
+        && world.is_sprinting()
+    {
+        if world.is_current_fall_damage() {
+            state.should_jump = false;
+            return false;
+        }
+
+        // event.jump = true
+        state.should_jump = false;
+        return true;
+    }
+
+    false
+}
+
+#[cfg(test)]
+mod velocity_lag_tests {
+    use super::*;
+
+    struct MockLagWorld {
+        on_ground: bool,
+        sprinting: bool,
+        fall_damage: bool,
+    }
+
+    impl Default for MockLagWorld {
+        fn default() -> Self {
+            MockLagWorld {
+                on_ground: true,
+                sprinting: true,
+                fall_damage: false,
+            }
+        }
+    }
+
+    impl VelocityWorld for MockLagWorld {
+        fn player_id(&self) -> i64 {
+            42
+        }
+        fn player_on_ground(&self) -> bool {
+            self.on_ground
+        }
+        fn any_horizontal_input(&self) -> bool {
+            true
+        }
+        fn delta_movement(&self) -> Vec3 {
+            Vec3 { x: 0.4, y: -0.078, z: 0.3 }
+        }
+        fn horizontal_speed(&self) -> f64 {
+            0.5
+        }
+        fn input_is_moving(&self) -> bool {
+            true
+        }
+        fn movement_yaw(&self) -> f32 {
+            90.0
+        }
+        fn find_enemy(&self, _max_range: f64) -> Option<Vec3> {
+            None
+        }
+        fn is_looking_at_entity(
+            &self,
+            _target: Vec3,
+            _range: f64,
+            _rotation: (f32, f32),
+        ) -> Option<()> {
+            None
+        }
+        fn current_rotation(&self) -> Option<(f32, f32)> {
+            None
+        }
+        fn player_rotation(&self) -> (f32, f32) {
+            (10.0, 0.0)
+        }
+    }
+
+    impl VelocityWorldExtended for MockLagWorld {
+        fn hurt_time(&self) -> i64 {
+            0
+        }
+        fn is_sprinting(&self) -> bool {
+            self.sprinting
+        }
+        fn is_current_fall_damage(&self) -> bool {
+            self.fall_damage
+        }
+    }
+
+    #[test]
+    fn velocity_lag_arms_on_a_local_velocity_packet() {
+        let module = velocity_lag();
+        let mut state = VelocityLagState::default();
+
+        // Non-velocity packets never arm it
+        velocity_lag_packet_handler(&module, &mut state, false, false, 0.5);
+        assert!(!state.should_lag);
+
+        // SetEntityMotion arms it regardless of ConsiderExplosion
+        velocity_lag_packet_handler(&module, &mut state, true, false, 0.5);
+        assert!(state.should_lag);
+        assert_eq!(state.lag_ticks, 5); // LagTime 5..5
+
+        // An explode packet arms it only with ConsiderExplosion
+        state.should_lag = false;
+        velocity_lag_packet_handler(&module, &mut state, false, true, 0.5);
+        assert!(state.should_lag);
+        state.should_lag = false;
+        let mut module = velocity_lag();
+        module.setting_mut("ConsiderExplosion").unwrap().kind = ValueKind::Bool(false);
+        velocity_lag_packet_handler(&module, &mut state, false, true, 0.5);
+        assert!(!state.should_lag);
+    }
+
+    #[test]
+    fn velocity_lag_queues_incoming_packets_but_not_keepalives() {
+        let module = velocity_lag();
+        let mut state = VelocityLagState::default();
+
+        // Not lagging: untouched
+        assert_eq!(
+            velocity_lag_blink_packet_handler(&state, true, false),
+            VelocityLagBlinkOutcome::Untouched
+        );
+
+        // Lagging incoming non-keepalive: queue
+        state.should_lag = true;
+        assert_eq!(
+            velocity_lag_blink_packet_handler(&state, true, false),
+            VelocityLagBlinkOutcome::Queue
+        );
+
+        // Outgoing or keepalive: untouched
+        assert_eq!(
+            velocity_lag_blink_packet_handler(&state, false, false),
+            VelocityLagBlinkOutcome::Untouched
+        );
+        assert_eq!(
+            velocity_lag_blink_packet_handler(&state, true, true),
+            VelocityLagBlinkOutcome::Untouched
+        );
+    }
+
+    #[test]
+    fn velocity_lag_flushes_when_the_lag_ticks_run_out() {
+        let module = velocity_lag();
+        let mut state = VelocityLagState {
+            should_lag: true,
+            lag_ticks: 2,
+            should_jump: false,
+            jump_wait_ticks: 0,
+        };
+
+        // Each game tick counts down while lagging
+        velocity_lag_tick_handler(&mut state);
+        velocity_lag_tick_handler(&mut state);
+        assert_eq!(state.lag_ticks, 0);
+
+        // At zero: state reset, flush, shouldJump armed, waitTicks(2) starts
+        assert_eq!(
+            velocity_lag_process_handler(&mut state),
+            VelocityLagProcessOutcome::Flushed
+        );
+        assert!(!state.should_lag);
+        assert_eq!(state.lag_ticks, 0);
+        assert!(state.should_jump);
+        assert_eq!(state.jump_wait_ticks, 2);
+
+        // Two waited ticks later shouldJump clears
+        velocity_lag_wait_ticks_step(&mut state);
+        assert!(state.should_jump);
+        velocity_lag_wait_ticks_step(&mut state);
+        assert!(!state.should_jump);
+
+        // Already-processed state stays untouched
+        assert_eq!(
+            velocity_lag_process_handler(&mut state),
+            VelocityLagProcessOutcome::Untouched
+        );
+
+        // disable() resets the lag state
+        state.should_lag = true;
+        state.lag_ticks = 7;
+        velocity_lag_disable(&mut state);
+        assert!(!state.should_lag);
+        assert_eq!(state.lag_ticks, 0);
+    }
+
+    #[test]
+    fn velocity_lag_input_handler_jumps_on_the_ground_while_sprinting() {
+        let mut module = velocity_lag();
+        module.setting_mut("JumpReset").unwrap().kind = ValueKind::Bool(true);
+        let mut world = MockLagWorld::default();
+        let mut state = VelocityLagState::default();
+        state.should_jump = true;
+
+        // On ground, sprinting: jump set and shouldJump cleared
+        assert!(velocity_lag_input_handler(&module, &mut state, &world));
+        assert!(!state.should_jump);
+
+        // JumpReset off: no jump
+        state.should_jump = true;
+        module.setting_mut("JumpReset").unwrap().kind = ValueKind::Bool(false);
+        assert!(!velocity_lag_input_handler(&module, &mut state, &world));
+        assert!(state.should_jump);
+
+        // In the air: no jump
+        module.setting_mut("JumpReset").unwrap().kind = ValueKind::Bool(true);
+        world.on_ground = false;
+        assert!(!velocity_lag_input_handler(&module, &mut state, &world));
+        assert!(state.should_jump);
+
+        // Not sprinting: no jump
+        world.on_ground = true;
+        world.sprinting = false;
+        assert!(!velocity_lag_input_handler(&module, &mut state, &world));
+        assert!(state.should_jump);
+
+        // Current fall damage: no jump and shouldJump cleared
+        world.sprinting = true;
+        world.fall_damage = true;
+        assert!(!velocity_lag_input_handler(&module, &mut state, &world));
+        assert!(!state.should_jump);
+    }
+}

@@ -19900,17 +19900,17 @@ fn ka_raycast(module: &Module) -> KaRaycast {
 
 /// Upstream `KillAuraRotationsValueGroup.KillAuraRotationTiming`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum KaRotationTiming {
+pub enum RotationTiming {
     Normal,
     Snap,
     OnTick,
 }
 
-fn ka_rotation_timing(module: &Module) -> KaRotationTiming {
+fn ka_rotation_timing(module: &Module) -> RotationTiming {
     match module.setting("RotationTiming").map(|v| &v.kind) {
-        Some(ValueKind::Choice(sel, _)) if sel == "Snap" => KaRotationTiming::Snap,
-        Some(ValueKind::Choice(sel, _)) if sel == "OnTick" => KaRotationTiming::OnTick,
-        _ => KaRotationTiming::Normal,
+        Some(ValueKind::Choice(sel, _)) if sel == "Snap" => RotationTiming::Snap,
+        Some(ValueKind::Choice(sel, _)) if sel == "OnTick" => RotationTiming::OnTick,
+        _ => RotationTiming::Normal,
     }
 }
 
@@ -20390,7 +20390,7 @@ pub fn ka_tick_handler(module: &Module, hooks: &mut dyn KaHooks, state: &mut KaS
 
     let ir = ka_interaction_range(module, hooks);
     let twr = ka_through_walls_range(module);
-    let found = if ka_rotation_timing(module) == KaRotationTiming::OnTick {
+    let found = if ka_rotation_timing(module) == RotationTiming::OnTick {
         ka_find_rotation(module, hooks, state, target, ir, twr).map(|(rotation, _)| rotation)
     } else {
         None
@@ -20532,7 +20532,7 @@ fn ka_process_target(module: &Module, hooks: &mut dyn KaHooks, state: &mut KaSta
     match ka_rotation_timing(module) {
         // If our click scheduler is not going to click the moment we reach the target,
         // we should not start aiming towards the target just yet.
-        KaRotationTiming::Snap => {
+        RotationTiming::Snap => {
             if !hooks.ka_will_click_at(ticks.max(1)) {
                 return true;
             }
@@ -20540,13 +20540,13 @@ fn ka_process_target(module: &Module, hooks: &mut dyn KaHooks, state: &mut KaSta
         // [ON_TICK] will always instantly aim onto the target on attack, however, if
         // our rotation is unable to be ready in time, we can at least start aiming
         // towards the target.
-        KaRotationTiming::OnTick => {
+        RotationTiming::OnTick => {
             if ticks <= 1 {
                 return true;
             }
         }
         // Continue with regular aiming
-        KaRotationTiming::Normal => {}
+        RotationTiming::Normal => {}
     }
 
     hooks.ka_set_rotation_target(rotation, Some(entity), !setting_bool(module, "IgnoreOpenInventory", true));
@@ -20643,7 +20643,7 @@ fn ka_prepare_for_attack(module: &Module, hooks: &mut dyn KaHooks, state: &mut K
     }
 
     // 3. Rotate to target (if we have on-tick enabled)
-    if ka_rotation_timing(module) == KaRotationTiming::OnTick {
+    if ka_rotation_timing(module) == RotationTiming::OnTick {
         if let Some((yaw, pitch)) = rotation {
             hooks.ka_send_pos_rot(yaw, pitch, None);
         }
@@ -20656,7 +20656,7 @@ fn ka_prepare_for_attack(module: &Module, hooks: &mut dyn KaHooks, state: &mut K
 /// again, reopen the inventory.
 fn ka_finish_attack(module: &Module, hooks: &mut dyn KaHooks, rotation: Option<(f32, f32)>, was_sim_inv: bool) {
     // 1. Rotate back
-    if ka_rotation_timing(module) == KaRotationTiming::OnTick {
+    if ka_rotation_timing(module) == RotationTiming::OnTick {
         if let Some((yaw, pitch)) = rotation {
             hooks.ka_send_pos_rot(yaw, pitch, Some(yaw));
         }
@@ -21776,5 +21776,665 @@ mod crystal_aura_tests {
             ValueKind::Bool(v) => assert!(!v),
             other => panic!("IDPredict = {:?}", other),
         }
+    }
+}
+
+// ----- DamageProvider.kt -----
+
+/// Upstream `DamageProvider` — damage comparisons used by the crystal aura.
+/// The `else` branches in `isSmallerThanOrEqual(other)` compare the provider's
+/// own fixed value against itself, mirroring upstream code as written.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DamageProvider {
+    /// `NormalDamageProvider`
+    Normal { damage: f32 },
+    /// `OrBiDamageProvider`
+    Or { damage: f32, damage1: f32 },
+    /// `AndBiDamageProvider`
+    And { damage: f32, damage1: f32 },
+}
+
+impl DamageProvider {
+    pub fn is_smaller_than(&self, float: f32) -> bool {
+        match *self {
+            DamageProvider::Normal { damage } => damage < float,
+            DamageProvider::Or { damage, damage1 } => damage < float || damage1 < float,
+            DamageProvider::And { damage, damage1 } => damage < float && damage1 < float,
+        }
+    }
+
+    pub fn is_smaller_than_or_equal(&self, float: f32) -> bool {
+        match *self {
+            DamageProvider::Normal { damage } => damage <= float,
+            DamageProvider::Or { damage, damage1 } => damage <= float || damage1 <= float,
+            DamageProvider::And { damage, damage1 } => damage <= float && damage1 <= float,
+        }
+    }
+
+    pub fn is_smaller_than_or_equal_other(&self, other: &DamageProvider) -> bool {
+        // upstream `when (other)`: Normal compares against the other's damage,
+        // Bi providers delegate to other.isGreaterThan on the own fields, and
+        // the (unreachable) else branch compares own fixed against itself.
+        match other {
+            DamageProvider::Normal { damage } => self.is_smaller_than_or_equal(*damage),
+            _ => match *self {
+                DamageProvider::Normal { damage } => other.is_greater_than(damage),
+                DamageProvider::Or { damage, damage1 } => {
+                    other.is_greater_than(damage) || other.is_greater_than(damage1)
+                }
+                DamageProvider::And { damage, damage1 } => {
+                    other.is_greater_than(damage) && other.is_greater_than(damage1)
+                }
+            },
+        }
+    }
+
+    pub fn is_greater_than(&self, float: f32) -> bool {
+        match *self {
+            DamageProvider::Normal { damage } => damage > float,
+            DamageProvider::Or { damage, damage1 } => damage > float || damage1 > float,
+            DamageProvider::And { damage, damage1 } => damage > float && damage1 > float,
+        }
+    }
+
+    /// Any because it's used for death prevention.
+    pub fn is_any_greater_than_or_equal(&self, float: f32) -> bool {
+        match *self {
+            DamageProvider::Normal { damage } => damage >= float,
+            DamageProvider::Or { damage, damage1 } => damage >= float || damage1 >= float,
+            DamageProvider::And { damage, damage1 } => damage >= float || damage1 >= float,
+        }
+    }
+
+    /// Returns the most important damage value that should also be used for
+    /// comparison. `BiDamageProvider`: the possible predicted value is more
+    /// important.
+    pub fn get_fixed(&self) -> f32 {
+        match *self {
+            DamageProvider::Normal { damage } => damage,
+            DamageProvider::Or { damage1, .. } => damage1,
+            DamageProvider::And { damage1, .. } => damage1,
+        }
+    }
+}
+
+// ----- SubmoduleCrystalDestroyer.kt + CrystalAuraDestroyTargetFactory.kt -----
+
+/// Upstream `SwingMode.DO_NOT_HIDE.serverSwing` and the flattened Destroy
+/// settings of `SubmoduleCrystalDestroyer`.
+#[derive(Clone, Copy, Debug)]
+pub struct CrystalDestroyerSettings {
+    pub enabled: bool,
+    /// `Delay` 0 0..1000 (ms)
+    pub delay_ms: i64,
+    /// `Range` 4.5 1..6
+    pub range: f32,
+    /// `WallsRange` 4.5 0..6
+    pub walls_range: f32,
+    /// `PrioritizeVisibleFaces` false
+    pub prioritize_visible_faces: bool,
+    /// `SwingMode.DO_NOT_HIDE.serverSwing`
+    pub swing_server_swing: bool,
+}
+
+impl Default for CrystalDestroyerSettings {
+    fn default() -> Self {
+        CrystalDestroyerSettings {
+            enabled: true,
+            delay_ms: 0,
+            range: 4.5,
+            walls_range: 4.5,
+            prioritize_visible_faces: false,
+            swing_server_swing: false,
+        }
+    }
+}
+
+/// Upstream `FULL_BOX` (a full block AABB), with `move(below())` applied by
+/// the caller.
+pub const FULL_BOX: (f64, f64, f64, f64, f64, f64) = (0.0, 0.0, 0.0, 1.0, 1.0, 1.0);
+
+/// A world entity handle (an `EndCrystal` upstream).
+pub type CrystalEntityId = u32;
+
+/// The engine surfaces `SubmoduleCrystalDestroyer` and
+/// `CrystalAuraDestroyTargetFactory` read: the player, the world, the
+/// rotation mode, the damage options, and the post attack handlers.
+pub trait CaDestroyHooks {
+    /// `player.eyePosition` (x, y, z).
+    fn ca_eye_position(&self) -> (f64, f64, f64);
+
+    /// `CrystalAuraDamageOptions.approximateExplosionDamage(pos, DESTROY)` —
+    /// `FloatFloatPair?`.
+    fn ca_approximate_explosion_damage(&mut self, pos: (f64, f64, f64)) -> Option<(f32, f32)>;
+
+    /// `world.getEntitiesBoxInRange(eye, range) { it is EndCrystal &&
+    /// it.isWithinWorldBorder && !cannotSeeEntity(it) }`.
+    fn ca_entities_in_range(&self, eye: (f64, f64, f64), range: f64) -> Vec<CrystalEntityId>;
+
+    /// `entity.isWithinWorldBorder`.
+    fn ca_is_within_world_border(&self, entity: CrystalEntityId) -> bool;
+
+    /// `entity.squaredBoxedDistanceTo(eye)`.
+    fn ca_squared_boxed_distance(&self, entity: CrystalEntityId, eye: (f64, f64, f64)) -> f64;
+
+    /// `entity.boundingBox` (min/max extents).
+    fn ca_bounding_box(&self, entity: CrystalEntityId) -> (f64, f64, f64, f64, f64, f64);
+
+    /// `entity.blockPosition().below()`.
+    fn ca_block_position_below(&self, entity: CrystalEntityId) -> (f64, f64, f64);
+
+    /// `entity.position()`.
+    fn ca_position(&self, entity: CrystalEntityId) -> (f64, f64, f64);
+
+    /// `cannotSeeEntity(entity)`: `!canSeeBox(eye, box, range, wallsRange)`.
+    fn ca_cannot_see_entity(&self, entity: CrystalEntityId, range: f32, walls_range: f32) -> bool;
+
+    /// `raytraceBox(eye, box, range, wallsRange, futureTarget, prioritizeVisible)`.
+    fn ca_raytrace_box(
+        &mut self,
+        eye: (f64, f64, f64),
+        entity: CrystalEntityId,
+        range: f64,
+        walls_range: f64,
+        future_target: (f64, f64, f64, f64, f64, f64),
+        prioritize_visible: bool,
+    ) -> Option<(Rotation, (f64, f64, f64))>;
+
+    /// `isLookingAtEntity(target, serverRotation, range, wallsRange) != null`.
+    fn ca_is_looking_at_entity(
+        &self,
+        entity: CrystalEntityId,
+        server_rotation: Rotation,
+        range: f64,
+        walls_range: f64,
+    ) -> bool;
+
+    /// `RotationManager.serverRotation`.
+    fn ca_server_rotation(&self) -> Rotation;
+
+    /// `ModuleCrystalAura.rotationMode.activeMode.rotate(rotation, isFinished,
+    /// onFinished)`. Returns whether `onFinished` ran.
+    fn ca_rotate(&mut self, rotation: Rotation, is_finished: bool) -> bool;
+
+    /// `attackEntity(target, swingMode)`.
+    fn ca_attack_entity(&mut self, entity: CrystalEntityId);
+
+    /// `postAttackHandlers.forEach { it.attacked(target.id) }`.
+    fn ca_post_attack(&mut self, handler: &str, entity: CrystalEntityId);
+
+    /// `ModuleCrystalAura.debugGeometry("predictedBlock") { DebuggedBox(base,
+    /// Color4b.GREEN.fade(0.4f)) }`.
+    fn ca_debug_geometry(&mut self, name: &str, base: (f64, f64, f64, f64, f64, f64));
+
+    /// `base.isHitByLine(eyePos, vec3d)`.
+    fn ca_base_is_hit_by_line(
+        &self,
+        base: (f64, f64, f64, f64, f64, f64),
+        eye: (f64, f64, f64),
+        vec3d: (f64, f64, f64),
+    ) -> bool;
+
+    /// `mc.execute(action)` (queued on the main thread).
+    fn ca_execute_deferred(&mut self);
+}
+
+/// Destroyer + factory state: the `Chronometer` and the default
+/// `postAttackHandlers = [CrystalAuraSpeedDebugger,
+/// SubmoduleSetDead.CrystalTracker]`, plus `currentTarget`.
+#[derive(Debug, Default)]
+pub struct CrystalDestroyerState {
+    pub chronometer: Chronometer,
+    pub post_attack_handlers: Vec<&'static str>,
+    /// `CrystalAuraDestroyTargetFactory.currentTarget`
+    pub current_target: Option<CrystalEntityId>,
+}
+
+impl CrystalDestroyerState {
+    pub fn new() -> Self {
+        CrystalDestroyerState {
+            chronometer: Chronometer::default(),
+            post_attack_handlers: vec!["CrystalAuraSpeedDebugger", "SubmoduleSetDead.CrystalTracker"],
+            current_target: None,
+        }
+    }
+}
+
+/// Upstream `getMaxRange() = max(range, wallsRange)`.
+pub fn crystal_destroyer_max_range(settings: &CrystalDestroyerSettings) -> f32 {
+    settings.range.max(settings.walls_range)
+}
+
+/// Upstream `SubmoduleCrystalDestroyer.tick(providedCrystal)`.
+pub fn ca_destroyer_tick(
+    hooks: &mut dyn CaDestroyHooks,
+    state: &mut CrystalDestroyerState,
+    settings: &CrystalDestroyerSettings,
+    provided_crystal: Option<CrystalEntityId>,
+    now_ms: u64,
+) {
+    if !settings.enabled || !state.chronometer.has_at_least_elapsed(settings.delay_ms as u64, now_ms) {
+        return;
+    }
+
+    // update the target / validate the provided crystal
+    match provided_crystal {
+        // just check if it works, not if it's the best
+        Some(crystal) => ca_destroy_validate_and_update_target(hooks, state, settings, crystal),
+        None => ca_destroy_update_target(hooks, state, settings),
+    }
+
+    let target = match state.current_target {
+        Some(target) => target,
+        None => return,
+    };
+
+    let base = ca_move_below(FULL_BOX, hooks.ca_block_position_below(target));
+    hooks.ca_debug_geometry("predictedBlock", base);
+
+    let eye_pos = hooks.ca_eye_position();
+
+    // find the best spot (and skip if no spot was found)
+    let (rotation, vec3d) = match hooks.ca_raytrace_box(
+        eye_pos,
+        target,
+        settings.range as f64,
+        settings.walls_range as f64,
+        base,
+        settings.prioritize_visible_faces,
+    ) {
+        Some(found) => found,
+        None => return,
+    };
+
+    ca_destroy_queue_destroy(hooks, state, settings, rotation, target, base, eye_pos, vec3d, now_ms);
+}
+
+/// Upstream `SubmoduleCrystalDestroyer.queueDestroy`.
+#[allow(clippy::too_many_arguments)]
+pub fn ca_destroy_queue_destroy(
+    hooks: &mut dyn CaDestroyHooks,
+    state: &mut CrystalDestroyerState,
+    settings: &CrystalDestroyerSettings,
+    rotation: Rotation,
+    target: CrystalEntityId,
+    base: (f64, f64, f64, f64, f64, f64),
+    eye_pos: (f64, f64, f64),
+    vec3d: (f64, f64, f64),
+    now_ms: u64,
+) {
+    // create the action chain to execute
+    let action = |hooks: &mut dyn CaDestroyHooks, state: &mut CrystalDestroyerState| {
+        let is_finished = hooks.ca_is_looking_at_entity(
+            target,
+            hooks.ca_server_rotation(),
+            settings.range as f64,
+            settings.walls_range as f64,
+        );
+        if !hooks.ca_rotate(rotation, is_finished) {
+            return;
+        }
+
+        if !state.chronometer.has_at_least_elapsed(settings.delay_ms as u64, now_ms) {
+            return;
+        }
+
+        let target1 = match state.current_target {
+            Some(t) => t,
+            None => return,
+        };
+
+        hooks.ca_attack_entity(target1);
+        for handler in &state.post_attack_handlers {
+            hooks.ca_post_attack(handler, target1);
+        }
+        state.chronometer.reset(now_ms);
+    };
+
+    // fixes swinging off thread as other packets might interrupt
+    if settings.swing_server_swing && !hooks.ca_base_is_hit_by_line(base, eye_pos, vec3d) {
+        hooks.ca_execute_deferred();
+    } else {
+        action(hooks, state);
+    }
+}
+
+/// Upstream `CrystalAuraDestroyTargetFactory.updateTarget` — finds the best
+/// target in range and updates the current target.
+pub fn ca_destroy_update_target(
+    hooks: &mut dyn CaDestroyHooks,
+    state: &mut CrystalDestroyerState,
+    settings: &CrystalDestroyerSettings,
+) {
+    let eye = hooks.ca_eye_position();
+    let mut entries: Vec<(CrystalEntityId, f32, f32)> = Vec::new();
+
+    for entity in hooks.ca_entities_in_range(eye, crystal_destroyer_max_range(settings) as f64) {
+        if let Some(damage) =
+            hooks.ca_approximate_explosion_damage(hooks.ca_position(entity))
+        {
+            entries.push((entity, damage.0, damage.1));
+        }
+    }
+
+    // `maxOrNull()` on `ComparisonListEntry`: coarse sorting on enemy damage,
+    // fine sorting on the smaller self damage. Kotlin keeps the first maximum,
+    // so a later entry only replaces the current one when strictly better.
+    let mut best: Option<(CrystalEntityId, f32, f32)> = None;
+    for entry in entries {
+        best = match best {
+            None => Some(entry),
+            Some(current) => {
+                let order = entry
+                    .2
+                    .partial_cmp(&current.2)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(current.1.partial_cmp(&entry.1).unwrap_or(std::cmp::Ordering::Equal));
+                if order == std::cmp::Ordering::Greater {
+                    Some(entry)
+                } else {
+                    Some(current)
+                }
+            }
+        };
+    }
+    state.current_target = best.map(|(entity, _, _)| entity);
+}
+
+/// Upstream `CrystalAuraDestroyTargetFactory.validateAndUpdateTarget` — only
+/// checks if the given crystal is valid, and updates the current target.
+pub fn ca_destroy_validate_and_update_target(
+    hooks: &mut dyn CaDestroyHooks,
+    state: &mut CrystalDestroyerState,
+    settings: &CrystalDestroyerSettings,
+    crystal: CrystalEntityId,
+) {
+    let box_ = hooks.ca_bounding_box(crystal);
+    let max_range = crystal_destroyer_max_range(settings) as f64 + box_.3 - box_.0;
+    state.current_target = None;
+
+    if !hooks.ca_is_within_world_border(crystal) {
+        return;
+    }
+
+    let eye = hooks.ca_eye_position();
+    if hooks.ca_squared_boxed_distance(crystal, eye) > max_range * max_range {
+        return;
+    }
+
+    if hooks.ca_cannot_see_entity(crystal, settings.range, settings.walls_range) {
+        return;
+    }
+
+    if hooks.ca_approximate_explosion_damage(hooks.ca_position(crystal)).is_none() {
+        return;
+    }
+
+    state.current_target = Some(crystal);
+}
+
+/// Upstream `FULL_BOX.move(below)`.
+fn ca_move_below(
+    full: (f64, f64, f64, f64, f64, f64),
+    below: (f64, f64, f64),
+) -> (f64, f64, f64, f64, f64, f64) {
+    (
+        full.0 + below.0,
+        full.1 + below.1,
+        full.2 + below.2,
+        full.3 + below.0,
+        full.4 + below.1,
+        full.5 + below.2,
+    )
+}
+
+#[cfg(test)]
+mod crystal_destroy_tests {
+    use super::*;
+
+    #[test]
+    fn damage_provider_normal_matches_upstream() {
+        let normal = DamageProvider::Normal { damage: 5.0 };
+        assert!(normal.is_smaller_than(6.0));
+        assert!(!normal.is_smaller_than(5.0));
+        assert!(normal.is_smaller_than_or_equal(5.0));
+        assert!(normal.is_greater_than(4.0));
+        assert!(normal.is_any_greater_than_or_equal(5.0));
+        assert!(!normal.is_any_greater_than_or_equal(5.5));
+        assert_eq!(normal.get_fixed(), 5.0);
+    }
+
+    #[test]
+    fn damage_provider_or_and_match_upstream() {
+        let or = DamageProvider::Or { damage: 3.0, damage1: 8.0 };
+        assert!(or.is_smaller_than(4.0)); // damage1 < 4
+        assert!(!or.is_smaller_than(2.0));
+        assert!(or.is_greater_than(7.0)); // damage1 > 7
+        assert!(or.is_any_greater_than_or_equal(8.0));
+        assert_eq!(or.get_fixed(), 8.0); // predicted value is more important
+
+        let and = DamageProvider::And { damage: 3.0, damage1: 8.0 };
+        assert!(and.is_smaller_than(9.0)); // both < 9
+        assert!(!and.is_smaller_than(5.0)); // damage1 >= 5
+        assert!(!and.is_greater_than(5.0)); // damage <= 5
+        assert!(and.is_any_greater_than_or_equal(8.0)); // damage1 >= 8 (upstream uses || here too)
+        assert_eq!(and.get_fixed(), 8.0);
+    }
+
+    #[test]
+    fn damage_provider_cross_comparisons() {
+        let normal = DamageProvider::Normal { damage: 5.0 };
+        let or = DamageProvider::Or { damage: 3.0, damage1: 8.0 };
+        let and = DamageProvider::And { damage: 3.0, damage1: 8.0 };
+
+        // Normal vs Or: other.isGreaterThan(damage) -> 3 > 5 || 8 > 5
+        assert!(normal.is_smaller_than_or_equal_other(&or));
+        // Normal vs And: AndBi.isGreaterThan(damage) -> 3 > 5 && 8 > 5 -> false
+        assert!(!normal.is_smaller_than_or_equal_other(&and));
+        // Or vs Normal: isSmallerThanOrEqual(other.damage) via own damage fields
+        assert!(or.is_smaller_than_or_equal_other(&normal));
+        // And vs Normal: both damage fields <= 5 -> 8 fails
+        assert!(!and.is_smaller_than_or_equal_other(&normal));
+    }
+
+    struct DestroyMock {
+        eye: (f64, f64, f64),
+        ca_squared_boxed_distance_mock: f64,
+        crystals: Vec<CrystalEntityId>,
+        border: bool,
+        damage: Option<(f32, f32)>,
+        raytrace: Option<(Rotation, (f64, f64, f64))>,
+        can_see: bool,
+        looking_at: bool,
+        rotate_fires: bool,
+        server_swing_line_hit: bool,
+        deferred: u32,
+        attacked: Vec<CrystalEntityId>,
+        post_attacks: Vec<(String, CrystalEntityId)>,
+        debug_geoms: u32,
+        rotations: u32,
+    }
+
+    impl Default for DestroyMock {
+        fn default() -> Self {
+            DestroyMock {
+                eye: (0.0, 64.0, 0.0),
+                ca_squared_boxed_distance_mock: 10.0,
+                crystals: vec![7],
+                border: true,
+                damage: Some((2.0, 12.0)),
+                raytrace: Some((Rotation { yaw: 30.0, pitch: 10.0 }, (1.0, 2.0, 3.0))),
+                can_see: true,
+                looking_at: true,
+                rotate_fires: true,
+                server_swing_line_hit: false,
+                deferred: 0,
+                attacked: Vec::new(),
+                post_attacks: Vec::new(),
+                debug_geoms: 0,
+                rotations: 0,
+            }
+        }
+    }
+
+    impl CaDestroyHooks for DestroyMock {
+        fn ca_eye_position(&self) -> (f64, f64, f64) { self.eye }
+        fn ca_approximate_explosion_damage(&mut self, _pos: (f64, f64, f64)) -> Option<(f32, f32)> { self.damage }
+        fn ca_entities_in_range(&self, _eye: (f64, f64, f64), _range: f64) -> Vec<CrystalEntityId> { self.crystals.clone() }
+        fn ca_is_within_world_border(&self, _entity: CrystalEntityId) -> bool { self.border }
+        fn ca_squared_boxed_distance(&self, _entity: CrystalEntityId, _eye: (f64, f64, f64)) -> f64 { self.ca_squared_boxed_distance_mock }
+        fn ca_bounding_box(&self, _entity: CrystalEntityId) -> (f64, f64, f64, f64, f64, f64) { (0.0, 0.0, 0.0, 0.5, 1.0, 0.5) }
+        fn ca_block_position_below(&self, _entity: CrystalEntityId) -> (f64, f64, f64) { (5.0, 63.0, 5.0) }
+        fn ca_position(&self, _entity: CrystalEntityId) -> (f64, f64, f64) { (5.5, 64.5, 5.5) }
+        fn ca_cannot_see_entity(&self, _entity: CrystalEntityId, _range: f32, _walls_range: f32) -> bool { !self.can_see }
+        fn ca_raytrace_box(&mut self, _eye: (f64, f64, f64), _entity: CrystalEntityId, _range: f64, _walls_range: f64, _future_target: (f64, f64, f64, f64, f64, f64), _prioritize_visible: bool) -> Option<(Rotation, (f64, f64, f64))> { self.raytrace }
+        fn ca_is_looking_at_entity(&self, _entity: CrystalEntityId, _server_rotation: Rotation, _range: f64, _walls_range: f64) -> bool { self.looking_at }
+        fn ca_server_rotation(&self) -> Rotation { Rotation { yaw: 0.0, pitch: 0.0 } }
+        fn ca_rotate(&mut self, _rotation: Rotation, _is_finished: bool) -> bool { self.rotations += 1; self.rotate_fires }
+        fn ca_attack_entity(&mut self, entity: CrystalEntityId) { self.attacked.push(entity); }
+        fn ca_post_attack(&mut self, handler: &str, entity: CrystalEntityId) { self.post_attacks.push((handler.to_string(), entity)); }
+        fn ca_debug_geometry(&mut self, _name: &str, _base: (f64, f64, f64, f64, f64, f64)) { self.debug_geoms += 1; }
+        fn ca_base_is_hit_by_line(&self, _base: (f64, f64, f64, f64, f64, f64), _eye: (f64, f64, f64), _vec: (f64, f64, f64)) -> bool { self.server_swing_line_hit }
+        fn ca_execute_deferred(&mut self) { self.deferred += 1; }
+    }
+
+    #[test]
+    fn tick_gates_on_enabled_and_delay() {
+        let mut hooks = DestroyMock::default();
+        let mut state = CrystalDestroyerState::new();
+        let mut settings = CrystalDestroyerSettings::default();
+
+        ca_destroyer_tick(&mut hooks, &mut state, &settings, None, 1000);
+        assert_eq!(state.current_target, Some(7)); // picks the best target
+
+        // disabled -> nothing
+        settings.enabled = false;
+        state.current_target = None;
+        ca_destroyer_tick(&mut hooks, &mut state, &settings, None, 1000);
+        assert_eq!(state.current_target, None);
+
+        // delay not elapsed -> nothing
+        settings.enabled = true;
+        settings.delay_ms = 500;
+        state.chronometer.reset(1000);
+        ca_destroyer_tick(&mut hooks, &mut state, &settings, None, 1200);
+        assert_eq!(state.current_target, None);
+    }
+
+    #[test]
+    fn update_target_picks_best_by_enemy_damage_then_self() {
+        let mut hooks = DestroyMock::default();
+        hooks.crystals = vec![1, 2, 3];
+        hooks.damage = None;
+        let mut state = CrystalDestroyerState::new();
+        let settings = CrystalDestroyerSettings::default();
+
+        ca_destroy_update_target(&mut hooks, &mut state, &settings);
+        assert_eq!(state.current_target, None); // no candidate deals enough damage
+
+        hooks.damage = Some((2.0, 12.0));
+        ca_destroy_update_target(&mut hooks, &mut state, &settings);
+        assert_eq!(state.current_target, Some(1)); // first maximum on ties
+    }
+
+    #[test]
+    fn validate_and_update_target_checks_gates_in_order() {
+        let mut hooks = DestroyMock::default();
+        let mut state = CrystalDestroyerState::new();
+        let settings = CrystalDestroyerSettings::default();
+
+        ca_destroy_validate_and_update_target(&mut hooks, &mut state, &settings, 7);
+        assert_eq!(state.current_target, Some(7));
+
+        // outside the world border
+        hooks.border = false;
+        ca_destroy_validate_and_update_target(&mut hooks, &mut state, &settings, 7);
+        assert_eq!(state.current_target, None);
+
+        // too far: squared distance 10 vs max range (4.5 + 0.5)^2 = 25 -> passes;
+        // distance 100 fails
+        hooks.border = true;
+        hooks.ca_squared_boxed_distance_mock = 100.0;
+        ca_destroy_validate_and_update_target(&mut hooks, &mut state, &settings, 7);
+        assert_eq!(state.current_target, None);
+
+        // cannot see
+        hooks.ca_squared_boxed_distance_mock = 10.0;
+        hooks.can_see = false;
+        ca_destroy_validate_and_update_target(&mut hooks, &mut state, &settings, 7);
+        assert_eq!(state.current_target, None);
+
+        // not enough damage
+        hooks.can_see = true;
+        hooks.damage = None;
+        ca_destroy_validate_and_update_target(&mut hooks, &mut state, &settings, 7);
+        assert_eq!(state.current_target, None);
+    }
+
+    #[test]
+    fn queue_destroy_rotates_attacks_and_resets() {
+        let mut hooks = DestroyMock::default();
+        let mut state = CrystalDestroyerState::new();
+        state.current_target = Some(7);
+        state.chronometer.reset(1000);
+        let settings = CrystalDestroyerSettings::default();
+        let eye = hooks.eye;
+
+        ca_destroy_queue_destroy(
+            &mut hooks, &mut state, &settings,
+            Rotation { yaw: 30.0, pitch: 10.0 },
+            7, FULL_BOX, eye, (1.0, 2.0, 3.0), 1200,
+        );
+        assert_eq!(hooks.rotations, 1);
+        assert_eq!(hooks.attacked, vec![7]);
+        assert_eq!(hooks.post_attacks, vec![
+            ("CrystalAuraSpeedDebugger".to_string(), 7),
+            ("SubmoduleSetDead.CrystalTracker".to_string(), 7)
+        ]);
+        assert_eq!(state.chronometer.last_reset_ms, 1200);
+
+        // rotation not finished -> no attack
+        let mut hooks = DestroyMock::default();
+        hooks.rotate_fires = false;
+        let mut state = CrystalDestroyerState::new();
+        state.current_target = Some(7);
+        let eye = hooks.eye;
+        ca_destroy_queue_destroy(
+            &mut hooks, &mut state, &settings, Rotation { yaw: 0.0, pitch: 0.0 }, 7, FULL_BOX, eye, (1.0, 2.0, 3.0), 1200,
+        );
+        assert!(hooks.attacked.is_empty());
+    }
+
+    #[test]
+    fn queue_destroy_defers_server_swing_off_line() {
+        let mut hooks = DestroyMock::default();
+        let mut state = CrystalDestroyerState::new();
+        state.current_target = Some(7);
+        let mut settings = CrystalDestroyerSettings::default();
+        settings.swing_server_swing = true;
+        let eye = hooks.eye;
+
+        // line misses the base -> mc.execute
+        ca_destroy_queue_destroy(
+            &mut hooks, &mut state, &settings, Rotation { yaw: 0.0, pitch: 0.0 }, 7, FULL_BOX, eye, (1.0, 2.0, 3.0), 1200,
+        );
+        assert_eq!(hooks.deferred, 1);
+        assert!(hooks.attacked.is_empty());
+
+        // line hits the base -> runs inline
+        hooks.server_swing_line_hit = true;
+        ca_destroy_queue_destroy(
+            &mut hooks, &mut state, &settings, Rotation { yaw: 0.0, pitch: 0.0 }, 7, FULL_BOX, eye, (1.0, 2.0, 3.0), 1200,
+        );
+        assert_eq!(hooks.deferred, 1);
+        assert_eq!(hooks.attacked, vec![7]);
+    }
+
+    #[test]
+    fn max_range_is_max_of_both() {
+        let mut settings = CrystalDestroyerSettings::default();
+        assert_eq!(crystal_destroyer_max_range(&settings), 4.5);
+        settings.walls_range = 6.0;
+        assert_eq!(crystal_destroyer_max_range(&settings), 6.0);
     }
 }

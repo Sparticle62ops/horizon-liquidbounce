@@ -5,11 +5,7 @@
 //! machine (onToggled returns whether the switch happened, with the
 //! notification title/severity pair it feeds).
 use crate::category::ModuleCategory;
-<<<<<<< HEAD
-use crate::value::{boolean, Value, ValueKind};
-=======
 use crate::value::{boolean, float, Value, ValueKind};
->>>>>>> 3c0a73b (port: liquidbounce slice 1 (categories, value/settings system, ClientModule state machine, ModuleManager, config round-trip, 18 tests))
 use std::collections::BTreeMap;
 
 pub type TickFn = fn(&mut Module);
@@ -80,11 +76,7 @@ impl Module {
             return false;
         }
         self.running = requested;
-<<<<<<< HEAD
-        requested
-=======
         true
->>>>>>> 3c0a73b (port: liquidbounce slice 1 (categories, value/settings system, ClientModule state machine, ModuleManager, config round-trip, 18 tests))
     }
 
     /// The notification pair upstream computes in onToggled.
@@ -128,11 +120,6 @@ pub fn to_lower_camel_case(name: &str) -> String {
     let mut upper_next = false;
     for (i, ch) in name.chars().enumerate() {
         match ch {
-<<<<<<< HEAD
-            ' ' | '-' | '_' | '.' => upper_next = i > 0,
-            _ => {
-                if i == 0 || upper_next {
-=======
             ' ' | '-' | '_' | '.' => {
                 if i > 0 {
                     upper_next = true;
@@ -143,7 +130,6 @@ pub fn to_lower_camel_case(name: &str) -> String {
                     out.extend(ch.to_lowercase());
                     upper_next = false;
                 } else if upper_next {
->>>>>>> 3c0a73b (port: liquidbounce slice 1 (categories, value/settings system, ClientModule state machine, ModuleManager, config round-trip, 18 tests))
                     out.extend(ch.to_uppercase());
                     upper_next = false;
                 } else {

@@ -62,11 +62,7 @@ impl Value {
     pub fn set_from_json(&mut self, v: &Json) -> Result<(), &'static str> {
         match (&mut self.kind, v) {
             (ValueKind::Bool(b), Json::Bool(n)) => *b = *n,
-<<<<<<< HEAD
-            (ValueKind::Bool(_), Json::Num(n)) => *b = *n != 0.0,
-=======
             (ValueKind::Bool(b), Json::Num(n)) => *b = *n != 0.0,
->>>>>>> 3c0a73b (port: liquidbounce slice 1 (categories, value/settings system, ClientModule state machine, ModuleManager, config round-trip, 18 tests))
             (ValueKind::Int(cur, lo, hi), Json::Num(n)) => *cur = clamp(*n, *lo as f64, *hi as f64) as i64,
             (ValueKind::Float(cur, lo, hi), Json::Num(n)) => *cur = clamp(*n, *lo, *hi),
             (ValueKind::Choice(sel, opts), Json::Str(s)) => {

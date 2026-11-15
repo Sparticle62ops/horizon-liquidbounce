@@ -8365,6 +8365,18 @@ pub trait VelocityWorldExtended: VelocityWorld {
     fn is_sprinting(&self) -> bool;
     /// `LocalPlayerFallDamageTracker.isCurrentFallDamage`
     fn is_current_fall_damage(&self) -> bool;
+    /// Upstream `player.isSprinting = false` (Reduce attack burst): a write
+    /// seam, default no-op.
+    fn set_sprinting(&mut self, sprinting: bool) {
+        let _ = sprinting;
+    }
+
+    /// Upstream `player.deltaMovement = ...` (Reduce attack burst): a write
+    /// seam, default no-op.
+    fn set_delta_movement(&mut self, delta: Vec3) {
+        let _ = delta;
+    }
+
 }
 
 /// Upstream `Vec3.multiply(factorX, factorY = 1.0, factorZ)`.
@@ -9179,5 +9191,1300 @@ mod velocity_lag_tests {
         world.fall_damage = true;
         assert!(!velocity_lag_input_handler(&module, &mut state, &world));
         assert!(!state.should_jump);
+    }
+}
+
+// ----- velocity/mode/VelocityReduce.kt (GPL-3.0, (c) 2015-2026 CCBlueX) -----
+//
+// Attack Reduce. Holds incoming packets in the blink queue while the player
+// closes on a target, then either bursts the queued attacks into it or
+// releases the lag after a reason (flag, spectator, out of range, max delay).
+
+/// Upstream `VelocityReduce` settings.
+pub fn velocity_reduce() -> Module {
+    Module::new(
+        "Reduce",
+        COMBAT,
+        vec![
+            int_range("AttackCount", 3, 3, 0, 20),
+            float_range("LagTargetRange", 2.0, 6.0, 0.0, 20.0),
+            // "ticks" suffix
+            int_range("LagMaxDelay", 10, 10, 1, 1000),
+            boolean("LagRequireKillAura", false),
+            float("Horizontal", 0.6, 0.0, 1.0),
+            float("Vertical", 1.0, 0.0, 1.0),
+            // Upstream Debug ToggleableValueGroup (doNotIncludeAlways),
+            // flattened: `Debug.notify` posts via notification()/chat().
+            boolean("Debug", false),
+            boolean("DebugChatMessage", false),
+            boolean("DebugNotification", false),
+            // Upstream BlinkEsp modes (doNotIncludeAlways); the visual modes
+            // stay in the host renderer, only the selection is carried.
+            choice("BlinkEsp", "Box", &["Box", "Model", "Wireframe", "None"]),
+        ],
+    )
+}
+
+/// An entity as the Reduce mode sees it: `Entity` fields the mode reads
+/// (`id`, position, `rotation`, `isRemoved`, `shouldBeAttacked()`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VelocityReduceTarget {
+    pub entity_id: i64,
+    pub pos: Vec3,
+    pub rotation: (f32, f32),
+    pub removed: bool,
+    pub attackable: bool,
+}
+
+/// Upstream `TrackedEntityPosition`: the base position and rotation a
+/// rendered (blink-lagged) entity is tracked at. `handlePacket` advances it
+/// with each incoming packet; the packet decode (entity position deltas)
+/// stays in the host net layer and arrives here as an update tuple.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VelocityTrackedEntityPosition {
+    pub base: Vec3,
+    pub rotation: (f32, f32),
+}
+
+impl VelocityTrackedEntityPosition {
+    pub fn new(target: VelocityReduceTarget) -> Self {
+        VelocityTrackedEntityPosition {
+            base: target.pos,
+            rotation: target.rotation,
+        }
+    }
+}
+
+/// Upstream `TrackedEntityPosition.handlePacket(packet, world, trackedTarget)`.
+pub fn velocity_tracked_entity_position_handle_packet(
+    pos: &mut VelocityTrackedEntityPosition,
+    update: Option<(Vec3, f32, f32)>,
+) {
+    if let Some((base, yaw, pitch)) = update {
+        pos.base = base;
+        pos.rotation = (yaw, pitch);
+    }
+}
+
+/// Upstream `ReleaseReason` with its `debugSuffix`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum VelocityReduceReleaseReason {
+    TargetReached,
+    Flag,
+    Spectator,
+    OutOfRange,
+    MaxDelay,
+}
+
+impl VelocityReduceReleaseReason {
+    pub fn debug_suffix(&self) -> Option<&'static str> {
+        match self {
+            VelocityReduceReleaseReason::TargetReached => None,
+            VelocityReduceReleaseReason::Flag => Some("flag"),
+            VelocityReduceReleaseReason::Spectator => Some("spectator"),
+            VelocityReduceReleaseReason::OutOfRange => Some("out of range"),
+            VelocityReduceReleaseReason::MaxDelay => Some("max delay"),
+        }
+    }
+}
+
+/// Upstream `VelocityReduce` state: `target`, `renderTarget`,
+/// `renderTargetPos`, `remainingAttackCount`, `currentGameTick`,
+/// `forwardInputAttackGameTick`, `receiveDamage`, `lagTicks` and
+/// `releaseReason`. `lagTicks` is `-1` when not lagging.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VelocityReduceState {
+    pub target: Option<VelocityReduceTarget>,
+    pub render_target: Option<VelocityReduceTarget>,
+    pub render_target_pos: Option<VelocityTrackedEntityPosition>,
+    pub remaining_attack_count: i64,
+    pub current_game_tick: i64,
+    pub forward_input_attack_game_tick: i64,
+    pub receive_damage: bool,
+    pub lag_ticks: i64,
+    pub release_reason: Option<VelocityReduceReleaseReason>,
+}
+
+impl Default for VelocityReduceState {
+    fn default() -> Self {
+        VelocityReduceState {
+            target: None,
+            render_target: None,
+            render_target_pos: None,
+            remaining_attack_count: 0,
+            current_game_tick: 0,
+            forward_input_attack_game_tick: -1,
+            receive_damage: false,
+            lag_ticks: -1,
+            release_reason: None,
+        }
+    }
+}
+
+/// Upstream `backtrackBlocked`.
+pub fn velocity_reduce_backtrack_blocked(state: &VelocityReduceState) -> bool {
+    state.lag_ticks >= 0 || state.remaining_attack_count > 0
+}
+
+/// Upstream `ownsIncomingBlinkQueue`.
+pub fn velocity_reduce_owns_incoming_blink_queue(state: &VelocityReduceState) -> bool {
+    state.lag_ticks >= 0
+}
+
+/// Upstream `resetRenderState()`.
+pub fn velocity_reduce_reset_render_state(state: &mut VelocityReduceState) {
+    state.render_target = None;
+    state.render_target_pos = None;
+}
+
+/// Upstream `enable()`.
+pub fn velocity_reduce_enable(state: &mut VelocityReduceState) {
+    *state = VelocityReduceState::default();
+}
+
+/// What upstream `disable()` did with the blink queue.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum VelocityReduceDisableOutcome {
+    /// Not lagging, nothing flushed.
+    Untouched,
+    /// `BlinkManager.flush(TransferOrigin.INCOMING)` ran.
+    FlushedIncoming,
+}
+
+/// Upstream `disable()`.
+pub fn velocity_reduce_disable(state: &mut VelocityReduceState) -> VelocityReduceDisableOutcome {
+    let flushed = state.lag_ticks >= 0;
+    *state = VelocityReduceState::default();
+    if flushed {
+        VelocityReduceDisableOutcome::FlushedIncoming
+    } else {
+        VelocityReduceDisableOutcome::Untouched
+    }
+}
+
+/// Upstream `canLag`: `!lagRequireKillAura || ModuleKillAura.running`.
+pub fn velocity_reduce_can_lag(module: &Module, kill_aura_running: bool) -> bool {
+    !tb_setting_bool(module, "LagRequireKillAura", false) || kill_aura_running
+}
+
+/// Upstream `LagTargetRange` as `(start, endInclusive)`.
+fn velocity_reduce_target_range(module: &Module) -> (f64, f64) {
+    module
+        .setting("LagTargetRange")
+        .map(|value| &value.kind)
+        .and_then(|kind| kind.float_range())
+        .unwrap_or((2.0, 6.0))
+}
+
+/// Upstream `squaredBoxedDistanceTo(player)` as squared distance between the
+/// player position and the entity position; the host seam carries the box
+/// distance when its AABBs differ from the centre distance.
+fn velocity_reduce_squared_distance(a: Vec3, b: Vec3) -> f64 {
+    let dx = a.x - b.x;
+    let dy = a.y - b.y;
+    let dz = a.z - b.z;
+    dx * dx + dy * dy + dz * dz
+}
+
+/// Upstream `weightedMinByOrNullAtMost(bound) { key }`: the element with the
+/// smallest key, but only when that key is at most `bound`.
+fn velocity_reduce_weighted_min_by_or_none_at_most<'a, T: Copy + 'a>(
+    items: impl Iterator<Item = &'a T>,
+    bound: f64,
+    key: impl Fn(&T) -> f64,
+) -> Option<T> {
+    let mut best: Option<(&T, f64)> = None;
+    for item in items {
+        let k = key(item);
+        if best.map_or(true, |(_, best_k)| k < best_k) {
+            best = Some((item, k));
+        }
+    }
+    let (item, k) = best?;
+    if k <= bound {
+        Some(*item)
+    } else {
+        None
+    }
+}
+
+/// Everything `findTarget()` needs from the outside: the KillAura context,
+/// the player rotation, the crosshair raytrace and the renderable entity
+/// list. `crosshair_hit` is `findEntityInCrosshair(range, rotation)` resolved
+/// by the host raytracer with the upstream filter
+/// `{ !it.isRemoved && it.shouldBeAttacked() }` applied.
+pub struct VelocityReduceFindTargetContext<'a> {
+    pub kill_aura_running: bool,
+    /// `ModuleKillAura.targetTracker.target`
+    pub kill_aura_target: Option<VelocityReduceTarget>,
+    /// `ModuleKillAura.range.interactionRange`
+    pub kill_aura_interaction_range: f64,
+    /// `RotationManager.currentRotation ?: player.rotation`
+    pub current_rotation: Option<(f32, f32)>,
+    pub player_rotation: (f32, f32),
+    pub player_pos: Vec3,
+    /// `world.entitiesForRendering()`, each carrying `isRemoved` and
+    /// `shouldBeAttacked()` in `removed`/`attackable`.
+    pub candidates: &'a [VelocityReduceTarget],
+    pub crosshair_hit: Option<VelocityReduceTarget>,
+}
+
+/// Upstream `findTarget()`.
+pub fn velocity_reduce_find_target(
+    module: &Module,
+    state: &mut VelocityReduceState,
+    ctx: &VelocityReduceFindTargetContext,
+) {
+    let can_lag = velocity_reduce_can_lag(module, ctx.kill_aura_running);
+    let (range_start, range_end) = velocity_reduce_target_range(module);
+
+    if !can_lag && state.lag_ticks >= 0 {
+        return;
+    }
+
+    if ctx.kill_aura_running && ctx.kill_aura_target.is_some() {
+        let kill_aura_target = ctx.kill_aura_target.unwrap();
+        if state.lag_ticks == -1 {
+            state.render_target = Some(kill_aura_target);
+        }
+        if !can_lag
+            || velocity_reduce_squared_distance(kill_aura_target.pos, ctx.player_pos)
+                <= range_start * range_start
+        {
+            state.target = Some(kill_aura_target);
+        }
+        return;
+    }
+
+    let crosshair_range = if can_lag {
+        range_start
+    } else {
+        ctx.kill_aura_interaction_range
+    };
+    let rotation = ctx.current_rotation.unwrap_or(ctx.player_rotation);
+    let _ = crosshair_range;
+    let _ = rotation;
+    // findEntityInCrosshair(range, rotation) { !it.isRemoved && it.shouldBeAttacked() }
+    let hit = ctx
+        .crosshair_hit
+        .filter(|target| !target.removed && target.attackable);
+    state.target = hit;
+
+    if state.lag_ticks == -1 {
+        state.render_target = state.target;
+    }
+
+    if state.target.is_some() || state.lag_ticks >= 0 {
+        return;
+    }
+
+    state.render_target = velocity_reduce_weighted_min_by_or_none_at_most(
+        ctx.candidates
+            .iter()
+            .filter(|entity| !entity.removed && entity.attackable),
+        range_end * range_end,
+        |entity| velocity_reduce_squared_distance(entity.pos, ctx.player_pos),
+    );
+}
+
+/// Upstream `hasLostReduceTarget()`.
+pub fn velocity_reduce_has_lost_reduce_target(
+    state: &VelocityReduceState,
+    kill_aura_running: bool,
+    kill_aura_target_id: Option<i64>,
+) -> bool {
+    let reduce_target = match state.target {
+        Some(target) => target,
+        None => return true,
+    };
+
+    if !kill_aura_running {
+        return false;
+    }
+
+    let kill_aura_target_id = match kill_aura_target_id {
+        Some(id) => id,
+        None => return true,
+    };
+    kill_aura_target_id != reduce_target.entity_id
+}
+
+/// What upstream `getEspData()` feeds the render-only `BlinkEsp` modes
+/// (Box/Model/Wireframe/None, kept in the host renderer): the render target
+/// id, its tracked base position and rotation, while lagging.
+pub fn velocity_reduce_esp_data(
+    state: &VelocityReduceState,
+) -> Option<(i64, Vec3, (f32, f32))> {
+    if state.lag_ticks == -1 {
+        return None;
+    }
+
+    let render_target = state.render_target?;
+    let render_target_pos = state.render_target_pos?;
+    Some((
+        render_target.entity_id,
+        render_target_pos.base,
+        render_target_pos.rotation,
+    ))
+}
+
+/// What the upstream `Debug.notify(message)` would deliver; the host posts
+/// it through its notification / chat backends.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VelocityReduceDebugNotice {
+    pub message: String,
+    pub notification: bool,
+    pub chat: bool,
+}
+
+/// Upstream `Debug.notify(message)`.
+pub fn velocity_reduce_debug_notify(module: &Module, message: &str) -> Option<VelocityReduceDebugNotice> {
+    if !tb_setting_bool(module, "Debug", false) {
+        return None;
+    }
+
+    let notification = tb_setting_bool(module, "DebugNotification", false);
+    let chat = tb_setting_bool(module, "DebugChatMessage", false);
+    if !notification && !chat {
+        return None;
+    }
+
+    Some(VelocityReduceDebugNotice {
+        message: message.to_string(),
+        notification,
+        chat,
+    })
+}
+
+/// What the packet handler did with a `PacketEvent` on `TransferOrigin.INCOMING`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum VelocityReducePacketOutcome {
+    /// The event is untouched.
+    Untouched,
+    /// Lagging: a `ClientboundPlayerPositionPacket` set `ReleaseReason.FLAG`
+    /// and the tracked render position advanced with the packet.
+    LagHandling { flagged: bool, tracked: bool },
+    /// `ModuleVelocity.pause > 0`, nothing happened.
+    Paused,
+    /// A local-player damage packet was recorded.
+    ReceivedDamage,
+    /// A local-player velocity packet arrived but nothing could act on it.
+    NoAction,
+    /// Blocked by `player.isUsingItem` or `ModuleScaffold.running`.
+    BlockedByUseOrScaffold,
+    /// `findTarget()` left no render target.
+    NoTarget,
+    /// Lag armed for `delay` ticks (`lagTicks = lagMaxDelay`).
+    ArmedLag {
+        delay: i64,
+        debug: Option<VelocityReduceDebugNotice>,
+    },
+    /// Attack burst armed with `count` attacks
+    /// (`remainingAttackCount = attackCount.random()`).
+    ArmedAttacks { count: i64 },
+}
+
+/// Upstream `packetEventHandler`, a `handler` on `PacketEvent` (only the
+/// INCOMING origin is handled). `isLocalPlayerVelocity()` takes its default
+/// `considerExplosion = true`.
+#[allow(clippy::too_many_arguments)]
+pub fn velocity_reduce_packet_handler(
+    module: &Module,
+    state: &mut VelocityReduceState,
+    ctx: &VelocityReduceFindTargetContext,
+    origin_incoming: bool,
+    is_player_position_packet: bool,
+    tracked_update: Option<(Vec3, f32, f32)>,
+    velocity_pause: i64,
+    is_local_player_damage: bool,
+    is_local_player_velocity: bool,
+    is_using_item: bool,
+    scaffold_running: bool,
+    is_sprinting: bool,
+    attack_roll: f64,
+) -> VelocityReducePacketOutcome {
+    if !origin_incoming {
+        return VelocityReducePacketOutcome::Untouched;
+    }
+
+    if state.lag_ticks >= 0 {
+        let flagged = is_player_position_packet;
+        if flagged {
+            state.release_reason = Some(VelocityReduceReleaseReason::Flag);
+        }
+
+        let mut tracked = false;
+        if let (Some(render_target_pos), Some(render_target)) =
+            (state.render_target_pos.as_mut(), state.render_target)
+        {
+            velocity_tracked_entity_position_handle_packet(render_target_pos, tracked_update);
+            let _ = render_target;
+            tracked = true;
+        }
+
+        return VelocityReducePacketOutcome::LagHandling { flagged, tracked };
+    }
+
+    if velocity_pause > 0 {
+        return VelocityReducePacketOutcome::Paused;
+    }
+
+    if is_local_player_damage {
+        state.receive_damage = true;
+        return VelocityReducePacketOutcome::ReceivedDamage;
+    } else if is_local_player_velocity && state.receive_damage {
+        state.receive_damage = false;
+        if is_using_item || scaffold_running {
+            return VelocityReducePacketOutcome::BlockedByUseOrScaffold;
+        }
+
+        velocity_reduce_find_target(module, state, ctx);
+
+        if state.render_target.is_none() {
+            return VelocityReducePacketOutcome::NoTarget;
+        }
+
+        let can_lag = velocity_reduce_can_lag(module, ctx.kill_aura_running);
+        if (state.target.is_none() && can_lag) || (state.target.is_some() && !is_sprinting) {
+            let debug = if state.target.is_some() {
+                velocity_reduce_debug_notify(module, "Lag... (not sprinting)")
+            } else {
+                velocity_reduce_debug_notify(module, "Lag...")
+            };
+
+            if state.target.is_none() {
+                state.render_target_pos = state.render_target.map(VelocityTrackedEntityPosition::new);
+            }
+            let delay = tb_setting_i64(module, "LagMaxDelay", 10);
+            state.lag_ticks = delay;
+            return VelocityReducePacketOutcome::ArmedLag { delay, debug };
+        } else if state.target.is_some() {
+            let count = velocity_jump_range_random(module, "AttackCount", 3, 3, attack_roll);
+            state.remaining_attack_count = count;
+            return VelocityReducePacketOutcome::ArmedAttacks { count };
+        }
+
+        return VelocityReducePacketOutcome::NoAction;
+    }
+
+    VelocityReducePacketOutcome::NoAction
+}
+
+/// What the blink queue handler did with a `BlinkPacketEvent`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum VelocityReduceBlinkOutcome {
+    /// The event is untouched.
+    Untouched,
+    /// Upstream `event.action = BlinkManager.Action.QUEUE`.
+    Queue,
+}
+
+/// Upstream `queuePacketHandler`, a `handler` on `BlinkPacketEvent`.
+pub fn velocity_reduce_blink_packet_handler(
+    state: &VelocityReduceState,
+    origin_incoming: bool,
+) -> VelocityReduceBlinkOutcome {
+    if state.lag_ticks >= 0 && origin_incoming {
+        return VelocityReduceBlinkOutcome::Queue;
+    }
+
+    VelocityReduceBlinkOutcome::Untouched
+}
+
+/// What the tick handler did on a `GameTickEvent`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum VelocityReduceTickOutcome {
+    /// No attack burst running.
+    Untouched,
+    /// `hasLostReduceTarget()` ended the burst early.
+    LostTarget,
+    /// One `attackEntity(target!!, SwingMode.DO_NOT_HIDE)` burst step ran,
+    /// with the remaining count after the decrement.
+    Attacked { count_after: i64 },
+}
+
+/// Upstream `tickHandler`, a `handler` on `GameTickEvent`. The world seam
+/// needs the `player.isSprinting = false` and `deltaMovement` writes; both
+/// are default no-ops on `VelocityWorldExtended`.
+pub fn velocity_reduce_tick_handler(
+    module: &Module,
+    state: &mut VelocityReduceState,
+    world: &mut dyn VelocityWorldExtended,
+    kill_aura_running: bool,
+    kill_aura_target_id: Option<i64>,
+) -> VelocityReduceTickOutcome {
+    state.current_game_tick += 1;
+
+    if state.remaining_attack_count > 0 {
+        if velocity_reduce_has_lost_reduce_target(state, kill_aura_running, kill_aura_target_id) {
+            state.remaining_attack_count = 0;
+            state.target = None;
+            return VelocityReduceTickOutcome::LostTarget;
+        }
+
+        // player.isSprinting = false
+        world.set_sprinting(false);
+        // attackEntity(target!!, SwingMode.DO_NOT_HIDE)
+        state.forward_input_attack_game_tick = state.current_game_tick;
+        // player.deltaMovement = player.deltaMovement.multiply(horizontal, vertical, horizontal)
+        let horizontal = tb_setting_f64(module, "Horizontal", 0.6);
+        let vertical = tb_setting_f64(module, "Vertical", 1.0);
+        let delta = world.delta_movement();
+        world.set_delta_movement(Vec3 {
+            x: delta.x * horizontal,
+            y: delta.y * vertical,
+            z: delta.z * horizontal,
+        });
+        state.remaining_attack_count -= 1;
+        if state.remaining_attack_count == 0 {
+            state.target = None;
+        }
+        return VelocityReduceTickOutcome::Attacked {
+            count_after: state.remaining_attack_count,
+        };
+    }
+
+    VelocityReduceTickOutcome::Untouched
+}
+
+/// What the tick-packet-process handler did on a `TickPacketProcessEvent`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum VelocityReduceProcessOutcome {
+    /// No release reason pending, the event is untouched.
+    Untouched,
+    /// `BlinkManager.flush(TransferOrigin.INCOMING)` ran, `lagTicks` reset to
+    /// `-1` and the render state cleared. `TARGET_REACHED` also re-arms the
+    /// attack count with `attackCount.random()`.
+    Released {
+        target_reached: bool,
+        debug: Option<VelocityReduceDebugNotice>,
+    },
+}
+
+/// Upstream `tickPacketProcessEventHandler`, a `handler` on
+/// `TickPacketProcessEvent`.
+pub fn velocity_reduce_process_handler(
+    module: &Module,
+    state: &mut VelocityReduceState,
+    attack_roll: f64,
+) -> VelocityReduceProcessOutcome {
+    match state.release_reason {
+        None => VelocityReduceProcessOutcome::Untouched,
+        Some(release_reason) => {
+            // BlinkManager.flush(TransferOrigin.INCOMING)
+            state.lag_ticks = -1;
+            velocity_reduce_reset_render_state(state);
+            let target_reached = release_reason == VelocityReduceReleaseReason::TargetReached;
+            let debug = if target_reached {
+                velocity_reduce_debug_notify(module, "Finish lag")
+            } else {
+                velocity_reduce_debug_notify(
+                    module,
+                    &format!("Finish lag ({})", release_reason.debug_suffix().unwrap_or("")),
+                )
+            };
+            if target_reached {
+                state.remaining_attack_count =
+                    velocity_jump_range_random(module, "AttackCount", 3, 3, attack_roll);
+            }
+            state.release_reason = None;
+            VelocityReduceProcessOutcome::Released {
+                target_reached,
+                debug,
+            }
+        }
+    }
+}
+
+/// The `MovementInputEvent` slice Reduce touches: upstream
+/// `DirectionalInput.FORWARDS` and `.copy(forwards = true, backwards = false)`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct VelocityReduceInput {
+    pub forwards: bool,
+    pub backwards: bool,
+    pub left: bool,
+    pub right: bool,
+}
+
+/// What the movement input handler did on a `MovementInputEvent`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum VelocityReduceMovementOutcome {
+    /// Not lagging, the event is untouched.
+    Untouched,
+    /// A lag tick counted down and `findTarget()` ran; `release` is the
+    /// release reason it ended with, if any.
+    LagTick {
+        release: Option<VelocityReduceReleaseReason>,
+    },
+}
+
+/// Upstream `movementInputEventHandler`, a `handler` on `MovementInputEvent`.
+pub fn velocity_reduce_movement_input_handler(
+    module: &Module,
+    state: &mut VelocityReduceState,
+    ctx: &VelocityReduceFindTargetContext,
+    player_pos: Vec3,
+    flying: bool,
+    input: &mut VelocityReduceInput,
+) -> VelocityReduceMovementOutcome {
+    let mut outcome = VelocityReduceMovementOutcome::Untouched;
+    if state.lag_ticks > 0 && state.release_reason.is_none() {
+        state.lag_ticks -= 1;
+        velocity_reduce_find_target(module, state, ctx);
+
+        let (_, range_end) = velocity_reduce_target_range(module);
+        let release = if flying {
+            Some(VelocityReduceReleaseReason::Spectator)
+        } else if state.target.is_some() {
+            // event.directionalInput = DirectionalInput.FORWARDS
+            *input = VelocityReduceInput {
+                forwards: true,
+                backwards: false,
+                left: false,
+                right: false,
+            };
+            Some(VelocityReduceReleaseReason::TargetReached)
+        } else {
+            let base = state
+                .render_target_pos
+                .map(|pos| pos.base)
+                .unwrap_or(Vec3 { x: 0.0, y: 0.0, z: 0.0 });
+            if velocity_reduce_squared_distance(player_pos, base) > range_end * range_end {
+                Some(VelocityReduceReleaseReason::OutOfRange)
+            } else if state.lag_ticks == 0 {
+                Some(VelocityReduceReleaseReason::MaxDelay)
+            } else {
+                None
+            }
+        };
+        state.release_reason = release;
+        outcome = VelocityReduceMovementOutcome::LagTick { release };
+    }
+
+    if state.current_game_tick == state.forward_input_attack_game_tick {
+        // event.directionalInput = event.directionalInput.copy(
+        //     forwards = true, backwards = false
+        // )
+        input.forwards = true;
+        input.backwards = false;
+    }
+
+    outcome
+}
+
+#[cfg(test)]
+mod velocity_reduce_tests {
+    use super::*;
+
+    struct MockReduceWorld {
+        on_ground: bool,
+        sprinting: bool,
+        fall_damage: bool,
+        delta: Vec3,
+    }
+
+    impl Default for MockReduceWorld {
+        fn default() -> Self {
+            MockReduceWorld {
+                on_ground: true,
+                sprinting: true,
+                fall_damage: false,
+                delta: Vec3 { x: 0.4, y: -0.078, z: 0.3 },
+            }
+        }
+    }
+
+    impl VelocityWorld for MockReduceWorld {
+        fn player_id(&self) -> i64 {
+            42
+        }
+        fn player_on_ground(&self) -> bool {
+            self.on_ground
+        }
+        fn any_horizontal_input(&self) -> bool {
+            true
+        }
+        fn delta_movement(&self) -> Vec3 {
+            self.delta
+        }
+        fn horizontal_speed(&self) -> f64 {
+            0.5
+        }
+        fn input_is_moving(&self) -> bool {
+            true
+        }
+        fn movement_yaw(&self) -> f32 {
+            90.0
+        }
+        fn find_enemy(&self, _max_range: f64) -> Option<Vec3> {
+            None
+        }
+        fn is_looking_at_entity(
+            &self,
+            _target: Vec3,
+            _range: f64,
+            _rotation: (f32, f32),
+        ) -> Option<()> {
+            None
+        }
+        fn current_rotation(&self) -> Option<(f32, f32)> {
+            None
+        }
+        fn player_rotation(&self) -> (f32, f32) {
+            (10.0, 0.0)
+        }
+    }
+
+    impl VelocityWorldExtended for MockReduceWorld {
+        fn hurt_time(&self) -> i64 {
+            0
+        }
+        fn is_sprinting(&self) -> bool {
+            self.sprinting
+        }
+        fn is_current_fall_damage(&self) -> bool {
+            self.fall_damage
+        }
+        fn set_sprinting(&mut self, sprinting: bool) {
+            self.sprinting = sprinting;
+        }
+        fn set_delta_movement(&mut self, delta: Vec3) {
+            self.delta = delta;
+        }
+    }
+
+    fn target(id: i64, pos: Vec3) -> VelocityReduceTarget {
+        VelocityReduceTarget {
+            entity_id: id,
+            pos,
+            rotation: (10.0, 0.0),
+            removed: false,
+            attackable: true,
+        }
+    }
+
+    fn ctx<'a>(
+        kill_aura_running: bool,
+        kill_aura_target: Option<VelocityReduceTarget>,
+        candidates: &'a [VelocityReduceTarget],
+        crosshair_hit: Option<VelocityReduceTarget>,
+    ) -> VelocityReduceFindTargetContext<'a> {
+        VelocityReduceFindTargetContext {
+            kill_aura_running,
+            kill_aura_target,
+            kill_aura_interaction_range: 4.5,
+            current_rotation: None,
+            player_rotation: (10.0, 0.0),
+            player_pos: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            candidates,
+            crosshair_hit,
+        }
+    }
+
+    #[test]
+    fn velocity_reduce_enable_disable_reset_the_state() {
+        let mut state = VelocityReduceState::default();
+        state.lag_ticks = 5;
+        state.remaining_attack_count = 2;
+        velocity_reduce_enable(&mut state);
+        assert_eq!(state.lag_ticks, -1);
+        assert_eq!(state.remaining_attack_count, 0);
+        assert_eq!(state.forward_input_attack_game_tick, -1);
+
+        // disable() flushes only while lagging
+        state.lag_ticks = 3;
+        assert_eq!(
+            velocity_reduce_disable(&mut state),
+            VelocityReduceDisableOutcome::FlushedIncoming
+        );
+        assert_eq!(state.lag_ticks, -1);
+        assert_eq!(
+            velocity_reduce_disable(&mut state),
+            VelocityReduceDisableOutcome::Untouched
+        );
+
+        // backtrackBlocked / ownsIncomingBlinkQueue
+        let mut state = VelocityReduceState::default();
+        assert!(!velocity_reduce_backtrack_blocked(&state));
+        assert!(!velocity_reduce_owns_incoming_blink_queue(&state));
+        state.lag_ticks = 2;
+        assert!(velocity_reduce_backtrack_blocked(&state));
+        assert!(velocity_reduce_owns_incoming_blink_queue(&state));
+        state.lag_ticks = -1;
+        state.remaining_attack_count = 1;
+        assert!(velocity_reduce_backtrack_blocked(&state));
+        assert!(!velocity_reduce_owns_incoming_blink_queue(&state));
+    }
+
+    #[test]
+    fn velocity_reduce_can_lag_follows_the_killaura_requirement() {
+        let module = velocity_reduce();
+
+        // No KillAura requirement: always can lag
+        assert!(velocity_reduce_can_lag(&module, false));
+        assert!(velocity_reduce_can_lag(&module, true));
+
+        // LagRequireKillAura on: only while KillAura runs
+        let mut module = velocity_reduce();
+        module.setting_mut("LagRequireKillAura").unwrap().kind = ValueKind::Bool(true);
+        assert!(!velocity_reduce_can_lag(&module, false));
+        assert!(velocity_reduce_can_lag(&module, true));
+    }
+
+    #[test]
+    fn velocity_reduce_find_target_takes_the_killaura_target_in_range() {
+        let module = velocity_reduce();
+        let mut state = VelocityReduceState::default();
+
+        // KillAura target within LagTargetRange.start (2.0): target set
+        let kt = target(1, Vec3 { x: 1.0, y: 0.0, z: 0.0 });
+        let context = ctx(true, Some(kt), &[], None);
+        velocity_reduce_find_target(&module, &mut state, &context);
+        assert_eq!(state.target, Some(kt));
+        assert_eq!(state.render_target, Some(kt));
+
+        // KillAura target beyond the range: render target only, no target
+        let mut state = VelocityReduceState::default();
+        let kt = target(2, Vec3 { x: 5.0, y: 0.0, z: 0.0 });
+        let context = ctx(true, Some(kt), &[], None);
+        velocity_reduce_find_target(&module, &mut state, &context);
+        assert_eq!(state.target, None);
+        assert_eq!(state.render_target, Some(kt));
+
+        // LagRequireKillAura without a running KillAura blocks the swap
+        let mut module = velocity_reduce();
+        module.setting_mut("LagRequireKillAura").unwrap().kind = ValueKind::Bool(true);
+        let mut state = VelocityReduceState::default();
+        let kt = target(3, Vec3 { x: 1.0, y: 0.0, z: 0.0 });
+        let context = ctx(false, Some(kt), &[], None);
+        velocity_reduce_find_target(&module, &mut state, &context);
+        assert_eq!(state.target, None);
+    }
+
+    #[test]
+    fn velocity_reduce_find_target_falls_back_to_the_closest_candidate() {
+        let module = velocity_reduce();
+        let mut state = VelocityReduceState::default();
+
+        // Crosshair hit becomes the target
+        let hit = target(7, Vec3 { x: 3.0, y: 0.0, z: 0.0 });
+        let context = ctx(false, None, &[], Some(hit));
+        velocity_reduce_find_target(&module, &mut state, &context);
+        assert_eq!(state.target, Some(hit));
+        assert_eq!(state.render_target, Some(hit));
+
+        // No target and not lagging: closest attackable candidate within
+        // LagTargetRange.end (6.0) becomes the render target
+        let mut state = VelocityReduceState::default();
+        let near = target(8, Vec3 { x: 3.0, y: 0.0, z: 0.0 });
+        let far = target(9, Vec3 { x: 10.0, y: 0.0, z: 0.0 });
+        let candidates = vec![far, near];
+        let context = ctx(false, None, &candidates, None);
+        velocity_reduce_find_target(&module, &mut state, &context);
+        assert_eq!(state.target, None);
+        assert_eq!(state.render_target, Some(near));
+
+        // Every candidate beyond the bound: no render target
+        let mut state = VelocityReduceState::default();
+        let candidates = vec![far];
+        let context = ctx(false, None, &candidates, None);
+        velocity_reduce_find_target(&module, &mut state, &context);
+        assert_eq!(state.render_target, None);
+
+        // Removed or unattackable candidates never render
+        let mut state = VelocityReduceState::default();
+        let mut dead = near;
+        dead.removed = true;
+        let candidates = vec![dead];
+        let context = ctx(false, None, &candidates, None);
+        velocity_reduce_find_target(&module, &mut state, &context);
+        assert_eq!(state.render_target, None);
+    }
+
+    #[test]
+    fn velocity_reduce_packet_handler_arms_the_lag_after_damage() {
+        let module = velocity_reduce();
+        let mut state = VelocityReduceState::default();
+
+        // Outgoing origin: untouched
+        let context = ctx(false, None, &[], None);
+        assert_eq!(
+            velocity_reduce_packet_handler(
+                &module, &mut state, &context, false, false, None, 0, false, false, false, false,
+                false, 0.5
+            ),
+            VelocityReducePacketOutcome::Untouched
+        );
+
+        // Pause active: paused
+        assert_eq!(
+            velocity_reduce_packet_handler(
+                &module, &mut state, &context, true, false, None, 2, false, false, false, false,
+                false, 0.5
+            ),
+            VelocityReducePacketOutcome::Paused
+        );
+
+        // Damage recorded first
+        assert_eq!(
+            velocity_reduce_packet_handler(
+                &module, &mut state, &context, true, false, None, 0, true, false, false, false,
+                false, 0.5
+            ),
+            VelocityReducePacketOutcome::ReceivedDamage
+        );
+
+        // Velocity after damage with no target and no render target: NoTarget
+        assert_eq!(
+            velocity_reduce_packet_handler(
+                &module, &mut state, &context, true, false, None, 0, false, true, false, false,
+                false, 0.5
+            ),
+            VelocityReducePacketOutcome::NoTarget
+        );
+        assert!(state.receive_damage == false);
+
+        // With a render target: lag armed for LagMaxDelay (10) with the
+        // tracked position built from it
+        let near = target(8, Vec3 { x: 3.0, y: 0.0, z: 0.0 });
+        let candidates = vec![near];
+        let context = ctx(false, None, &candidates, None);
+        state.receive_damage = true;
+        let outcome = velocity_reduce_packet_handler(
+            &module, &mut state, &context, true, false, None, 0, false, true, false, false, false,
+            0.5,
+        );
+        match outcome {
+            VelocityReducePacketOutcome::ArmedLag { delay, debug } => {
+                assert_eq!(delay, 10);
+                assert_eq!(debug, None);
+            }
+            other => panic!("expected ArmedLag, got {:?}", other),
+        }
+        assert_eq!(state.lag_ticks, 10);
+        assert_eq!(
+            state.render_target_pos.map(|pos| pos.base),
+            Some(near.pos)
+        );
+
+        // Using the item blocks the arm
+        let mut state = VelocityReduceState::default();
+        state.receive_damage = true;
+        assert_eq!(
+            velocity_reduce_packet_handler(
+                &module, &mut state, &context, true, false, None, 0, false, true, true, false,
+                false, 0.5
+            ),
+            VelocityReducePacketOutcome::BlockedByUseOrScaffold
+        );
+        // Scaffold running blocks too
+        let mut state = VelocityReduceState::default();
+        state.receive_damage = true;
+        assert_eq!(
+            velocity_reduce_packet_handler(
+                &module, &mut state, &context, true, false, None, 0, false, true, false, true,
+                false, 0.5
+            ),
+            VelocityReducePacketOutcome::BlockedByUseOrScaffold
+        );
+    }
+
+    #[test]
+    fn velocity_reduce_packet_handler_arms_attacks_with_a_target_and_sprint() {
+        let module = velocity_reduce();
+        let kt = target(1, Vec3 { x: 1.0, y: 0.0, z: 0.0 });
+        let context = ctx(true, Some(kt), &[], None);
+        let mut state = VelocityReduceState::default();
+
+        // Damage then velocity with a target while sprinting: attack burst
+        assert_eq!(
+            velocity_reduce_packet_handler(
+                &module, &mut state, &context, true, false, None, 0, true, false, false, false,
+                false, 0.5
+            ),
+            VelocityReducePacketOutcome::ReceivedDamage
+        );
+        assert_eq!(
+            velocity_reduce_packet_handler(
+                &module, &mut state, &context, true, false, None, 0, false, true, false, false,
+                true, 0.5
+            ),
+            VelocityReducePacketOutcome::ArmedAttacks { count: 3 }
+        );
+        assert_eq!(state.remaining_attack_count, 3);
+        // no tracked position on the attack path
+        assert_eq!(state.render_target_pos, None);
+    }
+
+    #[test]
+    fn velocity_reduce_lag_branch_flags_and_tracks() {
+        let module = velocity_reduce();
+        let near = target(8, Vec3 { x: 3.0, y: 0.0, z: 0.0 });
+        let candidates = [near];
+        let context = ctx(false, None, &candidates, None);
+        let mut state = VelocityReduceState::default();
+        state.lag_ticks = 5;
+        state.render_target = Some(near);
+        state.render_target_pos = Some(VelocityTrackedEntityPosition::new(near));
+
+        // A player-position packet flags the release and tracks the position
+        let moved = Vec3 { x: 4.0, y: 1.0, z: 2.0 };
+        assert_eq!(
+            velocity_reduce_packet_handler(
+                &module,
+                &mut state,
+                &context,
+                true,
+                true,
+                Some((moved, 20.0, 0.0)),
+                0,
+                false,
+                false,
+                false,
+                false,
+                false,
+                0.5
+            ),
+            VelocityReducePacketOutcome::LagHandling {
+                flagged: true,
+                tracked: true
+            }
+        );
+        assert_eq!(
+            state.release_reason,
+            Some(VelocityReduceReleaseReason::Flag)
+        );
+        assert_eq!(
+            state.render_target_pos,
+            Some(VelocityTrackedEntityPosition {
+                base: moved,
+                rotation: (20.0, 0.0)
+            })
+        );
+
+        // Lag armed earlier, then queue handler: incoming packets queue
+        assert_eq!(
+            velocity_reduce_blink_packet_handler(&state, true),
+            VelocityReduceBlinkOutcome::Queue
+        );
+        // Outgoing does not
+        assert_eq!(
+            velocity_reduce_blink_packet_handler(&state, false),
+            VelocityReduceBlinkOutcome::Untouched
+        );
+        // And once the lag releases, neither does
+        state.lag_ticks = -1;
+        assert_eq!(
+            velocity_reduce_blink_packet_handler(&state, true),
+            VelocityReduceBlinkOutcome::Untouched
+        );
+    }
+
+    #[test]
+    fn velocity_reduce_tick_handler_runs_the_attack_burst() {
+        let mut module = velocity_reduce();
+        module.setting_mut("Horizontal").unwrap().kind = ValueKind::Float(0.5, 0.0, 1.0);
+        module.setting_mut("Vertical").unwrap().kind = ValueKind::Float(1.0, 0.0, 1.0);
+        let mut world = MockReduceWorld::default();
+        world.delta = Vec3 { x: 0.4, y: -0.078, z: 0.3 };
+        let kt = target(1, Vec3 { x: 1.0, y: 0.0, z: 0.0 });
+        let mut state = VelocityReduceState::default();
+        state.target = Some(kt);
+        state.remaining_attack_count = 2;
+
+        // First burst step: sprint off, delta scaled, forward tick stamped
+        assert_eq!(
+            velocity_reduce_tick_handler(&module, &mut state, &mut world, true, Some(1)),
+            VelocityReduceTickOutcome::Attacked { count_after: 1 }
+        );
+        assert_eq!(state.forward_input_attack_game_tick, state.current_game_tick);
+        assert_eq!(world.delta.x, 0.2); // 0.4 * Horizontal 0.5
+        assert_eq!(world.delta.z, 0.15);
+        assert_eq!(world.delta.y, -0.078); // Vertical 1.0
+        assert!(!world.sprinting);
+
+        // Losing the KillAura target ends the burst early
+        assert_eq!(
+            velocity_reduce_tick_handler(&module, &mut state, &mut world, true, Some(2)),
+            VelocityReduceTickOutcome::LostTarget
+        );
+        assert_eq!(state.remaining_attack_count, 0);
+        assert_eq!(state.target, None);
+
+        // Second burst step clears the target at zero
+        let mut state = VelocityReduceState::default();
+        state.target = Some(kt);
+        state.remaining_attack_count = 1;
+        assert_eq!(
+            velocity_reduce_tick_handler(&module, &mut state, &mut world, true, Some(1)),
+            VelocityReduceTickOutcome::Attacked { count_after: 0 }
+        );
+        assert_eq!(state.target, None);
+
+        // No burst: untouched
+        assert_eq!(
+            velocity_reduce_tick_handler(&module, &mut state, &mut world, true, Some(1)),
+            VelocityReduceTickOutcome::Untouched
+        );
+    }
+
+    #[test]
+    fn velocity_reduce_process_handler_releases_and_rearms() {
+        let module = velocity_reduce();
+        let mut state = VelocityReduceState::default();
+
+        // No release reason: untouched
+        assert_eq!(
+            velocity_reduce_process_handler(&module, &mut state, 0.5),
+            VelocityReduceProcessOutcome::Untouched
+        );
+
+        // TARGET_REACHED: flush, reset lag, re-arm attacks
+        state.lag_ticks = 4;
+        state.release_reason = Some(VelocityReduceReleaseReason::TargetReached);
+        state.render_target = Some(target(1, Vec3 { x: 1.0, y: 0.0, z: 0.0 }));
+        let outcome = velocity_reduce_process_handler(&module, &mut state, 0.5);
+        match outcome {
+            VelocityReduceProcessOutcome::Released { target_reached, debug } => {
+                assert!(target_reached);
+                assert_eq!(debug, None);
+            }
+            other => panic!("expected Released, got {:?}", other),
+        }
+        assert_eq!(state.lag_ticks, -1);
+        assert_eq!(state.render_target, None);
+        assert_eq!(state.render_target_pos, None);
+        assert_eq!(state.remaining_attack_count, 3); // AttackCount 3..3
+        assert_eq!(state.release_reason, None);
+
+        // Another reason: no re-arm, debug suffix in the message
+        let mut module = velocity_reduce();
+        module.setting_mut("Debug").unwrap().kind = ValueKind::Bool(true);
+        module.setting_mut("DebugChatMessage").unwrap().kind = ValueKind::Bool(true);
+        state.release_reason = Some(VelocityReduceReleaseReason::OutOfRange);
+        let outcome = velocity_reduce_process_handler(&module, &mut state, 0.5);
+        match outcome {
+            VelocityReduceProcessOutcome::Released { target_reached, debug } => {
+                assert!(!target_reached);
+                assert_eq!(
+                    debug.map(|notice| notice.message),
+                    Some("Finish lag (out of range)".to_string())
+                );
+            }
+            other => panic!("expected Released, got {:?}", other),
+        }
+        assert_eq!(state.remaining_attack_count, 3);
+    }
+
+    #[test]
+    fn velocity_reduce_movement_input_handler_releases_by_reason() {
+        let module = velocity_reduce();
+        let near = target(8, Vec3 { x: 3.0, y: 0.0, z: 0.0 });
+        let far = target(9, Vec3 { x: 10.0, y: 0.0, z: 0.0 });
+
+        // Flying releases as SPECTATOR before the target is checked
+        let context = ctx(true, Some(near), &[], None);
+        let mut state = VelocityReduceState::default();
+        state.lag_ticks = 2;
+        let mut input = VelocityReduceInput::default();
+        assert_eq!(
+            velocity_reduce_movement_input_handler(&module, &mut state, &context, Vec3 { x: 0.0, y: 0.0, z: 0.0 }, true, &mut input),
+            VelocityReduceMovementOutcome::LagTick {
+                release: Some(VelocityReduceReleaseReason::Spectator)
+            }
+        );
+        assert_eq!(state.lag_ticks, 1);
+        assert_eq!(input, VelocityReduceInput::default());
+
+        // A target reached: FORWARDS input and TARGET_REACHED (KillAura
+        // target within LagTargetRange.start, unlike `near` at 3.0)
+        let kt = target(1, Vec3 { x: 1.0, y: 0.0, z: 0.0 });
+        let context = ctx(true, Some(kt), &[], None);
+        let mut state = VelocityReduceState::default();
+        state.lag_ticks = 2;
+        let mut input = VelocityReduceInput::default();
+        input.backwards = true;
+        assert_eq!(
+            velocity_reduce_movement_input_handler(&module, &mut state, &context, Vec3 { x: 0.0, y: 0.0, z: 0.0 }, false, &mut input),
+            VelocityReduceMovementOutcome::LagTick {
+                release: Some(VelocityReduceReleaseReason::TargetReached)
+            }
+        );
+        assert_eq!(
+            input,
+            VelocityReduceInput {
+                forwards: true,
+                backwards: false,
+                left: false,
+                right: false
+            }
+        );
+
+        // Out of range (render target tracked at far, player at origin,
+        // LagTargetRange.end 6.0)
+        let mut state = VelocityReduceState::default();
+        state.lag_ticks = 5;
+        state.render_target_pos = Some(VelocityTrackedEntityPosition::new(far));
+        let context = ctx(false, None, &[], None);
+        let mut input = VelocityReduceInput::default();
+        assert_eq!(
+            velocity_reduce_movement_input_handler(&module, &mut state, &context, Vec3 { x: 0.0, y: 0.0, z: 0.0 }, false, &mut input),
+            VelocityReduceMovementOutcome::LagTick {
+                release: Some(VelocityReduceReleaseReason::OutOfRange)
+            }
+        );
+
+        // Max delay when the lag ticks run out in range
+        let mut state = VelocityReduceState::default();
+        state.lag_ticks = 1;
+        state.render_target_pos = Some(VelocityTrackedEntityPosition::new(near));
+        let context = ctx(false, None, &[], None);
+        let mut input = VelocityReduceInput::default();
+        assert_eq!(
+            velocity_reduce_movement_input_handler(&module, &mut state, &context, Vec3 { x: 0.0, y: 0.0, z: 0.0 }, false, &mut input),
+            VelocityReduceMovementOutcome::LagTick {
+                release: Some(VelocityReduceReleaseReason::MaxDelay)
+            }
+        );
+        assert_eq!(state.lag_ticks, 0);
+
+        // After an attack burst tick, forwards is forced on that game tick
+        let mut world = MockReduceWorld::default();
+        let kt = target(1, Vec3 { x: 1.0, y: 0.0, z: 0.0 });
+        let mut state = VelocityReduceState::default();
+        state.target = Some(kt);
+        state.remaining_attack_count = 1;
+        let mut module = velocity_reduce();
+        velocity_reduce_tick_handler(&mut module, &mut state, &mut world, true, Some(1));
+        let context = ctx(false, None, &[], None);
+        let mut input = VelocityReduceInput::default();
+        input.backwards = true;
+        assert_eq!(
+            velocity_reduce_movement_input_handler(&mut module, &mut state, &context, Vec3 { x: 0.0, y: 0.0, z: 0.0 }, false, &mut input),
+            VelocityReduceMovementOutcome::Untouched
+        );
+        assert!(input.forwards);
+        assert!(!input.backwards);
+    }
+
+    #[test]
+    fn velocity_reduce_esp_data_needs_lag_and_a_tracked_position() {
+        let near = target(8, Vec3 { x: 3.0, y: 0.0, z: 0.0 });
+        let mut state = VelocityReduceState::default();
+
+        // Not lagging: none
+        assert_eq!(velocity_reduce_esp_data(&state), None);
+
+        // Lagging without a tracked position: none
+        state.lag_ticks = 3;
+        state.render_target = Some(near);
+        assert_eq!(velocity_reduce_esp_data(&state), None);
+
+        // Lagging with a tracked position: id, base, rotation
+        state.render_target_pos = Some(VelocityTrackedEntityPosition::new(near));
+        assert_eq!(
+            velocity_reduce_esp_data(&state),
+            Some((8, near.pos, (10.0, 0.0)))
+        );
     }
 }

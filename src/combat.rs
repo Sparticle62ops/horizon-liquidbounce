@@ -5372,9 +5372,36 @@ pub struct TbHooks<'a> {
     pub attack_pressed: bool,
     /// Upstream `mc.options.keyAttack.wasPressedRecently(250)`.
     pub attack_recently_pressed: bool,
-    /// Upstream `Advantage.paysOff(hit, path, landing, landingDelay)`, ported
-    /// with the Advantage group in the next part.
-    pub advantage_pays_off: Box<dyn Fn(&TbHit, &[TbSnapshot], usize, i64) -> bool + 'a>,
+    /// Upstream `Timer.hold(this, ticks)`: the engine holds back up to `ticks`
+    /// while the hold handler re-plans.
+    pub timer_hold: Box<dyn FnMut(i64) + 'a>,
+    /// Upstream `Timer.burst(ticks, range)`: bursts up to the range around
+    /// `ticks`, returns the ticks actually burst.
+    pub timer_burst: Box<dyn FnMut(i64, i64, i64) -> i64 + 'a>,
+    /// Upstream `Timer.heldTicksWithin(ticks)`.
+    pub timer_held_ticks_within: Box<dyn Fn(i64) -> i64 + 'a>,
+    /// Upstream `killAuraClicksAt(ticks)`, already carrying
+    /// `!KillAura.running || target == null || clicker.willClickAt(ticks)`.
+    pub killaura_clicks_at: Box<dyn Fn(i64) -> bool + 'a>,
+    /// Upstream `ModuleCriticals.running || KillAura.running &&
+    /// KillAura.criticalsSelectionMode != IGNORE`.
+    pub prefers_critical: bool,
+    /// Upstream `ModuleCriticals.allowsCriticalHit(ignoreOnGround = true)`.
+    pub criticals_allows_hit: bool,
+    /// Upstream `player.isSprinting`.
+    pub is_sprinting: bool,
+    /// Upstream `player.ping`, in milliseconds.
+    pub player_ping_ms: f64,
+    /// Upstream `PositionExtrapolation.getBestForEntity(entity).getPositionInTicks(ticks)`.
+    pub extrapolated_position: Box<dyn Fn(u64, f64) -> [f64; 3] + 'a>,
+    /// Upstream `enemy.hurtTime / hurtDuration / armorKnockbackResistance /
+    /// eyeHeight`, and `enemy.serverPosition - enemy.position()`.
+    pub enemy_info: Box<dyn Fn(u64) -> Option<TbEnemy> + 'a>,
+    /// Upstream `CombatManager.attackCooldownProgress(enemy, ticks)` for enemy
+    /// players, `None` for non-players.
+    pub enemy_attack_cooldown_progress: Box<dyn Fn(u64, f64) -> Option<f64> + 'a>,
+    /// Upstream `player.getBoundingBoxAt(pos)`.
+    pub bounding_box_at: Box<dyn Fn([f64; 3]) -> TbBox + 'a>,
     /// Upstream `TickBaseVisuals.show(path, ticks, point)`.
     pub visuals_show: Box<dyn FnMut(&[[f64; 3]], Option<usize>, Option<[f64; 3]>) + 'a>,
     /// Upstream `TickBaseVisuals.clear()`.
@@ -5573,7 +5600,7 @@ pub fn tick_base_timer_boost_timer_speed(
         path_after.extend(after);
         tb_requirements_met(module, hooks, hit.point)
             && tb_cooldown_ready(module, hooks, landing_delay)
-            && (hooks.advantage_pays_off)(hit, path_after.as_slice(), path.len() - 1, landing_delay)
+            && tb_advantage_pays_off(module, hooks, hit, &path_after, path.len() - 1, landing_delay)
     });
     (hooks.visuals_show)(
         &path.iter().map(|s| s.pos).collect::<Vec<_>>(),
@@ -5610,14 +5637,14 @@ pub fn tick_base_timer_boost_timer_speed(
 pub fn tick_base_speed_handler(
     module: &Module,
     boost_state: &mut TbTimerBoostState,
+    burst_state: &TbBurstState,
     hooks: &mut TbHooks,
     rolled: &mut Option<bool>,
     roll: f64,
 ) {
-    // HoldFirst / BurstFirst: their tickHandler and its `busy` pin are ported
-    // in the next part; until then their `timerSpeed()` sees busy == false.
     let speed = match tb_mode(module) {
         "Timer" => tick_base_timer_boost_timer_speed(module, boost_state, hooks, rolled, roll),
+        "HoldFirst" | "BurstFirst" => tick_base_burst_timer_speed(burst_state),
         _ => None,
     }
     .or_else(|| tick_base_charging_speed(module, hooks));
@@ -5668,9 +5695,554 @@ pub fn tick_base() -> Module {
     )
 }
 
+// ----- ModuleTickBase.kt part 2: Advantage + BurstMode -----
+
+/// The enemy-side facts `Advantage` reads, from the world seam.
+#[derive(Clone, Copy, Debug)]
+pub struct TbEnemy {
+    pub hurt_time: i64,
+    pub hurt_duration: i64,
+    pub is_player: bool,
+    pub armor_knockback_resistance: f64,
+    pub eye_height: f64,
+    /// Upstream `enemy.serverPosition.subtract(enemy.position())`.
+    pub server_offset: [f64; 3],
+}
+
+/// Upstream `player.getBoundingBoxAt(pos)` reduced to what the range check
+/// reads: the distance from a point to the box.
+#[derive(Clone, Copy, Debug)]
+pub struct TbBox {
+    pub min: [f64; 3],
+    pub max: [f64; 3],
+}
+
+impl TbBox {
+    /// Upstream `AABB.distanceToSqr(point)`.
+    pub fn distance_to_sqr(&self, point: [f64; 3]) -> f64 {
+        let dx = (self.min[0] - point[0]).max(point[0] - self.max[0]).max(0.0);
+        let dy = (self.min[1] - point[1]).max(point[1] - self.max[1]).max(0.0);
+        let dz = (self.min[2] - point[2]).max(point[2] - self.max[2]).max(0.0);
+        dx * dx + dy * dy + dz * dz
+    }
+}
+
+/// Upstream `Vec3.normalize()`: a zero vector stays zero.
+fn tb_normalize(v: [f64; 3]) -> [f64; 3] {
+    let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    if len == 0.0 {
+        [0.0, 0.0, 0.0]
+    } else {
+        [v[0] / len, v[1] / len, v[2] / len]
+    }
+}
+
+/// Upstream `Advantage`: boosts only when the hit wins the exchange: the enemy
+/// is not invulnerable when it lands, and cannot hit back within
+/// `KnockbackTicks` ticks. That is the case when the knockback pushes it out of
+/// `EnemyRange` of us, when its own attack cooldown is not full yet, or when
+/// our hit is critical. The last two apply only where the server has an attack
+/// cooldown.
+fn tb_advantage_pays_off(
+    module: &Module,
+    hooks: &TbHooks,
+    hit: &TbHit,
+    path: &[TbSnapshot],
+    landing: usize,
+    landing_delay: i64,
+) -> bool {
+    let enemy = (hooks.enemy_info)(hit.entity);
+    if !tb_setting_bool(module, "Advantage", true) || enemy.is_none() {
+        return true;
+    }
+    let enemy = enemy.unwrap();
+
+    // Invulnerable when the hit reaches the server, so it takes no knockback
+    // and hits back. The hurt time is a round trip late, and did not count
+    // down while ticks were held since it arrived
+    let hurt_time = enemy.hurt_time
+        - (hooks.timer_held_ticks_within)(enemy.hurt_duration - enemy.hurt_time);
+    if tb_setting_bool(module, "SkipInvulnerable", true)
+        && hurt_time > landing_delay + (hooks.player_ping_ms / 50.0) as i64
+    {
+        return false;
+    }
+
+    let modern = hooks.has_cooldown;
+    let strength = if modern {
+        (hooks.attack_cooldown_progress)(landing_delay)
+    } else {
+        1.0
+    };
+    let critical = modern
+        && tb_setting_bool(module, "Criticals", true)
+        && tb_advantage_is_critical(hooks, path[landing], strength);
+    // Our hit reaches the server half a ping after we send it
+    let knockback_end = landing_delay as f64
+        + hooks.player_ping_ms / 2.0 / 50.0
+        + tb_setting_i64(module, "KnockbackTicks", 2) as f64;
+    let enemy_strength = if enemy.is_player
+        && modern
+        && tb_setting_bool(module, "EnemyCooldown", true)
+    {
+        (hooks.enemy_attack_cooldown_progress)(hit.entity, knockback_end)
+    } else {
+        None
+    };
+    // Vanilla's threshold for sprint knockback and crits
+    let sprint_hit = hooks.is_sprinting && strength > 0.9;
+    let range = tb_advantage_range_after_knockback(
+        module, hooks, &enemy, hit.entity, path, landing, landing_delay, sprint_hit,
+    );
+    range > tb_setting_f64(module, "EnemyRange", 3.0)
+        || critical
+        || enemy_strength.map_or(false, |s| s <= 0.9)
+}
+
+/// Upstream `Advantage.rangeAfterKnockback(...)`: how far the enemy is from us
+/// `KnockbackTicks` ticks after the knockback of our hit, which lands with the
+/// player at `landing` of `path`, `landingDelay` ticks of real time from now.
+#[allow(clippy::too_many_arguments)]
+fn tb_advantage_range_after_knockback(
+    module: &Module,
+    hooks: &TbHooks,
+    enemy: &TbEnemy,
+    entity: u64,
+    path: &[TbSnapshot],
+    landing: usize,
+    landing_delay: i64,
+    sprint_hit: bool,
+) -> f64 {
+    // The prediction starts where the client draws the enemy, which falls
+    // behind the server while ticks are held
+    let predicted = (hooks.extrapolated_position)(entity, landing_delay as f64);
+    let mut feet = [
+        predicted[0] + enemy.server_offset[0],
+        predicted[1] + enemy.server_offset[1],
+        predicted[2] + enemy.server_offset[2],
+    ];
+    // The server halves the motion it has of the enemy. Of players it only has
+    // what is left of earlier knockback, and their client takes the result as
+    // its new motion
+    let before = if enemy.is_player {
+        [0.0, 0.0, 0.0]
+    } else {
+        let next = (hooks.extrapolated_position)(entity, landing_delay as f64 + 1.0);
+        [
+            next[0] + enemy.server_offset[0] - feet[0],
+            next[1] + enemy.server_offset[1] - feet[1],
+            next[2] + enemy.server_offset[2] - feet[2],
+        ]
+    };
+    let mut motion = tb_advantage_knockback(
+        module, hooks, entity, path[landing].pos, feet, before, sprint_hit,
+    );
+
+    for _ in 0..tb_setting_i64(module, "KnockbackTicks", 2) {
+        feet = [feet[0] + motion[0], feet[1] + motion[1], feet[2] + motion[2]];
+        // Knockback lifts the enemy off the ground, where only the air slows
+        // it down
+        motion = [motion[0] * 0.91, motion[1] * 0.91, motion[2] * 0.91];
+    }
+
+    let landing_pos = path[(landing + tb_setting_i64(module, "KnockbackTicks", 2) as usize)
+        .min(path.len() - 1)]
+    .pos;
+    let point = [feet[0], feet[1] + enemy.eye_height, feet[2]];
+    ((hooks.bounding_box_at)(landing_pos)).distance_to_sqr(point).sqrt()
+}
+
+/// Upstream `Advantage.knockback(enemy, from, at, motion, sprintHit)`: the
+/// horizontal motion of the enemy at `at` after our hit from `from`, with the
+/// server having `motion` of it before.
+fn tb_advantage_knockback(
+    module: &Module,
+    hooks: &TbHooks,
+    entity: u64,
+    from: [f64; 3],
+    at: [f64; 3],
+    motion: [f64; 3],
+    sprint_hit: bool,
+) -> [f64; 3] {
+    let away = tb_normalize([at[0] - from[0], 0.0, at[2] - from[2]]);
+    // Armor is the only knockback resistance known of other entities, the
+    // attribute is not synced
+    let resistance = (hooks.enemy_info)(entity)
+        .map_or(0.0, |e| e.armor_knockback_resistance)
+        .clamp(0.0, 1.0);
+    let strength = tb_setting_f64(module, "KnockbackMultiplier", 1.0) * (1.0 - resistance);
+    let knocked = [
+        motion[0] * 0.5 + away[0] * 0.4 * strength,
+        away[1] * 0.4 * strength,
+        motion[2] * 0.5 + away[2] * 0.4 * strength,
+    ];
+    if sprint_hit {
+        [
+            knocked[0] * 0.5 + away[0] * 0.5 * strength,
+            knocked[1] * 0.5 + away[1] * 0.5 * strength,
+            knocked[2] * 0.5 + away[2] * 0.5 * strength,
+        ]
+    } else {
+        knocked
+    }
+}
+
+/// Upstream `Advantage.isCritical(landing, strength)`: falling, a full enough
+/// cooldown, and not sprinting, which KillAura and Criticals stop for a
+/// critical hit.
+fn tb_advantage_is_critical(hooks: &TbHooks, landing: TbSnapshot, strength: f64) -> bool {
+    let can_crit = hooks.criticals_allows_hit
+        && (!hooks.is_sprinting || hooks.prefers_critical);
+    landing.falling() && strength > 0.9 && can_crit
+}
+
+/// Upstream `BurstMode.plan(snapshots, walk)`: the tick of `snapshots` to land
+/// the hit on after `walk` normal ticks, shown in the visuals. `None` when no
+/// hit lands and pays off, or the requirements are not met.
+fn tb_burst_plan(
+    module: &Module,
+    hooks: &mut TbHooks,
+    snapshots: Vec<TbSnapshot>,
+    walk: i64,
+) -> Option<usize> {
+    let max_ticks = tb_setting_i64(module, "MaxTicks", 4) as usize;
+    let knockback_ticks = tb_setting_i64(module, "KnockbackTicks", 2) as usize;
+    let walk = walk as usize;
+    let simulated: Vec<TbSnapshot> = snapshots
+        .into_iter()
+        .take(walk + max_ticks + 1 + knockback_ticks)
+        .collect();
+    let path: Vec<TbSnapshot> = simulated.iter().take(walk + max_ticks + 1).cloned().collect();
+    let hits: Vec<Option<TbHit>> = path
+        .iter()
+        .map(|snapshot| (hooks.hit_at)(snapshot.eyes(hooks.eye_height)))
+        .collect();
+    let ticks = tb_burst_ticks_to_hit(module, hooks, &path, &hits, walk, &simulated);
+    let hit = ticks
+        .and_then(|tick| hits[tick])
+        .filter(|hit| tb_requirements_met(module, hooks, hit.point));
+    (hooks.visuals_show)(
+        &path.iter().map(|snapshot| snapshot.pos).collect::<Vec<_>>(),
+        ticks.filter(|_| hit.is_some()),
+        hit.map(|hit| hit.point),
+    );
+    ticks.filter(|_| hit.is_some())
+}
+
+/// Upstream `BurstMode.ticksToHit(...)`: the tick of `path` to land the hit
+/// on, preferring a critical one, with `walk` normal ticks before the burst.
+/// `None` when no hit lands on `path` and pays off, or one lands by just
+/// walking without a critical hit to wait for.
+fn tb_burst_ticks_to_hit(
+    module: &Module,
+    hooks: &TbHooks,
+    path: &[TbSnapshot],
+    hits: &[Option<TbHit>],
+    walk: usize,
+    simulated: &[TbSnapshot],
+) -> Option<usize> {
+    let in_range: Vec<usize> = (0..path.len()).filter(|i| hits[*i].is_some()).collect();
+    let first = *in_range.first()?;
+
+    // The n-th game tick from now moves the player to path[n + 1], held ticks
+    // are no game ticks
+    let landing: Vec<usize> = in_range
+        .iter()
+        .copied()
+        .filter(|tick| {
+            let delay = tb_burst_landing_delay(module, hooks, *tick as i64, walk as i64);
+            *tick > walk
+                && (hooks.killaura_clicks_at)(*tick as i64 - 1)
+                && tb_cooldown_ready(module, hooks, delay)
+                && hits[*tick].map_or(false, |hit| {
+                    tb_advantage_pays_off(module, hooks, &hit, simulated, *tick, delay)
+                })
+        })
+        .collect();
+    let critical = if hooks.prefers_critical {
+        landing.iter().copied().find(|tick| path[*tick].falling())
+    } else {
+        None
+    };
+
+    if let Some(critical) = critical {
+        Some(critical)
+    } else if first <= walk {
+        None
+    } else {
+        landing.first().copied()
+    }
+}
+
+/// Upstream `BurstMode.landingDelay(tick, walk)`: ticks of real time until the
+/// hit on `tick` of the path lands; the normal ticks before the burst, and
+/// when holding first, the held ticks the balance does not pay for yet.
+fn tb_burst_landing_delay(module: &Module, hooks: &TbHooks, tick: i64, walk: i64) -> i64 {
+    let _ = module;
+    if tb_mode(module) == "HoldFirst" {
+        walk + (tick - walk - hooks.timer_balance as i64).max(0)
+    } else {
+        walk
+    }
+}
+
+/// Upstream `BurstMode.delay.random()`, `Delay` `IntRange` in `0..20`.
+fn tb_burst_delay_random(module: &Module, roll: f64) -> i64 {
+    let (from, to) = module
+        .setting("Delay")
+        .map(|value| &value.kind)
+        .and_then(|kind| kind.int_range())
+        .unwrap_or((0, 0));
+    from + (roll * ((to - from + 1) as f64)).floor() as i64
+}
+
+/// The upstream `BurstMode` coroutine translated to a per-tick state machine:
+/// `waitTicks` is a phase with a countdown, resumed by
+/// `tick_base_burst_tick_handler` each game tick.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum TbBurstPhase {
+    Idle,
+    /// `Timer.hold(this, MaxTicks)`, re-planned by the hold handler each tick.
+    Holding,
+    /// `waitTicks(1)` right after the hold released.
+    AfterHold,
+    /// `waitTicks(delayTicks)` before bursting.
+    PreBurst,
+    /// `waitTicks(burst + ...)`; carries the ticks BurstFirst holds back after
+    /// the burst.
+    PostBurst { hold_back: i64 },
+    /// `waitTicks(1 + cooldown.random())` after BurstFirst's hold-back.
+    PostHoldBack,
+    /// `waitTicks(cooldown.random())` after a failed re-plan.
+    Cooldown,
+}
+
+/// Upstream `BurstMode` state: `busy`, `walkAfterHold`, `plannedAtBalance`,
+/// plus the coroutine's phase, countdowns and captured locals.
+#[derive(Debug)]
+pub struct TbBurstState {
+    /// Set while bursting and paying for it, when the game has to run at the
+    /// normal speed.
+    pub busy: bool,
+    /// While holding first, the normal ticks that will run between the hold
+    /// and the burst.
+    pub walk_after_hold: Option<i64>,
+    /// Upstream `plannedAtBalance` (`Float.NaN` while unset).
+    pub planned_at_balance: Option<f64>,
+    pub phase: TbBurstPhase,
+    pub wait: i64,
+    /// The `walk` captured for the pending re-plan.
+    pub plan_walk: i64,
+    pub delay_ticks: i64,
+    /// The burst ticks from the last re-plan, paid for by `PreBurst`.
+    pub burst_ticks: i64,
+}
+
+impl Default for TbBurstState {
+    fn default() -> Self {
+        Self {
+            busy: false,
+            walk_after_hold: None,
+            planned_at_balance: None,
+            phase: TbBurstPhase::Idle,
+            wait: 0,
+            plan_walk: 0,
+            delay_ticks: 0,
+            burst_ticks: 0,
+        }
+    }
+}
+
+/// Upstream `BurstMode.timerSpeed()`: the game runs at the normal speed while
+/// the burst is running and paid for.
+pub fn tick_base_burst_timer_speed(state: &TbBurstState) -> Option<f64> {
+    Some(1.0).filter(|_| state.busy)
+}
+
+/// Upstream `BurstMode.tickHandler` with its `holdHandler`, one call per game
+/// tick. `roll` feeds `rollChance()`, `cooldown_roll` and `delay_roll` feed
+/// `Cooldown.random()` / `Delay.random()`.
+pub fn tick_base_burst_tick_handler(
+    module: &Module,
+    state: &mut TbBurstState,
+    hooks: &mut TbHooks,
+    rolled: &mut Option<bool>,
+    roll: f64,
+    cooldown_roll: f64,
+    delay_roll: f64,
+) {
+    (hooks.visuals_clear)();
+
+    if state.phase != TbBurstPhase::Idle {
+        tick_base_burst_resume(module, state, hooks, rolled, cooldown_roll);
+        return;
+    }
+
+    // We do not want this module to conflict with blink
+    if hooks.in_vehicle || hooks.blink_running {
+        return;
+    }
+
+    let delay_ticks = tb_burst_delay_random(module, delay_roll);
+    // The current tick still runs. Holding first then runs the delay and the
+    // tick the burst follows, so the player covers them at the normal speed
+    let walk = if tb_mode(module) == "HoldFirst" {
+        delay_ticks + 2
+    } else {
+        1
+    };
+    let snapshots = (hooks.snapshots_from_now)();
+    let ticks = tb_burst_plan(module, hooks, snapshots, walk);
+    let Some(ticks) = ticks else {
+        *rolled = None;
+        return;
+    };
+    if !tb_roll_chance(module, rolled, roll) {
+        return;
+    }
+    *rolled = None;
+
+    state.busy = true;
+    state.delay_ticks = delay_ticks;
+    if tb_mode(module) == "HoldFirst" {
+        // `holdFirst(delayTicks)`: holds back ticks until the hold handler
+        // finds the balance pays for the burst, then bursts after the delay.
+        state.plan_walk = delay_ticks + 1;
+        state.walk_after_hold = Some(state.plan_walk);
+        state.planned_at_balance = None;
+        (hooks.timer_hold)(tb_setting_i64(module, "MaxTicks", 4));
+        state.phase = TbBurstPhase::Holding;
+    } else {
+        // `burstFirst(ticks - walk)`: bursts right away and holds back the
+        // ticks the charged balance does not cover after the delay.
+        let charged = (hooks.timer_balance as i64).clamp(0, tb_setting_i64(module, "MaxBalance", 3));
+        let burst = (hooks.timer_burst)(
+            ticks as i64 - walk,
+            -tb_setting_i64(module, "MaxTicks", 4),
+            tb_setting_i64(module, "MaxBalance", 3),
+        );
+        state.phase = TbBurstPhase::PostBurst {
+            hold_back: (burst - charged).max(0),
+        };
+        state.wait = burst + delay_ticks;
+    }
+}
+
+/// `waitTicks`: countdown; `true` when the wait is over and the body runs.
+fn tb_burst_wait_done(state: &mut TbBurstState) -> bool {
+    if state.wait > 0 {
+        state.wait -= 1;
+        state.wait == 0
+    } else {
+        true
+    }
+}
+
+/// Upstream `finally { busy = false; walkAfterHold = null }`.
+fn tick_base_burst_finally(state: &mut TbBurstState) {
+    state.busy = false;
+    state.walk_after_hold = None;
+    state.phase = TbBurstPhase::Idle;
+}
+
+/// Upstream `disable() { busy = false; walkAfterHold = null; super.disable() }`
+/// (the coroutine's cancellation folded in).
+pub fn tick_base_burst_disable(state: &mut TbBurstState) {
+    state.busy = false;
+    state.walk_after_hold = None;
+    state.planned_at_balance = None;
+    state.phase = TbBurstPhase::Idle;
+    state.wait = 0;
+}
+
+/// The `waitTicks` resumes of the upstream `BurstMode` coroutine, plus its
+/// hold handler while the hold is running.
+fn tick_base_burst_resume(
+    module: &Module,
+    state: &mut TbBurstState,
+    hooks: &mut TbHooks,
+    rolled: &mut Option<bool>,
+    cooldown_roll: f64,
+) {
+    match state.phase {
+        TbBurstPhase::Idle => {}
+        TbBurstPhase::Holding => {
+            // Upstream `holdHandler`: plans the burst again with every tick
+            // held, against where the target is now. Releases the hold once
+            // the balance pays for it, or the hit is gone.
+            let walk = state.walk_after_hold.unwrap_or(0);
+            if Some(hooks.timer_balance) == state.planned_at_balance {
+                return;
+            }
+            state.planned_at_balance = Some(hooks.timer_balance);
+
+            let snapshots = (hooks.snapshots_from_now)();
+            let ticks = tb_burst_plan(module, hooks, snapshots, walk);
+            let release = ticks.map_or(true, |t| t as i64 - walk <= hooks.timer_balance as i64);
+            if release {
+                state.walk_after_hold = None;
+                (hooks.timer_hold)(0);
+                state.phase = TbBurstPhase::AfterHold;
+                state.wait = 1;
+            }
+        }
+        TbBurstPhase::AfterHold => {
+            if !tb_burst_wait_done(state) {
+                return;
+            }
+            // Resumed with the first tick after the hold
+            state.walk_after_hold = None;
+            let snapshots = (hooks.snapshots_from_now)();
+            let ticks = tb_burst_plan(module, hooks, snapshots, state.plan_walk)
+                .map(|t| t as i64 - state.plan_walk);
+            if ticks.map_or(true, |t| t > hooks.timer_balance as i64) {
+                *rolled = None;
+                state.phase = TbBurstPhase::Cooldown;
+                state.wait = tb_cooldown_random(module, cooldown_roll);
+                return;
+            }
+            state.burst_ticks = ticks.unwrap();
+            state.wait = state.delay_ticks;
+            state.phase = TbBurstPhase::PreBurst;
+        }
+        TbBurstPhase::PreBurst => {
+            if !tb_burst_wait_done(state) {
+                return;
+            }
+            let burst = (hooks.timer_burst)(
+                state.burst_ticks,
+                0,
+                tb_setting_i64(module, "MaxBalance", 3) + tb_setting_i64(module, "MaxTicks", 4),
+            );
+            (hooks.visuals_clear)();
+            state.phase = TbBurstPhase::PostBurst { hold_back: 0 };
+            state.wait = burst + tb_cooldown_random(module, cooldown_roll);
+        }
+        TbBurstPhase::PostBurst { hold_back } => {
+            if !tb_burst_wait_done(state) {
+                return;
+            }
+            if hold_back > 0 {
+                // BurstFirst: holds back the uncovered ticks
+                (hooks.timer_hold)(hold_back);
+                state.phase = TbBurstPhase::PostHoldBack;
+                state.wait = 1 + tb_cooldown_random(module, cooldown_roll);
+            } else {
+                tick_base_burst_finally(state);
+            }
+        }
+        TbBurstPhase::PostHoldBack | TbBurstPhase::Cooldown => {
+            if !tb_burst_wait_done(state) {
+                return;
+            }
+            tick_base_burst_finally(state);
+        }
+    }
+}
 #[cfg(test)]
 mod tick_base_tests {
     use super::*;
+    use std::{cell::RefCell, rc::Rc};
 
     fn tb_snap(pos_x: f64) -> TbSnapshot {
         TbSnapshot { pos: [pos_x, 0.0, 0.0], on_ground: true, fall_distance: 0.0 }
@@ -5681,10 +6253,38 @@ mod tick_base_tests {
         hit: Option<TbHit>,
         hit_from: f64,
         speeds: &'a mut Vec<f64>,
+        holds: &'a Rc<RefCell<Vec<i64>>>,
+        bursts: &'a Rc<RefCell<Vec<(i64, i64, i64)>>>,
         visuals: &'a mut Vec<(Vec<[f64; 3]>, Option<usize>, Option<[f64; 3]>)>,
     ) -> TbHooks<'a> {
+        let enemy = Some(TbEnemy {
+            hurt_time: 0,
+            hurt_duration: 10,
+            is_player: false,
+            armor_knockback_resistance: 0.0,
+            eye_height: 1.62,
+            server_offset: [0.0, 0.0, 0.0],
+        });
         TbHooks {
             request_timer_speed: Box::new(move |s: f64| speeds.push(s)),
+            timer_hold: Box::new(move |t: i64| holds.borrow_mut().push(t)),
+            timer_burst: Box::new(move |ticks: i64, from: i64, to: i64| {
+                bursts.borrow_mut().push((ticks, from, to));
+                ticks.clamp(from, to)
+            }),
+            timer_held_ticks_within: Box::new(|_: i64| 0),
+            killaura_clicks_at: Box::new(|_: i64| true),
+            prefers_critical: false,
+            criticals_allows_hit: true,
+            is_sprinting: false,
+            player_ping_ms: 0.0,
+            extrapolated_position: Box::new(|_: u64, ticks: f64| [2.0 + 3.0 * ticks, 0.0, 0.0]),
+            enemy_info: Box::new(move |_: u64| enemy),
+            enemy_attack_cooldown_progress: Box::new(|_: u64, _: f64| None),
+            bounding_box_at: Box::new(|pos: [f64; 3]| TbBox {
+                min: [pos[0] - 0.3, pos[1], pos[2] - 0.3],
+                max: [pos[0] + 0.3, pos[1] + 1.8, pos[2] + 0.3],
+            }),
             timer_balance: 1.0,
             timer_spendable_ticks: Box::new(|max: i64| 10.0 * max as f64),
             snapshots_from_now: Box::new(move || snapshots.to_vec()),
@@ -5716,7 +6316,6 @@ mod tick_base_tests {
             look_angle: [1.0, 0.0, 0.0],
             attack_pressed: false,
             attack_recently_pressed: false,
-            advantage_pays_off: Box::new(|_: &TbHit, _: &[TbSnapshot], _: usize, _: i64| true),
             visuals_show: Box::new(move |p: &[[f64; 3]], t: Option<usize>, pt: Option<[f64; 3]>| {
                 visuals.push((p.to_vec(), t, pt));
             }),
@@ -5726,7 +6325,8 @@ mod tick_base_tests {
 
     #[test]
     fn tick_base_timer_boost_boosts_when_the_hit_pays_off() {
-        let module = tick_base();
+        let mut module = tick_base();
+        module.setting_mut("EnemyRange").unwrap().kind = ValueKind::Float(1.0, 0.0, 8.0);
         let snaps =
             vec![tb_snap(0.0), tb_snap(1.0), tb_snap(2.0), tb_snap(3.0)];
         let hit = TbHit { entity: 7, point: [2.0, 1.62, 0.0] };
@@ -5735,8 +6335,10 @@ mod tick_base_tests {
 
         let (speed, visuals) = {
             let mut speeds = Vec::new();
+            let holds = Rc::new(RefCell::new(Vec::new()));
+            let bursts = Rc::new(RefCell::new(Vec::new()));
             let mut visuals = Vec::new();
-            let mut hooks = tb_hooks(&snaps, Some(hit), 2.0, &mut speeds, &mut visuals);
+            let mut hooks = tb_hooks(&snaps, Some(hit), 2.0, &mut speeds, &holds, &bursts, &mut visuals);
             let speed =
                 tick_base_timer_boost_timer_speed(&module, &mut state, &mut hooks, &mut rolled, 0.5);
             drop(hooks);
@@ -5767,8 +6369,10 @@ mod tick_base_tests {
         // Tick 1: boosts.
         {
             let mut speeds = Vec::new();
+            let holds = Rc::new(RefCell::new(Vec::new()));
+            let bursts = Rc::new(RefCell::new(Vec::new()));
             let mut visuals = Vec::new();
-            let mut hooks = tb_hooks(&snaps, Some(hit), 2.0, &mut speeds, &mut visuals);
+            let mut hooks = tb_hooks(&snaps, Some(hit), 2.0, &mut speeds, &holds, &bursts, &mut visuals);
             assert_eq!(
                 tick_base_timer_boost_timer_speed(&module, &mut state, &mut hooks, &mut rolled, 0.5),
                 Some(5.0)
@@ -5779,8 +6383,10 @@ mod tick_base_tests {
         {
             let snaps = vec![tb_snap(0.0)];
             let mut speeds = Vec::new();
+            let holds = Rc::new(RefCell::new(Vec::new()));
+            let bursts = Rc::new(RefCell::new(Vec::new()));
             let mut visuals = Vec::new();
-            let mut hooks = tb_hooks(&snaps, None, 0.0, &mut speeds, &mut visuals);
+            let mut hooks = tb_hooks(&snaps, None, 0.0, &mut speeds, &holds, &bursts, &mut visuals);
             assert_eq!(
                 tick_base_timer_boost_timer_speed(&module, &mut state, &mut hooks, &mut rolled, 0.5),
                 None
@@ -5792,8 +6398,10 @@ mod tick_base_tests {
         // Tick 3: still cooling down (the falling edge opened it).
         {
             let mut speeds = Vec::new();
+            let holds = Rc::new(RefCell::new(Vec::new()));
+            let bursts = Rc::new(RefCell::new(Vec::new()));
             let mut visuals = Vec::new();
-            let mut hooks = tb_hooks(&snaps, Some(hit), 2.0, &mut speeds, &mut visuals);
+            let mut hooks = tb_hooks(&snaps, Some(hit), 2.0, &mut speeds, &holds, &bursts, &mut visuals);
             assert_eq!(
                 tick_base_timer_boost_timer_speed(&module, &mut state, &mut hooks, &mut rolled, 0.5),
                 None
@@ -5804,8 +6412,10 @@ mod tick_base_tests {
         // Tick 4: the cooldown is spent, it boosts again.
         {
             let mut speeds = Vec::new();
+            let holds = Rc::new(RefCell::new(Vec::new()));
+            let bursts = Rc::new(RefCell::new(Vec::new()));
             let mut visuals = Vec::new();
-            let mut hooks = tb_hooks(&snaps, Some(hit), 2.0, &mut speeds, &mut visuals);
+            let mut hooks = tb_hooks(&snaps, Some(hit), 2.0, &mut speeds, &holds, &bursts, &mut visuals);
             assert_eq!(
                 tick_base_timer_boost_timer_speed(&module, &mut state, &mut hooks, &mut rolled, 0.5),
                 Some(5.0)
@@ -5816,26 +6426,33 @@ mod tick_base_tests {
 
     #[test]
     fn tick_base_charges_while_an_enemy_is_near_but_out_of_reach() {
-        let module = tick_base();
+        let mut module = tick_base();
+        module.setting_mut("EnemyRange").unwrap().kind = ValueKind::Float(1.0, 0.0, 8.0);
         let snaps = vec![tb_snap(0.0)];
 
         // Enemy near, no reachable hit, balance below MaxBalance.
         let mut speeds = Vec::new();
+        let holds = Rc::new(RefCell::new(Vec::new()));
+        let bursts = Rc::new(RefCell::new(Vec::new()));
         let mut visuals = Vec::new();
-        let hooks = tb_hooks(&snaps, None, 0.0, &mut speeds, &mut visuals);
+        let hooks = tb_hooks(&snaps, None, 0.0, &mut speeds, &holds, &bursts, &mut visuals);
         assert_eq!(tick_base_charging_speed(&module, &hooks), Some(0.9));
 
         // A reachable hit means it is not just charging.
         let hit = TbHit { entity: 7, point: [2.0, 1.62, 0.0] };
         let mut speeds = Vec::new();
+        let holds = Rc::new(RefCell::new(Vec::new()));
+        let bursts = Rc::new(RefCell::new(Vec::new()));
         let mut visuals = Vec::new();
-        let hooks = tb_hooks(&snaps, Some(hit), 0.0, &mut speeds, &mut visuals);
+        let hooks = tb_hooks(&snaps, Some(hit), 0.0, &mut speeds, &holds, &bursts, &mut visuals);
         assert_eq!(tick_base_charging_speed(&module, &hooks), None);
     }
 
     #[test]
     fn tick_base_speed_handler_requests_boost_then_charging() {
-        let module = tick_base();
+        let burst_state = TbBurstState::default();
+        let mut module = tick_base();
+        module.setting_mut("EnemyRange").unwrap().kind = ValueKind::Float(1.0, 0.0, 8.0);
         let snaps = vec![tb_snap(0.0), tb_snap(1.0), tb_snap(2.0), tb_snap(3.0)];
         let hit = TbHit { entity: 7, point: [2.0, 1.62, 0.0] };
         let mut state = TbTimerBoostState::default();
@@ -5844,9 +6461,11 @@ mod tick_base_tests {
         // Timer mode with a payable hit: the boost speed.
         let first = {
             let mut speeds = Vec::new();
+            let holds = Rc::new(RefCell::new(Vec::new()));
+            let bursts = Rc::new(RefCell::new(Vec::new()));
             let mut visuals = Vec::new();
-            let mut hooks = tb_hooks(&snaps, Some(hit), 2.0, &mut speeds, &mut visuals);
-            tick_base_speed_handler(&module, &mut state, &mut hooks, &mut rolled, 0.5);
+            let mut hooks = tb_hooks(&snaps, Some(hit), 2.0, &mut speeds, &holds, &bursts, &mut visuals);
+            tick_base_speed_handler(&module, &mut state, &burst_state, &mut hooks, &mut rolled, 0.5);
             drop(hooks);
             speeds
         };
@@ -5858,9 +6477,11 @@ mod tick_base_tests {
         module.setting_mut("Mode").unwrap().kind = ValueKind::Choice("HoldFirst".into(), Vec::new());
         let second = {
             let mut speeds = Vec::new();
+            let holds = Rc::new(RefCell::new(Vec::new()));
+            let bursts = Rc::new(RefCell::new(Vec::new()));
             let mut visuals = Vec::new();
-            let mut hooks = tb_hooks(&snaps, None, 0.0, &mut speeds, &mut visuals);
-            tick_base_speed_handler(&module, &mut state, &mut hooks, &mut rolled, 0.5);
+            let mut hooks = tb_hooks(&snaps, None, 0.0, &mut speeds, &holds, &bursts, &mut visuals);
+            tick_base_speed_handler(&module, &mut state, &burst_state, &mut hooks, &mut rolled, 0.5);
             drop(hooks);
             speeds
         };
@@ -5875,8 +6496,10 @@ mod tick_base_tests {
 
         // KillAura off → the default Requirement fails.
         let mut speeds = Vec::new();
+        let holds = Rc::new(RefCell::new(Vec::new()));
+        let bursts = Rc::new(RefCell::new(Vec::new()));
         let mut visuals = Vec::new();
-        let mut hooks = tb_hooks(&snaps, Some(hit), 2.0, &mut speeds, &mut visuals);
+        let mut hooks = tb_hooks(&snaps, Some(hit), 2.0, &mut speeds, &holds, &bursts, &mut visuals);
         hooks.killaura_engaged = false;
         assert!(!tb_requirements_met(&module, &hooks, hit.point));
 
@@ -5908,11 +6531,195 @@ mod tick_base_tests {
         let mut rolled: Option<bool> = Some(true);
         {
             let mut speeds = Vec::new();
+            let holds = Rc::new(RefCell::new(Vec::new()));
+            let bursts = Rc::new(RefCell::new(Vec::new()));
             let mut visuals = Vec::new();
             let snaps: Vec<TbSnapshot> = Vec::new();
-            let mut hooks = tb_hooks(&snaps, None, 0.0, &mut speeds, &mut visuals);
+            let mut hooks = tb_hooks(&snaps, None, 0.0, &mut speeds, &holds, &bursts, &mut visuals);
             tick_base_on_disabled(&mut hooks, &mut rolled);
         }
         assert!(rolled.is_none());
+    }
+    #[test]
+    fn tick_base_advantage_pays_off_flags_an_invulnerable_enemy() {
+        let mut module = tick_base();
+        module.setting_mut("EnemyRange").unwrap().kind =
+            ValueKind::Float(1.0, 0.0, 8.0);
+        let snaps = vec![tb_snap(0.0), tb_snap(1.0), tb_snap(2.0)];
+        let path = snaps.clone();
+        let hit = TbHit { entity: 7, point: [2.0, 1.62, 0.0] };
+        let mut speeds = Vec::new();
+        let holds = Rc::new(RefCell::new(Vec::new()));
+        let bursts = Rc::new(RefCell::new(Vec::new()));
+        let mut visuals = Vec::new();
+
+        // The enemy is fine: the knockback pushes it out of range
+        {
+            let hooks = tb_hooks(&snaps, Some(hit), 2.0, &mut speeds, &holds, &bursts, &mut visuals);
+            assert!(tb_advantage_pays_off(&module, &hooks, &hit, &path, 2, 1));
+        }
+        // Still invulnerable one round trip late: it takes no knockback and
+        // hits back
+        {
+            let mut hooks = tb_hooks(&snaps, Some(hit), 2.0, &mut speeds, &holds, &bursts, &mut visuals);
+            hooks.enemy_info = Box::new(|_: u64| {
+                Some(TbEnemy {
+                    hurt_time: 20,
+                    hurt_duration: 10,
+                    is_player: false,
+                    armor_knockback_resistance: 0.0,
+                    eye_height: 1.62,
+                    server_offset: [0.0, 0.0, 0.0],
+                })
+            });
+            assert!(!tb_advantage_pays_off(&module, &hooks, &hit, &path, 2, 1));
+        }
+    }
+
+    #[test]
+    fn tick_base_advantage_knockback_adds_the_sprint_hit() {
+        let module = tick_base();
+        let mut speeds = Vec::new();
+        let holds = Rc::new(RefCell::new(Vec::new()));
+        let bursts = Rc::new(RefCell::new(Vec::new()));
+        let mut visuals = Vec::new();
+        let hooks = tb_hooks(&[], None, 0.0, &mut speeds, &holds, &bursts, &mut visuals);
+
+        // Half of the enemy's motion, plus the knockback away from the hit
+        let plain = tb_advantage_knockback(
+            &module, &hooks, 7, [0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [1.0, 0.0, 0.0], false,
+        );
+        assert_eq!(plain, [0.9, 0.0, 0.0]);
+        // A sprint hit halves it again and adds the sprint knockback
+        let sprint = tb_advantage_knockback(
+            &module, &hooks, 7, [0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [1.0, 0.0, 0.0], true,
+        );
+        assert_eq!(sprint, [0.95, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn tick_base_hold_first_holds_until_the_balance_pays_then_bursts() {
+        let mut module = tick_base();
+        module.setting_mut("Mode").unwrap().kind = ValueKind::Choice(
+            "HoldFirst".to_string(),
+            vec![
+                "Timer".to_string(),
+                "HoldFirst".to_string(),
+                "BurstFirst".to_string(),
+            ],
+        );
+        let snaps: Vec<TbSnapshot> = (0..6).map(|i| tb_snap(i as f64)).collect();
+        let hit = TbHit { entity: 7, point: [4.0, 1.62, 0.0] };
+        let mut state = TbBurstState::default();
+        let mut rolled: Option<bool> = None;
+        let mut speeds = Vec::new();
+        let holds = Rc::new(RefCell::new(Vec::new()));
+        let bursts = Rc::new(RefCell::new(Vec::new()));
+        let mut visuals = Vec::new();
+        let mut hooks = tb_hooks(&snaps, Some(hit), 3.5, &mut speeds, &holds, &bursts, &mut visuals);
+
+        // Tick 1: the burst is planned, the hold starts, the game pins at 1.0
+        tick_base_burst_tick_handler(&module, &mut state, &mut hooks, &mut rolled, 0.5, 0.5, 0.5);
+        assert!(state.busy);
+        assert_eq!(state.phase, TbBurstPhase::Holding);
+        assert_eq!(*holds.borrow(), vec![4]);
+        assert_eq!(tick_base_burst_timer_speed(&state), Some(1.0));
+
+        // The balance pays for the burst: the hold handler releases
+        hooks.timer_balance = 3.0;
+        tick_base_burst_tick_handler(&module, &mut state, &mut hooks, &mut rolled, 0.5, 0.5, 0.5);
+        assert_eq!(state.phase, TbBurstPhase::AfterHold);
+        assert_eq!(*holds.borrow(), vec![4, 0]);
+
+        // waitTicks(1) runs, the re-plan pays, the delay (0 ticks) runs
+        tick_base_burst_tick_handler(&module, &mut state, &mut hooks, &mut rolled, 0.5, 0.5, 0.5);
+        assert_eq!(state.phase, TbBurstPhase::PreBurst);
+
+        // The burst bursts the 3 ticks it held, then the cooldown wait
+        // (0 ticks)
+        tick_base_burst_tick_handler(&module, &mut state, &mut hooks, &mut rolled, 0.5, 0.5, 0.5);
+        assert_eq!(*bursts.borrow(), vec![(3, 0, 7)]);
+        assert_eq!(state.phase, TbBurstPhase::PostBurst { hold_back: 0 });
+
+        // The burst wait runs, and the coroutine ends
+        tick_base_burst_tick_handler(&module, &mut state, &mut hooks, &mut rolled, 0.5, 0.5, 0.5);
+        tick_base_burst_tick_handler(&module, &mut state, &mut hooks, &mut rolled, 0.5, 0.5, 0.5);
+        tick_base_burst_tick_handler(&module, &mut state, &mut hooks, &mut rolled, 0.5, 0.5, 0.5);
+        assert!(!state.busy);
+        assert_eq!(state.phase, TbBurstPhase::Idle);
+    }
+
+    #[test]
+    fn tick_base_burst_first_bursts_then_holds_back_the_uncovered_ticks() {
+        let mut module = tick_base();
+        module.setting_mut("Mode").unwrap().kind = ValueKind::Choice(
+            "BurstFirst".to_string(),
+            vec![
+                "Timer".to_string(),
+                "HoldFirst".to_string(),
+                "BurstFirst".to_string(),
+            ],
+        );
+        let snaps: Vec<TbSnapshot> = (0..6).map(|i| tb_snap(i as f64)).collect();
+        let hit = TbHit { entity: 7, point: [4.0, 1.62, 0.0] };
+        let mut state = TbBurstState::default();
+        let mut rolled: Option<bool> = None;
+        let mut speeds = Vec::new();
+        let holds = Rc::new(RefCell::new(Vec::new()));
+        let bursts = Rc::new(RefCell::new(Vec::new()));
+        let mut visuals = Vec::new();
+        let mut hooks = tb_hooks(&snaps, Some(hit), 3.5, &mut speeds, &holds, &bursts, &mut visuals);
+        hooks.timer_balance = 2.0;
+
+        // Tick 1: plans 4 ticks, bursts 3 of them (2 are charged), and holds
+        // back the uncovered 1 after the delay (0 ticks)
+        tick_base_burst_tick_handler(&module, &mut state, &mut hooks, &mut rolled, 0.5, 0.5, 0.5);
+        assert!(state.busy);
+        assert_eq!(*bursts.borrow(), vec![(3, -4, 3)]);
+        assert_eq!(state.phase, TbBurstPhase::PostBurst { hold_back: 1 });
+        assert_eq!(state.wait, 3);
+
+        // The burst wait runs (3 ticks, then the hold-back)
+        tick_base_burst_tick_handler(&module, &mut state, &mut hooks, &mut rolled, 0.5, 0.5, 0.5);
+        tick_base_burst_tick_handler(&module, &mut state, &mut hooks, &mut rolled, 0.5, 0.5, 0.5);
+        assert_eq!(state.phase, TbBurstPhase::PostBurst { hold_back: 1 });
+        tick_base_burst_tick_handler(&module, &mut state, &mut hooks, &mut rolled, 0.5, 0.5, 0.5);
+        assert_eq!(*holds.borrow(), vec![1]);
+        assert_eq!(state.phase, TbBurstPhase::PostHoldBack);
+
+        // waitTicks(1 + cooldown.random()) and the coroutine ends
+        tick_base_burst_tick_handler(&module, &mut state, &mut hooks, &mut rolled, 0.5, 0.5, 0.5);
+        assert!(!state.busy);
+        assert_eq!(state.phase, TbBurstPhase::Idle);
+    }
+
+    #[test]
+    fn tick_base_burst_mode_prefers_a_critical_hit() {
+        let mut module = tick_base();
+        module.setting_mut("Mode").unwrap().kind = ValueKind::Choice(
+            "HoldFirst".to_string(),
+            vec![
+                "Timer".to_string(),
+                "HoldFirst".to_string(),
+                "BurstFirst".to_string(),
+            ],
+        );
+        let mut snaps: Vec<TbSnapshot> = (0..6).map(|i| tb_snap(i as f64)).collect();
+        snaps[5].on_ground = false;
+        snaps[5].fall_distance = 1.0;
+        let hit = TbHit { entity: 7, point: [5.0, 1.62, 0.0] };
+        let mut speeds = Vec::new();
+        let holds = Rc::new(RefCell::new(Vec::new()));
+        let bursts = Rc::new(RefCell::new(Vec::new()));
+        let mut visuals = Vec::new();
+        let mut hooks = tb_hooks(&snaps, Some(hit), 3.5, &mut speeds, &holds, &bursts, &mut visuals);
+        hooks.prefers_critical = true;
+
+        // Tick 5 lands while falling, so the wait prefers it over tick 4
+        let ticks = tb_burst_plan(&module, &mut hooks, snaps.clone(), 1);
+        drop(hooks);
+        assert_eq!(ticks, Some(5));
+        assert_eq!(visuals[0].1, Some(5));
+        assert_eq!(visuals[0].2, Some(hit.point));
     }
 }

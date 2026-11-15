@@ -2622,6 +2622,11 @@ pub struct Rotation {
 }
 
 /// Upstream `Mth.wrapDegrees`.
+/// Upstream `RotationUtil.angleDifference(a, b)` = `Mth.wrapDegrees(a - b)`.
+pub fn angle_difference(a: f32, b: f32) -> f32 {
+    wrap_degrees(a - b)
+}
+
 pub fn wrap_degrees(value: f32) -> f32 {
     let d = (value as f64) % 360.0;
     let d = if d >= 180.0 { d - 360.0 } else { d };
@@ -23940,5 +23945,905 @@ mod base_place_tests {
         ca_base_place_on_disabled(&mut hooks, &mut state);
         assert!(state.current_target.is_none());
         assert_eq!(hooks.placer_disabled, 1);
+    }
+}
+
+// ----- PredictFeature.kt + SubmoduleIdPredict.kt -----
+
+/// Upstream `PredictFeature.LogicalOperator`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PredictLogicalOperator {
+    And,
+    Or,
+}
+
+impl PredictLogicalOperator {
+    /// Upstream `LogicalOperator.getDamageProvider`.
+    pub fn get_damage_provider(&self, damage: f32, damage1: f32) -> DamageProvider {
+        match self {
+            PredictLogicalOperator::And => DamageProvider::And { damage, damage1 },
+            PredictLogicalOperator::Or => DamageProvider::Or { damage, damage1 },
+        }
+    }
+}
+
+/// Upstream `PredictFeature.CalculationMode` (`PredictOnly` / `Both` with its
+/// `Logic` enumChoice).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PredictCalculationMode {
+    PredictOnly,
+    Both { logic: PredictLogicalOperator },
+}
+
+/// Flattened `PredictFeature` settings (`Self` and `Target` features share the
+/// same value shape).
+#[derive(Clone, Copy, Debug)]
+pub struct PredictFeatureSettings {
+    pub enabled: bool,
+    /// `PlaceTicks` 2 0..20: the ticks should be equal to `20 / cps` to get
+    /// the approximate time it would take to place a crystal.
+    pub place_ticks: i32,
+    /// `BreakTicks` 1 0..20: should normally be lower than the place ticks
+    /// (except when using ID-Predict).
+    pub destroy_ticks: i32,
+    /// `BasePlaceTicks` 4 0..20: should be higher than the place ticks.
+    pub base_place_ticks: i32,
+    /// `CalculationMode`
+    pub calculation_mode: PredictCalculationMode,
+    /// `CheckIntersect` true: check if the target will block the placement.
+    pub check_intersect: bool,
+}
+
+impl Default for PredictFeatureSettings {
+    fn default() -> Self {
+        PredictFeatureSettings {
+            enabled: true,
+            place_ticks: 2,
+            destroy_ticks: 1,
+            base_place_ticks: 4,
+            calculation_mode: PredictCalculationMode::Both {
+                logic: PredictLogicalOperator::And,
+            },
+            check_intersect: true,
+        }
+    }
+}
+
+/// Which concrete `PredictFeature` instance (`SelfPredict` / `TargetPredict`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PredictFeatureKind {
+    SelfPredict,
+    TargetPredict,
+}
+
+/// The engine surfaces the predict-feature reads: the movement simulation
+/// snapshots, bounding boxes, the explosion damage calculation and the
+/// player-kind check.
+pub trait CaPredictHooks {
+    /// `getSnapshotPos(player, ticks)`: `SelfPredict` reads the local player
+    /// simulation, `TargetPredict` the given player's.
+    fn ca_predict_snapshot_pos(
+        &self,
+        kind: PredictFeatureKind,
+        player: Option<u64>,
+        ticks: i32,
+    ) -> (f64, f64, f64);
+    /// `target?.boundingBox ?: player.boundingBox`.
+    fn ca_predict_bounding_box(&self, player: Option<u64>) -> (f64, f64, f64, f64, f64, f64);
+    /// `player.getDamageFromExplosion(crystal, include, maxBlastResistance,
+    /// entityBoundingBox)`.
+    fn ca_predict_damage_from_explosion(
+        &self,
+        player: u64,
+        crystal: (f64, f64, f64),
+        include: Option<CaBlockPos>,
+        max_blast_resistance: Option<f32>,
+        entity_bounding_box: Option<(f64, f64, f64, f64, f64, f64)>,
+    ) -> f32;
+    /// `target is Player` for the companion `willBeBlocked`.
+    fn ca_predict_target_is_player(&self, target: u64) -> bool;
+}
+
+/// Upstream `AABB.intersects` for two `(minX, minY, minZ, maxX, maxY, maxZ)`
+/// boxes.
+pub fn ca_aabb_intersects(
+    a: (f64, f64, f64, f64, f64, f64),
+    b: (f64, f64, f64, f64, f64, f64),
+) -> bool {
+    a.0 < b.3 && b.0 < a.3 && a.1 < b.4 && b.1 < a.4 && a.2 < b.5 && b.2 < a.5
+}
+
+fn ca_predicted_bounding_box(
+    simulation: (f64, f64, f64),
+    bounding_box: (f64, f64, f64, f64, f64, f64),
+) -> (f64, f64, f64, f64, f64, f64) {
+    let half_width = (bounding_box.3 - bounding_box.0).abs() / 2.0;
+    (
+        simulation.0 - half_width,
+        simulation.1,
+        simulation.2 - half_width,
+        simulation.0 + half_width,
+        simulation.1 + (bounding_box.4 - bounding_box.1),
+        simulation.2 + half_width,
+    )
+}
+
+/// Upstream `PredictFeature.willBeBlocked(box, target, basePlace)`.
+pub fn ca_predict_will_be_blocked(
+    hooks: &dyn CaPredictHooks,
+    settings: &PredictFeatureSettings,
+    kind: PredictFeatureKind,
+    check_box: (f64, f64, f64, f64, f64, f64),
+    target: Option<u64>,
+    base_place: bool,
+) -> bool {
+    if !settings.enabled || !settings.check_intersect {
+        return false
+    }
+
+    let ticks = if base_place {
+        settings.base_place_ticks
+    } else {
+        settings.place_ticks
+    };
+    let simulation = hooks.ca_predict_snapshot_pos(kind, target, ticks);
+    let bounding_box = hooks.ca_predict_bounding_box(target);
+    let predicted_bounding_box = ca_predicted_bounding_box(simulation, bounding_box);
+
+    ca_aabb_intersects(check_box, predicted_bounding_box)
+}
+
+/// Upstream `companion.willBeBlocked(box, target, basePlace)`:
+/// `SelfPredict.willBeBlocked(box, null, basePlace) || (target is Player &&
+/// TargetPredict.willBeBlocked(box, target, basePlace))`.
+pub fn ca_predict_will_be_blocked_any(
+    hooks: &dyn CaPredictHooks,
+    self_settings: &PredictFeatureSettings,
+    target_settings: &PredictFeatureSettings,
+    check_box: (f64, f64, f64, f64, f64, f64),
+    target: Option<u64>,
+    base_place: bool,
+) -> bool {
+    ca_predict_will_be_blocked(
+        hooks,
+        self_settings,
+        PredictFeatureKind::SelfPredict,
+        check_box,
+        None,
+        base_place,
+    ) || (target.map(|t| hooks.ca_predict_target_is_player(t)).unwrap_or(false)
+        && ca_predict_will_be_blocked(
+            hooks,
+            target_settings,
+            PredictFeatureKind::TargetPredict,
+            check_box,
+            target,
+            base_place,
+        ))
+}
+
+/// Upstream `PredictFeature.getDamage(player, ticks, crystal,
+/// maxBlastResistance, include)`.
+pub fn ca_predict_get_damage(
+    hooks: &dyn CaPredictHooks,
+    settings: &PredictFeatureSettings,
+    kind: PredictFeatureKind,
+    player: u64,
+    ticks: i32,
+    crystal: (f64, f64, f64),
+    max_blast_resistance: Option<f32>,
+    include: Option<CaBlockPos>,
+) -> DamageProvider {
+    if !settings.enabled {
+        return DamageProvider::Normal {
+            damage: hooks.ca_predict_damage_from_explosion(
+                player,
+                crystal,
+                include,
+                max_blast_resistance,
+                None,
+            ),
+        };
+    }
+
+    let simulated = hooks.ca_predict_snapshot_pos(kind, Some(player), ticks);
+    let bounding_box = hooks.ca_predict_bounding_box(Some(player));
+    let predicted_bounding_box = ca_predicted_bounding_box(simulated, bounding_box);
+
+    let predicted_damage = hooks.ca_predict_damage_from_explosion(
+        player,
+        crystal,
+        include,
+        max_blast_resistance,
+        Some(predicted_bounding_box),
+    );
+
+    match settings.calculation_mode {
+        PredictCalculationMode::PredictOnly => DamageProvider::Normal {
+            damage: predicted_damage,
+        },
+        PredictCalculationMode::Both { logic } => {
+            let damage = hooks.ca_predict_damage_from_explosion(
+                player,
+                crystal,
+                include,
+                max_blast_resistance,
+                None,
+            );
+            logic.get_damage_provider(damage, predicted_damage)
+        }
+    }
+}
+
+/// Flattened `SubmoduleIdPredict` settings (the `Rotate` sub-group included).
+#[derive(Clone, Copy, Debug)]
+pub struct IdPredictSettings {
+    /// `IDPredict` default false.
+    pub enabled: bool,
+    /// `OffsetRange` 1..2 (within 1..100): sends a packet for all included
+    /// offsets.
+    pub offset_start: i32,
+    pub offset_end: i32,
+    /// `SwingAlways` false: swings before every attack; otherwise it will only
+    /// swing once.
+    pub swing_always: bool,
+    /// `Rotate` group enabled true: sends an additional rotation packet.
+    pub rotate_enabled: bool,
+    /// Rotate `Back` false
+    pub rotate_back: bool,
+}
+
+impl Default for IdPredictSettings {
+    fn default() -> Self {
+        IdPredictSettings {
+            enabled: false,
+            offset_start: 1,
+            offset_end: 2,
+            swing_always: false,
+            rotate_enabled: true,
+            rotate_back: false,
+        }
+    }
+}
+
+/// `SubmoduleIdPredict` state: `highestId` and the `Rotate.oldRotation`.
+#[derive(Debug, Default)]
+pub struct IdPredictState {
+    pub highest_id: i32,
+    pub old_rotation: Option<Rotation>,
+}
+
+/// The engine surfaces the ID-predict side: the player state, the network,
+/// the swing mode, the world entities, the destroyer link and the raytracer.
+pub trait CaIdPredictHooks {
+    /// `player.eyePosition` (x, y, z).
+    fn ca_idp_player_position(&self) -> (f64, f64, f64);
+    /// `player.onGround()`.
+    fn ca_idp_on_ground(&self) -> bool;
+    /// `player.horizontalCollision`.
+    fn ca_idp_horizontal_collision(&self) -> bool;
+    /// `RotationManager.serverRotation`.
+    fn ca_idp_server_rotation(&self) -> Rotation;
+    /// `RotationManager.currentRotation ?: player.rotation`.
+    fn ca_idp_current_rotation(&self) -> Option<Rotation>;
+    /// `RotationUtil.gcd`.
+    fn ca_idp_rotation_gcd(&self) -> f64;
+    /// `network.send(ServerboundMovePlayerPacket.PosRot(...))`.
+    fn ca_idp_send_pos_rot(
+        &mut self,
+        x: f64,
+        y: f64,
+        z: f64,
+        yaw: f32,
+        pitch: f32,
+        on_ground: bool,
+        horizontal_collision: bool,
+    );
+    /// `SubmoduleCrystalDestroyer.swingMode.attackSwing()`.
+    fn ca_idp_swing(&mut self);
+    /// `world.getEntity(id)`: `None` when absent, `Some(true)` when it is an
+    /// `EndCrystal`, `Some(false)` otherwise.
+    fn ca_idp_get_entity_is_crystal(&self, id: i32) -> Option<bool>;
+    /// `network.send(ServerboundAttackPacket(id))`.
+    fn ca_idp_send_attack(&mut self, id: i32);
+    /// `SubmoduleCrystalDestroyer.postAttackHandlers.forEach { it.attacked(id) }`.
+    fn ca_idp_post_attack(&mut self, id: i32);
+    /// `raytraceBox(eye, box, range, wallsRange)`.
+    fn ca_idp_raytrace_box(
+        &self,
+        eye: (f64, f64, f64),
+        check_box: (f64, f64, f64, f64, f64, f64),
+        range: f64,
+        walls_range: f64,
+    ) -> Option<Rotation>;
+    /// `SubmoduleCrystalDestroyer.range`.
+    fn ca_idp_destroyer_range(&self) -> f32;
+    /// `SubmoduleCrystalDestroyer.wallsRange`.
+    fn ca_idp_destroyer_walls_range(&self) -> f32;
+    /// `SubmoduleCrystalDestroyer.chronometer.reset()`.
+    fn ca_idp_destroyer_chronometer_reset(&mut self);
+    /// `reset()`: the highest id among `world.entitiesForRendering()` (0 when
+    /// empty).
+    fn ca_idp_world_max_entity_id(&self) -> i32;
+}
+
+/// Upstream `Rotation.normalize()` (gcd-snapped against the current
+/// rotation). The shared `Rotation` struct carries no `isNormalized` flag, so
+/// the caller passes it (`raytraceBox` returns a fresh rotation, which is not
+/// normalized).
+pub fn ca_rotation_normalize(
+    hooks: &dyn CaIdPredictHooks,
+    rotation: Rotation,
+    is_normalized: bool,
+) -> Rotation {
+    if is_normalized {
+        return rotation;
+    }
+
+    let gcd = hooks.ca_idp_rotation_gcd();
+    let current = match hooks.ca_idp_current_rotation() {
+        Some(current) => current,
+        None => hooks.ca_idp_server_rotation(),
+    };
+
+    // get rotation differences (`rotationDeltaTo`):
+    // deltaYaw = angleDifference(other.yaw, this.yaw)
+    let delta_yaw = angle_difference(rotation.yaw, current.yaw);
+    let delta_pitch = rotation.pitch - current.pitch;
+
+    // proper rounding
+    let g1 = (delta_yaw as f64 / gcd).round() * gcd;
+    let g2 = (delta_pitch as f64 / gcd).round() * gcd;
+
+    // fix rotation
+    Rotation {
+        yaw: current.yaw + g1 as f32,
+        pitch: (current.pitch + g2 as f32).clamp(-90.0, 90.0),
+    }
+}
+
+/// Upstream `Rotate.sendRotation(rotation)`.
+pub fn ca_idp_send_rotation(
+    hooks: &mut dyn CaIdPredictHooks,
+    state: &mut IdPredictState,
+    settings: &IdPredictSettings,
+    rotation: Rotation,
+) {
+    if !settings.rotate_enabled {
+        return;
+    }
+
+    state.old_rotation = Some(hooks.ca_idp_server_rotation());
+    let pos = hooks.ca_idp_player_position();
+    hooks.ca_idp_send_pos_rot(
+        pos.0,
+        pos.1,
+        pos.2,
+        rotation.yaw,
+        rotation.pitch,
+        hooks.ca_idp_on_ground(),
+        hooks.ca_idp_horizontal_collision(),
+    );
+}
+
+/// Upstream `Rotate.rotateBack()`.
+pub fn ca_idp_rotate_back(
+    hooks: &mut dyn CaIdPredictHooks,
+    state: &mut IdPredictState,
+    settings: &IdPredictSettings,
+) {
+    if !settings.rotate_enabled || !settings.rotate_back {
+        return;
+    }
+
+    let Some(old) = state.old_rotation else {
+        return;
+    };
+    let pos = hooks.ca_idp_player_position();
+    hooks.ca_idp_send_pos_rot(
+        pos.0,
+        pos.1,
+        pos.2,
+        old.yaw,
+        old.pitch,
+        hooks.ca_idp_on_ground(),
+        hooks.ca_idp_horizontal_collision(),
+    );
+}
+
+/// Upstream `SubmoduleIdPredict.reset()`.
+pub fn ca_idp_reset(hooks: &dyn CaIdPredictHooks, state: &mut IdPredictState) {
+    state.highest_id = hooks.ca_idp_world_max_entity_id();
+}
+
+/// Upstream `onEnabled()`.
+pub fn ca_idp_on_enabled(hooks: &dyn CaIdPredictHooks, state: &mut IdPredictState) {
+    ca_idp_reset(hooks, state);
+}
+
+/// Upstream `entitySpawnHandler` on `PacketEvent`: raises `highestId` for the
+/// add-entity and login packets.
+pub fn ca_idp_on_entity_packet(state: &mut IdPredictState, add_entity_id: Option<i32>, login_player_id: Option<i32>) {
+    if let Some(id) = add_entity_id {
+        state.highest_id = state.highest_id.max(id);
+    }
+    if let Some(id) = login_player_id {
+        state.highest_id = state.highest_id.max(id);
+    }
+}
+
+/// Upstream `worldChangeHandler`: resets on a world change.
+pub fn ca_idp_on_world_change(hooks: &dyn CaIdPredictHooks, state: &mut IdPredictState) {
+    ca_idp_reset(hooks, state);
+}
+
+/// Upstream `SubmoduleIdPredict.run(placePos)`.
+pub fn ca_idp_run(
+    hooks: &mut dyn CaIdPredictHooks,
+    state: &mut IdPredictState,
+    settings: &IdPredictSettings,
+    place_pos: CaBlockPos,
+) {
+    if !settings.enabled {
+        return;
+    }
+
+    // AABB(placePos).inflate(0.5, 0.0, 0.5).setMaxY(placePos.y + 2.0)
+    let check_box = (
+        place_pos.0 as f64 - 0.5,
+        place_pos.1 as f64,
+        place_pos.2 as f64 - 0.5,
+        place_pos.0 as f64 + 1.0 + 0.5,
+        place_pos.1 as f64 + 2.0,
+        place_pos.2 as f64 + 1.0 + 0.5,
+    );
+    let eye = hooks.ca_idp_player_position();
+    let rotation = hooks.ca_idp_raytrace_box(
+        eye,
+        check_box,
+        hooks.ca_idp_destroyer_range() as f64,
+        hooks.ca_idp_destroyer_walls_range() as f64,
+    );
+    let Some(rotation) = rotation else {
+        return;
+    };
+
+    let normalized = ca_rotation_normalize(hooks, rotation, false);
+    ca_idp_send_rotation(hooks, state, settings, normalized);
+
+    if !settings.swing_always {
+        hooks.ca_idp_swing();
+    }
+
+    for id_offset in settings.offset_start..=settings.offset_end {
+        let id = state.highest_id + id_offset;
+
+        // don't attack other entities in case the highest ID is wrong
+        if hooks.ca_idp_get_entity_is_crystal(id) == Some(false) {
+            continue;
+        }
+
+        if settings.swing_always {
+            hooks.ca_idp_swing();
+        }
+
+        hooks.ca_idp_send_attack(id);
+        hooks.ca_idp_post_attack(id);
+    }
+
+    hooks.ca_idp_destroyer_chronometer_reset();
+    ca_idp_rotate_back(hooks, state, settings);
+}
+
+#[cfg(test)]
+mod predict_idpredict_tests {
+    use super::*;
+
+    // ----- PredictFeature -----
+
+    struct PredictMock {
+        snapshots: Vec<(PredictFeatureKind, i32, (f64, f64, f64))>,
+        bbs: Vec<(Option<u64>, (f64, f64, f64, f64, f64, f64))>,
+        damages: Vec<(bool, f32)>, // (with override box, damage)
+        is_player: bool,
+    }
+
+    impl Default for PredictMock {
+        fn default() -> Self {
+            PredictMock {
+                snapshots: Vec::new(),
+                bbs: Vec::new(),
+                damages: Vec::new(),
+                is_player: false,
+            }
+        }
+    }
+
+    impl PredictMock {
+        fn simple() -> Self {
+            let mut mock = PredictMock::default();
+            // bb 1x1.8x1 -> halfWidth 0.5, height 1.8
+            mock.bbs.push((None, (0.0, 64.0, 0.0, 1.0, 65.8, 1.0)));
+            mock.bbs.push((Some(7), (0.0, 64.0, 0.0, 1.0, 65.8, 1.0)));
+            mock
+        }
+    }
+
+    impl CaPredictHooks for PredictMock {
+        fn ca_predict_snapshot_pos(
+            &self,
+            kind: PredictFeatureKind,
+            _player: Option<u64>,
+            ticks: i32,
+        ) -> (f64, f64, f64) {
+            for (k, t, pos) in &self.snapshots {
+                if *k == kind && *t == ticks {
+                    return *pos;
+                }
+            }
+            (0.0, 64.0, 0.0)
+        }
+
+        fn ca_predict_bounding_box(&self, player: Option<u64>) -> (f64, f64, f64, f64, f64, f64) {
+            for (p, bb) in &self.bbs {
+                if *p == player {
+                    return *bb;
+                }
+            }
+            (0.0, 64.0, 0.0, 1.0, 65.8, 1.0)
+        }
+
+        fn ca_predict_damage_from_explosion(
+            &self,
+            _player: u64,
+            _crystal: (f64, f64, f64),
+            _include: Option<CaBlockPos>,
+            _max_blast_resistance: Option<f32>,
+            entity_bounding_box: Option<(f64, f64, f64, f64, f64, f64)>,
+        ) -> f32 {
+            self.damages
+                .iter()
+                .find(|(with_override, _)| *with_override == entity_bounding_box.is_some())
+                .map(|(_, d)| *d)
+                .unwrap_or(0.0)
+        }
+
+        fn ca_predict_target_is_player(&self, _target: u64) -> bool {
+            self.is_player
+        }
+    }
+
+    #[test]
+    fn will_be_blocked_gates_and_intersection() {
+        let hooks = PredictMock::simple();
+        let settings = PredictFeatureSettings::default();
+        let mut hooks = hooks;
+        // self sim runs to (10, 64, 0) at place ticks; box halfwidth 0.5
+        hooks.snapshots = vec![(PredictFeatureKind::SelfPredict, 2, (10.0, 64.0, 0.0))];
+
+        // a box around the predicted position intersects
+        assert!(ca_predict_will_be_blocked(
+            &hooks,
+            &settings,
+            PredictFeatureKind::SelfPredict,
+            (9.6, 64.0, -0.4, 10.4, 64.5, 0.4),
+            None,
+            false,
+        ));
+        // a box far away does not
+        assert!(!ca_predict_will_be_blocked(
+            &hooks,
+            &settings,
+            PredictFeatureKind::SelfPredict,
+            (0.0, 64.0, 0.0, 0.9, 64.5, 0.9),
+            None,
+            false,
+        ));
+
+        // checkIntersect off -> false
+        let mut settings = settings;
+        settings.check_intersect = false;
+        assert!(!ca_predict_will_be_blocked(
+            &hooks,
+            &settings,
+            PredictFeatureKind::SelfPredict,
+            (9.6, 64.0, -0.4, 10.4, 64.5, 0.4),
+            None,
+            false,
+        ));
+    }
+
+    #[test]
+    fn will_be_blocked_uses_base_place_ticks() {
+        let settings = PredictFeatureSettings::default();
+        let mut hooks = PredictMock::simple();
+        hooks.snapshots = vec![
+            (PredictFeatureKind::SelfPredict, 2, (10.0, 64.0, 0.0)),
+            (PredictFeatureKind::SelfPredict, 4, (20.0, 64.0, 0.0)),
+        ];
+
+        // base place reads the base place ticks snapshot
+        assert!(ca_predict_will_be_blocked(
+            &hooks,
+            &settings,
+            PredictFeatureKind::SelfPredict,
+            (19.6, 64.0, -0.4, 20.4, 64.5, 0.4),
+            None,
+            true,
+        ));
+        assert!(!ca_predict_will_be_blocked(
+            &hooks,
+            &settings,
+            PredictFeatureKind::SelfPredict,
+            (9.6, 64.0, -0.4, 10.4, 64.5, 0.4),
+            None,
+            true,
+        ));
+    }
+
+    #[test]
+    fn will_be_blocked_any_checks_target_player() {
+        let settings = PredictFeatureSettings::default();
+        let mut hooks = PredictMock::simple();
+        hooks.snapshots = vec![
+            (PredictFeatureKind::SelfPredict, 2, (10.0, 64.0, 0.0)),
+            (PredictFeatureKind::TargetPredict, 2, (30.0, 64.0, 0.0)),
+        ];
+        // a non-player target never goes to TargetPredict
+        assert!(!ca_predict_will_be_blocked_any(
+            &hooks,
+            &settings,
+            &settings,
+            (29.6, 64.0, -0.4, 30.4, 64.5, 0.4),
+            Some(7),
+            false,
+        ));
+        // a player target does
+        hooks.is_player = true;
+        assert!(ca_predict_will_be_blocked_any(
+            &hooks,
+            &settings,
+            &settings,
+            (29.6, 64.0, -0.4, 30.4, 64.5, 0.4),
+            Some(7),
+            false,
+        ));
+    }
+
+    #[test]
+    fn get_damage_modes() {
+        let mut hooks = PredictMock::simple();
+        hooks.snapshots = vec![(PredictFeatureKind::SelfPredict, 2, (10.0, 64.0, 0.0))];
+        hooks.damages = vec![(true, 4.0), (false, 6.0)];
+        let settings = PredictFeatureSettings::default();
+
+        // Both + AND
+        assert_eq!(
+            ca_predict_get_damage(&hooks, &settings, PredictFeatureKind::SelfPredict, 7, 2, (10.0, 60.0, 0.0), None, None),
+            DamageProvider::And { damage: 6.0, damage1: 4.0 }
+        );
+
+        // Both + OR
+        let mut settings = settings;
+        settings.calculation_mode = PredictCalculationMode::Both {
+            logic: PredictLogicalOperator::Or,
+        };
+        assert_eq!(
+            ca_predict_get_damage(&hooks, &settings, PredictFeatureKind::SelfPredict, 7, 2, (10.0, 60.0, 0.0), None, None),
+            DamageProvider::Or { damage: 6.0, damage1: 4.0 }
+        );
+
+        // PredictOnly
+        settings.calculation_mode = PredictCalculationMode::PredictOnly;
+        assert_eq!(
+            ca_predict_get_damage(&hooks, &settings, PredictFeatureKind::SelfPredict, 7, 2, (10.0, 60.0, 0.0), None, None),
+            DamageProvider::Normal { damage: 4.0 }
+        );
+
+        // disabled: straight damage at the current position
+        settings.enabled = false;
+        assert_eq!(
+            ca_predict_get_damage(&hooks, &settings, PredictFeatureKind::SelfPredict, 7, 2, (10.0, 60.0, 0.0), None, None),
+            DamageProvider::Normal { damage: 6.0 }
+        );
+    }
+
+    #[test]
+    fn aabb_intersects_matches_upstream() {
+        assert!(ca_aabb_intersects((0.0, 0.0, 0.0, 1.0, 1.0, 1.0), (0.9, 0.9, 0.9, 2.0, 2.0, 2.0)));
+        assert!(!ca_aabb_intersects((0.0, 0.0, 0.0, 1.0, 1.0, 1.0), (1.0, 0.0, 0.0, 2.0, 1.0, 1.0)));
+    }
+
+    // ----- SubmoduleIdPredict -----
+
+    struct IdpMock {
+        pos: (f64, f64, f64),
+        server_rotation: Rotation,
+        current_rotation: Option<Rotation>,
+        gcd: f64,
+        raytrace: Option<Rotation>,
+        entity_kinds: Vec<(i32, bool)>,
+        world_max_id: i32,
+        sent_pos_rots: Vec<(f32, f32)>,
+        swings: u32,
+        attacks: Vec<i32>,
+        post_attacks: Vec<i32>,
+        chronometer_resets: u32,
+    }
+
+    impl Default for IdpMock {
+        fn default() -> Self {
+            IdpMock {
+                pos: (0.0, 64.0, 0.0),
+                server_rotation: Rotation { yaw: 180.0, pitch: 0.0 },
+                current_rotation: Some(Rotation { yaw: 180.0, pitch: 0.0 }),
+                gcd: 0.15,
+                raytrace: None,
+                entity_kinds: Vec::new(),
+                world_max_id: 0,
+                sent_pos_rots: Vec::new(),
+                swings: 0,
+                attacks: Vec::new(),
+                post_attacks: Vec::new(),
+                chronometer_resets: 0,
+            }
+        }
+    }
+
+    impl CaIdPredictHooks for IdpMock {
+        fn ca_idp_player_position(&self) -> (f64, f64, f64) { self.pos }
+        fn ca_idp_on_ground(&self) -> bool { true }
+        fn ca_idp_horizontal_collision(&self) -> bool { false }
+        fn ca_idp_server_rotation(&self) -> Rotation { self.server_rotation }
+        fn ca_idp_current_rotation(&self) -> Option<Rotation> { self.current_rotation }
+        fn ca_idp_rotation_gcd(&self) -> f64 { self.gcd }
+        fn ca_idp_send_pos_rot(&mut self, _x: f64, _y: f64, _z: f64, yaw: f32, pitch: f32, _on_ground: bool, _horizontal_collision: bool) {
+            self.sent_pos_rots.push((yaw, pitch));
+        }
+        fn ca_idp_swing(&mut self) { self.swings += 1; }
+        fn ca_idp_get_entity_is_crystal(&self, id: i32) -> Option<bool> {
+            self.entity_kinds.iter().find(|(i, _)| *i == id).map(|(_, crystal)| *crystal)
+        }
+        fn ca_idp_send_attack(&mut self, id: i32) { self.attacks.push(id); }
+        fn ca_idp_post_attack(&mut self, id: i32) { self.post_attacks.push(id); }
+        fn ca_idp_raytrace_box(
+            &self,
+            _eye: (f64, f64, f64),
+            _check_box: (f64, f64, f64, f64, f64, f64),
+            _range: f64,
+            _walls_range: f64,
+        ) -> Option<Rotation> {
+            self.raytrace
+        }
+        fn ca_idp_destroyer_range(&self) -> f32 { 4.5 }
+        fn ca_idp_destroyer_walls_range(&self) -> f32 { 4.5 }
+        fn ca_idp_destroyer_chronometer_reset(&mut self) { self.chronometer_resets += 1; }
+        fn ca_idp_world_max_entity_id(&self) -> i32 { self.world_max_id }
+    }
+
+    #[test]
+    fn idp_run_attacks_predicted_ids() {
+        let mut hooks = IdpMock::default();
+        hooks.raytrace = Some(Rotation { yaw: 91.0, pitch: 30.0 });
+        hooks.world_max_id = 40;
+        let mut state = IdPredictState::default();
+        ca_idp_on_enabled(&hooks, &mut state);
+        assert_eq!(state.highest_id, 40);
+
+        let mut settings = IdPredictSettings::default();
+        settings.enabled = true;
+        ca_idp_run(&mut hooks, &mut state, &settings, (5, 64, 5));
+
+        // rotate packet sent (gcd snap from the current rotation)
+        assert_eq!(hooks.sent_pos_rots.len(), 1);
+        // swing before every attack is off by default: one swing
+        assert_eq!(hooks.swings, 1);
+        // offsets 1..2
+        assert_eq!(hooks.attacks, vec![41, 42]);
+        assert_eq!(hooks.post_attacks, vec![41, 42]);
+        assert_eq!(hooks.chronometer_resets, 1);
+        // back off by default: no rotate-back packet
+        assert_eq!(hooks.sent_pos_rots.len(), 1);
+    }
+
+    #[test]
+    fn idp_run_skips_non_crystal_and_swing_always() {
+        let mut hooks = IdpMock::default();
+        hooks.raytrace = Some(Rotation { yaw: 0.0, pitch: 0.0 });
+        hooks.current_rotation = Some(Rotation { yaw: 0.0, pitch: 0.0 });
+        hooks.world_max_id = 40;
+        let mut state = IdPredictState::default();
+        state.highest_id = 40;
+
+        let mut settings = IdPredictSettings::default();
+        settings.enabled = true;
+        settings.swing_always = true;
+        settings.rotate_enabled = false;
+        // id 41 is a mob: skipped; 42 is a crystal
+        hooks.entity_kinds = vec![(41, false), (42, true)];
+
+        ca_idp_run(&mut hooks, &mut state, &settings, (5, 64, 5));
+
+        assert!(!hooks.sent_pos_rots.is_empty() == false);
+        assert_eq!(hooks.attacks, vec![42]);
+        // swingAlways: swings inside the loop only (no initial swing)
+        assert_eq!(hooks.swings, 1);
+        assert_eq!(hooks.chronometer_resets, 1);
+    }
+
+    #[test]
+    fn idp_disabled_or_no_rotation_runs_nothing() {
+        let mut hooks = IdpMock::default();
+        let mut state = IdPredictState::default();
+        state.highest_id = 40;
+        let settings = IdPredictSettings::default();
+
+        ca_idp_run(&mut hooks, &mut state, &settings, (5, 64, 5));
+        assert!(hooks.attacks.is_empty());
+        assert_eq!(hooks.chronometer_resets, 0);
+
+        let mut settings = settings;
+        settings.enabled = true;
+        ca_idp_run(&mut hooks, &mut state, &settings, (5, 64, 5));
+        assert!(hooks.attacks.is_empty());
+        assert_eq!(hooks.chronometer_resets, 0);
+    }
+
+    #[test]
+    fn idp_rotate_back_sends_old_rotation() {
+        let mut hooks = IdpMock::default();
+        hooks.raytrace = Some(Rotation { yaw: 0.0, pitch: 0.0 });
+        let mut state = IdPredictState::default();
+        state.highest_id = 40;
+
+        let mut settings = IdPredictSettings::default();
+        settings.enabled = true;
+        settings.rotate_back = true;
+
+        ca_idp_run(&mut hooks, &mut state, &settings, (5, 64, 5));
+        // first packet is the normalized new rotation, second is the old one
+        assert_eq!(hooks.sent_pos_rots.len(), 2);
+        assert_eq!(hooks.sent_pos_rots[1], (hooks.server_rotation.yaw, hooks.server_rotation.pitch));
+    }
+
+    #[test]
+    fn idp_entity_packets_raise_highest_id() {
+        let mut state = IdPredictState::default();
+        ca_idp_on_entity_packet(&mut state, Some(55), None);
+        assert_eq!(state.highest_id, 55);
+        ca_idp_on_entity_packet(&mut state, Some(30), Some(80));
+        assert_eq!(state.highest_id, 80);
+        ca_idp_on_entity_packet(&mut state, Some(60), None);
+        assert_eq!(state.highest_id, 80);
+    }
+
+    #[test]
+    fn idp_world_change_resets() {
+        let mut hooks = IdpMock::default();
+        hooks.world_max_id = 12;
+        let mut state = IdPredictState::default();
+        state.highest_id = 99;
+
+        ca_idp_on_world_change(&hooks, &mut state);
+        assert_eq!(state.highest_id, 12);
+    }
+
+    #[test]
+    fn idp_run_normalizes_rotation_by_gcd() {
+        let mut hooks = IdpMock::default();
+        hooks.raytrace = Some(Rotation { yaw: 91.03, pitch: 30.07 });
+        // current (180, 0), gcd 0.15: deltaYaw = angleDifference(91.03, 180)
+        // = -88.97 -> /0.15 = -593.13 -> round -593 * 0.15 = -88.95
+        // -> yaw = 91.05; deltaPitch = 30.07 -> /0.15 = 200.47 -> 200 * 0.15 = 30.0
+        let mut state = IdPredictState::default();
+        state.highest_id = 40;
+        let mut settings = IdPredictSettings::default();
+        settings.enabled = true;
+
+        ca_idp_run(&mut hooks, &mut state, &settings, (5, 64, 5));
+        assert_eq!(hooks.sent_pos_rots.len(), 1);
+        let (yaw, pitch) = hooks.sent_pos_rots[0];
+        assert!((yaw - 91.05).abs() < 1e-4, "yaw {}", yaw);
+        assert!((pitch - 30.0).abs() < 1e-4, "pitch {}", pitch);
     }
 }

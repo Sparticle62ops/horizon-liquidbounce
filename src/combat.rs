@@ -7570,3 +7570,777 @@ mod velocity_tests {
         );
     }
 }
+
+// ----- velocity/mode/VelocityMode.kt + VelocityModify.kt + VelocityStrafe.kt
+// (GPL-3.0, (c) 2015-2026 CCBlueX) -----
+//
+// Upstream `VelocityMode.running` is `super.running && pause == 0`: every
+// mode gate here takes the caller's `mode_running` input, which is that
+// conjunction. The modes share one world seam.
+
+/// Upstream world/player surface the velocity modes read.
+pub trait VelocityWorld {
+    /// `player.id`
+    fn player_id(&self) -> i64;
+    /// `player.onGround()`
+    fn player_on_ground(&self) -> bool;
+    /// `player.input.keyPresses.anyHorizontal`
+    fn any_horizontal_input(&self) -> bool;
+    /// `player.deltaMovement`
+    fn delta_movement(&self) -> Vec3;
+    /// `player.horizontalSpeed` (`deltaMovement.horizontalDistance()`)
+    fn horizontal_speed(&self) -> f64;
+    /// `player.input` `isMoving`
+    fn input_is_moving(&self) -> bool;
+    /// `player.getMovementDirectionOfInput(input)` yaw for `withStrafe`
+    fn movement_yaw(&self) -> f32;
+    /// `world.findEnemy(0f, range)`: an attackable enemy in range
+    fn find_enemy(&self, max_range: f64) -> Option<Vec3>;
+    /// `isLookingAtEntity(target, range, rotation)`: Some when it hits
+    fn is_looking_at_entity(&self, target: Vec3, range: f64, rotation: (f32, f32)) -> Option<()>;
+    /// `RotationManager.currentRotation`
+    fn current_rotation(&self) -> Option<(f32, f32)>;
+    /// `player.rotation`
+    fn player_rotation(&self) -> (f32, f32);
+}
+
+/// Upstream `Vec3.withStrafe(speed, strength = 1.0, input, yaw)`.
+pub fn with_strafe(vec: Vec3, speed: f64, strength: f64, input_moving: bool, yaw_deg: f32) -> Vec3 {
+    if !input_moving {
+        return Vec3 { x: 0.0, y: vec.y, z: 0.0 };
+    }
+
+    let one_minus_strength = 1.0 - strength;
+    let prev_x = vec.x * one_minus_strength;
+    let prev_z = vec.z * one_minus_strength;
+    let used_speed = speed * strength;
+
+    let angle = (yaw_deg as f64).to_radians();
+    let new_x = prev_x - angle.sin() * used_speed;
+    let new_z = prev_z + angle.cos() * used_speed;
+
+    Vec3 { x: new_x, y: vec.y, z: new_z }
+}
+
+// ----- VelocityModify.kt -----
+//
+// Basic velocity which should bypass most servers with common anti-cheats
+// like NCP.
+
+/// The upstream `VelocityTriggerFilter` tags, verbatim.
+pub const VELOCITY_FILTER_TAGS: [&str; 3] = ["Always", "OnGround", "InAir"];
+
+pub fn velocity_modify() -> Module {
+    Module::new(
+        "Modify",
+        COMBAT,
+        vec![
+            float("Horizontal", 0.0, -1.0, 1.0),
+            float("Vertical", 0.0, -1.0, 1.0),
+            float("MotionHorizontal", 0.0, 0.0, 1.0),
+            float("MotionVertical", 0.0, 0.0, 1.0),
+            // percentageChance("Chance", 100), a "%" int in 0..100
+            int("Chance", 100, 0, 100),
+            choice("Filter", "Always", &["Always", "OnGround", "InAir"]),
+            boolean("OnlyMove", false),
+            int("TransactionBuffer", 0, 0, 3),
+            boolean("ConsiderExplosion", true),
+        ],
+    )
+}
+
+/// Upstream `VelocityModify.transactionBuffer`, reset on disable.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct VelocityModifyState {
+    pub transaction_buffer: i64,
+}
+
+/// Upstream `VelocityModify.disable()`.
+pub fn velocity_modify_disable(state: &mut VelocityModifyState) {
+    state.transaction_buffer = 0;
+}
+
+/// The packets the modify handler distinguishes, flattened to their
+/// distinguishing fields.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum VelocityModifyPacket {
+    /// `ClientboundSetEntityMotionPacket` with `id == player.id`
+    Motion { movement: (f64, f64, f64) },
+    /// `ClientboundExplodePacket` with `playerKnockback.isPresent`
+    Explode { knockback: (f64, f64, f64) },
+    /// `ServerboundPongPacket`
+    Pong,
+}
+
+/// What the modify handler did to the packet.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum VelocityModifyOutcome {
+    /// The packet flows on untouched.
+    PassThrough,
+    /// Upstream `event.cancelEvent()`.
+    Cancelled,
+    /// The packet's motion was rewritten in place: (x, y, z).
+    Modified((f64, f64, f64)),
+}
+
+/// Upstream `PercentageChance.getAsBoolean`: 0% is always false, 100% always
+/// true, otherwise a uniform roll in 0..100 is under the percentage.
+fn velocity_chance_as_boolean(module: &Module, roll: f64) -> bool {
+    let percentage = tb_setting_i64(module, "Chance", 100) as f64;
+    if percentage <= 0.0 {
+        false
+    } else if percentage >= 100.0 {
+        true
+    } else {
+        roll * 100.0 < percentage
+    }
+}
+
+/// Upstream `VelocityTriggerFilter.condition`: Always, OnGround, InAir.
+fn velocity_modify_filter_passes(module: &Module, world: &dyn VelocityWorld) -> bool {
+    match module
+        .setting("Filter")
+        .and_then(|value| value.kind.choice())
+        .unwrap_or("Always")
+    {
+        "OnGround" => world.player_on_ground(),
+        "InAir" => !world.player_on_ground(),
+        _ => true, // Always
+    }
+}
+
+/// Upstream the shared gate block: chance, filter, `OnlyMove` + input.
+fn velocity_modify_gates_pass(
+    module: &Module,
+    world: &dyn VelocityWorld,
+    chance_roll: f64,
+) -> bool {
+    if !velocity_chance_as_boolean(module, chance_roll) {
+        return false;
+    }
+    if !velocity_modify_filter_passes(module, world) {
+        return false;
+    }
+    if tb_setting_bool(module, "OnlyMove", false) && !world.any_horizontal_input() {
+        return false;
+    }
+    true
+}
+
+/// Upstream `VelocityModify.packetHandler`, a `handler` on `PacketEvent`.
+/// `wait_until_ground` is `NoFallBlink.waitUntilGround`.
+pub fn velocity_modify_packet_handler(
+    module: &Module,
+    state: &mut VelocityModifyState,
+    world: &dyn VelocityWorld,
+    chance_roll: f64,
+    packet: VelocityModifyPacket,
+    wait_until_ground: &mut bool,
+) -> VelocityModifyOutcome {
+    match packet {
+        VelocityModifyPacket::Motion { movement: (x, y, z) } => {
+            // Check if this is a regular velocity update
+            if !velocity_modify_gates_pass(module, world, chance_roll) {
+                return VelocityModifyOutcome::PassThrough;
+            }
+
+            let horizontal = tb_setting_f64(module, "Horizontal", 0.0);
+            let vertical = tb_setting_f64(module, "Vertical", 0.0);
+
+            // It should just block the packet
+            if horizontal == 0.0 && vertical == 0.0 {
+                *wait_until_ground = true;
+                return VelocityModifyOutcome::Cancelled;
+            }
+
+            let current_velocity = world.delta_movement();
+            let (mut x, mut y, mut z) = (x, y, z);
+
+            // Modify packet according to the specified values
+            if horizontal != 0.0 {
+                x *= horizontal;
+                z *= horizontal;
+            } else {
+                // set the horizontal velocity to the player velocity to
+                // prevent horizontal slowdown
+                x = current_velocity.x * tb_setting_f64(module, "MotionHorizontal", 0.0);
+                z = current_velocity.z * tb_setting_f64(module, "MotionHorizontal", 0.0);
+            }
+
+            if vertical != 0.0 {
+                y *= vertical;
+            } else {
+                // set the vertical velocity to the player velocity to
+                // prevent vertical slowdown
+                y = current_velocity.y * tb_setting_f64(module, "MotionVertical", 0.0);
+            }
+
+            *wait_until_ground = true;
+            state.transaction_buffer += tb_setting_i64(module, "TransactionBuffer", 0);
+            VelocityModifyOutcome::Modified((x, y, z))
+        }
+
+        VelocityModifyPacket::Explode { knockback: (x, y, z) } => {
+            // Check if velocity is affected by explosion
+            if !tb_setting_bool(module, "ConsiderExplosion", true) {
+                return VelocityModifyOutcome::PassThrough;
+            }
+            if !velocity_modify_gates_pass(module, world, chance_roll) {
+                return VelocityModifyOutcome::PassThrough;
+            }
+
+            // note: explosion packets are being used by hypixel to trick
+            // poorly made cheats.
+
+            // Modify packet according to the specified values
+            let horizontal = tb_setting_f64(module, "Horizontal", 0.0);
+            let vertical = tb_setting_f64(module, "Vertical", 0.0);
+            let (mut x, mut y, mut z) = (x, y, z);
+            x *= horizontal;
+            y *= vertical;
+            z *= horizontal;
+
+            *wait_until_ground = true;
+            state.transaction_buffer += tb_setting_i64(module, "TransactionBuffer", 0);
+            VelocityModifyOutcome::Modified((x, y, z))
+        }
+
+        VelocityModifyPacket::Pong => {
+            if state.transaction_buffer > 0 {
+                state.transaction_buffer -= 1;
+                VelocityModifyOutcome::Cancelled
+            } else {
+                VelocityModifyOutcome::PassThrough
+            }
+        }
+    }
+}
+
+// ----- VelocityStrafe.kt -----
+
+pub fn velocity_strafe() -> Module {
+    Module::new(
+        "Strafe",
+        COMBAT,
+        vec![
+            int("Delay", 2, 0, 10), // "ticks" suffix
+            float("Strength", 1.0, 0.1, 2.0),
+            // OnlyFacing: ToggleableValueGroup with a Range child
+            boolean("OnlyFacing", false),
+            float("Range", 3.5, 0.1, 6.0),
+            boolean("UntilGround", false),
+        ],
+    )
+}
+
+/// Upstream `VelocityStrafe.applyStrafe` + `shouldStrafe`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct VelocityStrafeState {
+    pub apply_strafe: bool,
+    pub should_strafe: bool,
+}
+
+/// Upstream `VelocityStrafe.tickHandler`, a `handler` on `GameTickEvent`.
+pub fn velocity_strafe_tick_handler(
+    module: &Module,
+    state: &mut VelocityStrafeState,
+    world: &dyn VelocityWorld,
+) {
+    if !tb_setting_bool(module, "OnlyFacing", false) {
+        return;
+    }
+    let range = tb_setting_f64(module, "Range", 3.5);
+    let Some(target) = world.find_enemy(range) else {
+        return;
+    };
+
+    let rotation = world
+        .current_rotation()
+        .unwrap_or_else(|| world.player_rotation());
+    state.should_strafe =
+        world.is_looking_at_entity(target, range, rotation).is_some();
+}
+
+/// What the strafe packet handler did.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum VelocityStrafePacketOutcome {
+    /// The packet is untouched.
+    Untouched,
+    /// Upstream `waitTicks(delay)` then `player.deltaMovement =
+    /// player.deltaMovement.withStrafe(speed = player.horizontalSpeed *
+    /// strength)`; `until_ground_armed` says `UntilGround` set
+    /// `applyStrafe`.
+    Applied { new_movement: Vec3, until_ground_armed: bool },
+}
+
+/// Upstream `VelocityStrafe.packetHandler`, a `sequenceHandler` on
+/// `PacketEvent`.
+pub fn velocity_strafe_packet_handler(
+    module: &Module,
+    state: &mut VelocityStrafeState,
+    world: &dyn VelocityWorld,
+    local_player_velocity: bool,
+) -> VelocityStrafePacketOutcome {
+    // Check if this is a regular velocity update
+    if !local_player_velocity {
+        return VelocityStrafePacketOutcome::Untouched;
+    }
+
+    let only_facing = tb_setting_bool(module, "OnlyFacing", false);
+    if only_facing && !state.should_strafe {
+        return VelocityStrafePacketOutcome::Untouched;
+    }
+
+    // A few anti-cheats can be easily tricked by applying the velocity a few
+    // ticks after being damaged: waitTicks(delay)
+    let _delay = tb_setting_i64(module, "Delay", 2);
+
+    // Apply strafe
+    let strength = tb_setting_f64(module, "Strength", 1.0);
+    let new_movement = with_strafe(
+        world.delta_movement(),
+        world.horizontal_speed() * strength,
+        1.0,
+        world.input_is_moving(),
+        world.movement_yaw(),
+    );
+
+    let mut until_ground_armed = false;
+    if tb_setting_bool(module, "UntilGround", false) {
+        state.apply_strafe = true;
+        until_ground_armed = true;
+    }
+
+    VelocityStrafePacketOutcome::Applied { new_movement, until_ground_armed }
+}
+
+/// What the strafe move handler did.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum VelocityStrafeMoveOutcome {
+    /// The movement is untouched.
+    Untouched,
+    /// Upstream `event.movement = event.movement.withStrafe(speed =
+    /// player.horizontalSpeed * strength)`; carries the new movement.
+    Applied(Vec3),
+}
+
+/// Upstream `VelocityStrafe.moveHandler`, a `handler` on `PlayerMoveEvent`.
+pub fn velocity_strafe_move_handler(
+    module: &Module,
+    state: &mut VelocityStrafeState,
+    world: &dyn VelocityWorld,
+    movement: Vec3,
+) -> VelocityStrafeMoveOutcome {
+    if world.player_on_ground() {
+        state.apply_strafe = false;
+        return VelocityStrafeMoveOutcome::Untouched;
+    }
+
+    if state.apply_strafe {
+        let strength = tb_setting_f64(module, "Strength", 1.0);
+        let new_movement = with_strafe(
+            movement,
+            world.horizontal_speed() * strength,
+            1.0,
+            world.input_is_moving(),
+            world.movement_yaw(),
+        );
+        return VelocityStrafeMoveOutcome::Applied(new_movement);
+    }
+
+    VelocityStrafeMoveOutcome::Untouched
+}
+
+#[cfg(test)]
+mod velocity_mode_tests {
+    use super::*;
+
+    struct MockVelWorld {
+        on_ground: bool,
+        moving_input: bool,
+        delta: Vec3,
+        yaw: f32,
+        enemy: Option<Vec3>,
+        looking: bool,
+    }
+
+    impl Default for MockVelWorld {
+        fn default() -> Self {
+            MockVelWorld {
+                on_ground: true,
+                moving_input: true,
+                delta: Vec3 { x: 0.4, y: -0.078, z: 0.3 },
+                yaw: 90.0,
+                enemy: None,
+                looking: false,
+            }
+        }
+    }
+
+    impl VelocityWorld for MockVelWorld {
+        fn player_id(&self) -> i64 {
+            42
+        }
+        fn player_on_ground(&self) -> bool {
+            self.on_ground
+        }
+        fn any_horizontal_input(&self) -> bool {
+            self.moving_input
+        }
+        fn delta_movement(&self) -> Vec3 {
+            self.delta
+        }
+        fn horizontal_speed(&self) -> f64 {
+            (self.delta.x * self.delta.x + self.delta.z * self.delta.z).sqrt()
+        }
+        fn input_is_moving(&self) -> bool {
+            self.moving_input
+        }
+        fn movement_yaw(&self) -> f32 {
+            self.yaw
+        }
+        fn find_enemy(&self, _max_range: f64) -> Option<Vec3> {
+            self.enemy
+        }
+        fn is_looking_at_entity(
+            &self,
+            _target: Vec3,
+            _range: f64,
+            _rotation: (f32, f32),
+        ) -> Option<()> {
+            if self.looking { Some(()) } else { None }
+        }
+        fn current_rotation(&self) -> Option<(f32, f32)> {
+            None
+        }
+        fn player_rotation(&self) -> (f32, f32) {
+            (10.0, 0.0)
+        }
+    }
+
+    #[test]
+    fn velocity_modify_scales_the_motion_packet() {
+        let mut module = velocity_modify();
+        module.setting_mut("Horizontal").unwrap().kind = ValueKind::Float(0.5, -1.0, 1.0);
+        module.setting_mut("Vertical").unwrap().kind = ValueKind::Float(0.5, -1.0, 1.0);
+        let world = MockVelWorld::default();
+        let mut state = VelocityModifyState::default();
+        let mut wait_until_ground = false;
+
+        let outcome = velocity_modify_packet_handler(
+            &module,
+            &mut state,
+            &world,
+            0.5,
+            VelocityModifyPacket::Motion { movement: (0.8, 0.4, 0.6) },
+            &mut wait_until_ground,
+        );
+        // x and z scale by horizontal, y by vertical
+        assert_eq!(outcome, VelocityModifyOutcome::Modified((0.4, 0.2, 0.3)));
+        assert!(wait_until_ground);
+        assert_eq!(state.transaction_buffer, 0);
+    }
+
+    #[test]
+    fn velocity_modify_motion_fallback_uses_player_velocity() {
+        let mut module = velocity_modify();
+        // Vertical scales, Horizontal falls back to MotionHorizontal
+        module.setting_mut("Vertical").unwrap().kind = ValueKind::Float(0.5, -1.0, 1.0);
+        module.setting_mut("MotionHorizontal").unwrap().kind = ValueKind::Float(0.25, 0.0, 1.0);
+        let world = MockVelWorld::default();
+        let mut state = VelocityModifyState::default();
+        let mut wait_until_ground = false;
+
+        let outcome = velocity_modify_packet_handler(
+            &module,
+            &mut state,
+            &world,
+            0.5,
+            VelocityModifyPacket::Motion { movement: (0.8, 0.4, 0.6) },
+            &mut wait_until_ground,
+        );
+        // x = delta.x * motionHorizontal, y = movement.y * vertical
+        assert_eq!(
+            outcome,
+            VelocityModifyOutcome::Modified((0.4 * 0.25, 0.2, 0.3 * 0.25))
+        );
+        assert!(wait_until_ground);
+    }
+
+    #[test]
+    fn velocity_modify_blocks_the_packet_when_horizontal_and_vertical_are_zero() {
+        let module = velocity_modify();
+        let world = MockVelWorld::default();
+        let mut state = VelocityModifyState::default();
+        let mut wait_until_ground = false;
+
+        let outcome = velocity_modify_packet_handler(
+            &module,
+            &mut state,
+            &world,
+            0.5,
+            VelocityModifyPacket::Motion { movement: (0.8, 0.4, 0.6) },
+            &mut wait_until_ground,
+        );
+        assert_eq!(outcome, VelocityModifyOutcome::Cancelled);
+        assert!(wait_until_ground);
+    }
+
+    #[test]
+    fn velocity_modify_gates_drop_the_packet() {
+        let world = MockVelWorld::default();
+        let mut state = VelocityModifyState::default();
+        let mut wait_until_ground = false;
+
+        // Chance 0% never fires
+        let mut module = velocity_modify();
+        module.setting_mut("Chance").unwrap().kind = ValueKind::Int(0, 0, 100);
+        let outcome = velocity_modify_packet_handler(
+            &module,
+            &mut state,
+            &world,
+            0.5,
+            VelocityModifyPacket::Motion { movement: (0.8, 0.4, 0.6) },
+            &mut wait_until_ground,
+        );
+        assert_eq!(outcome, VelocityModifyOutcome::PassThrough);
+        assert!(!wait_until_ground);
+
+        // OnGround filter while in air drops it
+        let mut module = velocity_modify();
+        module.setting_mut("Filter").unwrap().kind =
+            ValueKind::Choice("OnGround".into(), VELOCITY_FILTER_TAGS.iter().map(|s| s.to_string()).collect());
+        let mut world = MockVelWorld::default();
+        world.on_ground = false;
+        let outcome = velocity_modify_packet_handler(
+            &module,
+            &mut state,
+            &world,
+            0.5,
+            VelocityModifyPacket::Motion { movement: (0.8, 0.4, 0.6) },
+            &mut wait_until_ground,
+        );
+        assert_eq!(outcome, VelocityModifyOutcome::PassThrough);
+
+        // OnlyMove without horizontal input drops it
+        let mut module = velocity_modify();
+        module.setting_mut("OnlyMove").unwrap().kind = ValueKind::Bool(true);
+        let mut world = MockVelWorld::default();
+        world.moving_input = false;
+        let outcome = velocity_modify_packet_handler(
+            &module,
+            &mut state,
+            &world,
+            0.5,
+            VelocityModifyPacket::Motion { movement: (0.8, 0.4, 0.6) },
+            &mut wait_until_ground,
+        );
+        assert_eq!(outcome, VelocityModifyOutcome::PassThrough);
+    }
+
+    #[test]
+    fn velocity_modify_scales_the_explosion_knockback() {
+        let mut module = velocity_modify();
+        module.setting_mut("Horizontal").unwrap().kind = ValueKind::Float(0.5, -1.0, 1.0);
+        module.setting_mut("Vertical").unwrap().kind = ValueKind::Float(0.5, -1.0, 1.0);
+        module.setting_mut("TransactionBuffer").unwrap().kind = ValueKind::Int(2, 0, 3);
+        let world = MockVelWorld::default();
+        let mut state = VelocityModifyState::default();
+        let mut wait_until_ground = false;
+
+        let outcome = velocity_modify_packet_handler(
+            &module,
+            &mut state,
+            &world,
+            0.5,
+            VelocityModifyPacket::Explode { knockback: (0.8, 0.4, 0.6) },
+            &mut wait_until_ground,
+        );
+        // knockback.x *= horizontal, knockback.y *= vertical, knockback.z *= horizontal
+        assert_eq!(outcome, VelocityModifyOutcome::Modified((0.4, 0.2, 0.3)));
+        assert!(wait_until_ground);
+        assert_eq!(state.transaction_buffer, 2);
+
+        // ConsiderExplosion false leaves the packet untouched
+        module.setting_mut("ConsiderExplosion").unwrap().kind = ValueKind::Bool(false);
+        let outcome = velocity_modify_packet_handler(
+            &module,
+            &mut state,
+            &world,
+            0.5,
+            VelocityModifyPacket::Explode { knockback: (0.8, 0.4, 0.6) },
+            &mut wait_until_ground,
+        );
+        assert_eq!(outcome, VelocityModifyOutcome::PassThrough);
+        assert_eq!(state.transaction_buffer, 2);
+    }
+
+    #[test]
+    fn velocity_modify_cancels_pong_packets_while_the_buffer_is_up() {
+        let mut module = velocity_modify();
+        // Horizontal 0.5 so the motion packet scales and fills the buffer
+        // (with both modifiers 0 the packet is blocked outright instead)
+        module.setting_mut("Horizontal").unwrap().kind = ValueKind::Float(0.5, -1.0, 1.0);
+        module.setting_mut("TransactionBuffer").unwrap().kind = ValueKind::Int(2, 0, 3);
+        let world = MockVelWorld::default();
+        let mut state = VelocityModifyState::default();
+        let mut wait_until_ground = false;
+
+        // Fill the buffer through a motion packet
+        velocity_modify_packet_handler(
+            &module,
+            &mut state,
+            &world,
+            0.5,
+            VelocityModifyPacket::Motion { movement: (0.8, 0.4, 0.6) },
+            &mut wait_until_ground,
+        );
+        assert_eq!(state.transaction_buffer, 2);
+
+        // Each pong cancels and drains one
+        assert_eq!(
+            velocity_modify_packet_handler(
+                &module,
+                &mut state,
+                &world,
+                0.5,
+                VelocityModifyPacket::Pong,
+                &mut wait_until_ground
+            ),
+            VelocityModifyOutcome::Cancelled
+        );
+        assert_eq!(
+            velocity_modify_packet_handler(
+                &module,
+                &mut state,
+                &world,
+                0.5,
+                VelocityModifyPacket::Pong,
+                &mut wait_until_ground
+            ),
+            VelocityModifyOutcome::Cancelled
+        );
+        assert_eq!(state.transaction_buffer, 0);
+
+        // Once empty, pongs flow on
+        assert_eq!(
+            velocity_modify_packet_handler(
+                &module,
+                &mut state,
+                &world,
+                0.5,
+                VelocityModifyPacket::Pong,
+                &mut wait_until_ground
+            ),
+            VelocityModifyOutcome::PassThrough
+        );
+
+        // disable() resets the buffer
+        state.transaction_buffer = 3;
+        velocity_modify_disable(&mut state);
+        assert_eq!(state.transaction_buffer, 0);
+    }
+
+    #[test]
+    fn with_strafe_blends_the_previous_velocity_toward_the_yaw() {
+        let vec = Vec3 { x: 1.0, y: 0.5, z: 2.0 };
+
+        // Not moving zeroes the horizontal components
+        assert_eq!(
+            with_strafe(vec, 4.0, 1.0, false, 90.0),
+            Vec3 { x: 0.0, y: 0.5, z: 0.0 }
+        );
+
+        // yaw 90°: sin = 1, cos = 0, so x - speed, z + 0
+        let out = with_strafe(vec, 3.0, 0.5, true, 90.0);
+        assert_eq!(out.y, 0.5);
+        assert!((out.x - (1.0 * 0.5 - 1.5)).abs() < 1e-12);
+        assert!((out.z - 2.0 * 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn velocity_strafe_packet_handler_applies_the_strafe() {
+        let mut module = velocity_strafe();
+        let world = MockVelWorld::default();
+        let mut state = VelocityStrafeState::default();
+
+        // Not a local velocity packet: untouched
+        assert_eq!(
+            velocity_strafe_packet_handler(&module, &mut state, &world, false),
+            VelocityStrafePacketOutcome::Untouched
+        );
+
+        // Local velocity: strafe applied, UntilGround arms applyStrafe
+        let outcome = velocity_strafe_packet_handler(&module, &mut state, &world, true);
+        assert!(matches!(outcome, VelocityStrafePacketOutcome::Applied { until_ground_armed: false, .. }));
+        assert!(!state.apply_strafe);
+
+        module.setting_mut("UntilGround").unwrap().kind = ValueKind::Bool(true);
+        let outcome = velocity_strafe_packet_handler(&module, &mut state, &world, true);
+        assert!(matches!(outcome, VelocityStrafePacketOutcome::Applied { until_ground_armed: true, .. }));
+        assert!(state.apply_strafe);
+    }
+
+    #[test]
+    fn velocity_strafe_packet_handler_respects_only_facing() {
+        let mut module = velocity_strafe();
+        let mut world = MockVelWorld::default();
+        world.enemy = Some(Vec3::ZERO);
+        world.looking = false;
+        let mut state = VelocityStrafeState::default();
+
+        // OnlyFacing with no enemy seen: the tick handler never sets
+        // shouldStrafe, so the packet handler passes
+        module.setting_mut("OnlyFacing").unwrap().kind = ValueKind::Bool(true);
+        velocity_strafe_tick_handler(&module, &mut state, &world);
+        assert!(!state.should_strafe);
+        assert_eq!(
+            velocity_strafe_packet_handler(&module, &mut state, &world, true),
+            VelocityStrafePacketOutcome::Untouched
+        );
+
+        // Looking at the enemy sets shouldStrafe and lets it through
+        world.looking = true;
+        velocity_strafe_tick_handler(&module, &mut state, &world);
+        assert!(state.should_strafe);
+        assert!(matches!(
+            velocity_strafe_packet_handler(&module, &mut state, &world, true),
+            VelocityStrafePacketOutcome::Applied { .. }
+        ));
+
+        // OnlyFacing off ignores shouldStrafe entirely
+        module.setting_mut("OnlyFacing").unwrap().kind = ValueKind::Bool(false);
+        state.should_strafe = false;
+        assert!(matches!(
+            velocity_strafe_packet_handler(&module, &mut state, &world, true),
+            VelocityStrafePacketOutcome::Applied { .. }
+        ));
+    }
+
+    #[test]
+    fn velocity_strafe_move_handler_applies_until_the_player_lands() {
+        let module = velocity_strafe();
+        let mut world = MockVelWorld::default();
+        world.on_ground = false;
+        let mut state = VelocityStrafeState::default();
+        state.apply_strafe = true;
+
+        // In air with applyStrafe: the movement is rewritten
+        let outcome =
+            velocity_strafe_move_handler(&module, &mut state, &world, Vec3 { x: 1.0, y: 0.0, z: 0.0 });
+        assert!(matches!(outcome, VelocityStrafeMoveOutcome::Applied(_)));
+
+        // On ground: cleared and untouched
+        world.on_ground = true;
+        let outcome =
+            velocity_strafe_move_handler(&module, &mut state, &world, Vec3 { x: 1.0, y: 0.0, z: 0.0 });
+        assert_eq!(outcome, VelocityStrafeMoveOutcome::Untouched);
+        assert!(!state.apply_strafe);
+
+        // Back in air without applyStrafe: untouched
+        world.on_ground = false;
+        let outcome =
+            velocity_strafe_move_handler(&module, &mut state, &world, Vec3 { x: 1.0, y: 0.0, z: 0.0 });
+        assert_eq!(outcome, VelocityStrafeMoveOutcome::Untouched);
+    }
+}

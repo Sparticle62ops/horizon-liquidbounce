@@ -18459,3 +18459,1423 @@ mod backtrack_tests {
         assert_eq!(data, Some((Vec3 { x: 0.0, y: 0.0, z: 0.0 }, 90.0)));
     }
 }
+
+// ----- Seams + ModuleTpAura.kt -----
+
+/// Upstream `Teleport.State`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TpState {
+    Active,
+    Done,
+    /// The server set the player back.
+    Rejected,
+    /// A solid block appeared ahead.
+    Invalid,
+    Cancelled,
+}
+
+/// Upstream `Teleport.Finish`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TpFinish {
+    /// The client moves to the destination as well.
+    Land,
+    /// The server stays at the destination until undo brings it back to the client.
+    Hold,
+    /// The route ends where the client is.
+    Resync,
+}
+
+/// Upstream `Route` flattened to the fields `ModuleTpAura` reads.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TpRoute {
+    pub start: Vec3,
+    pub destination: Vec3,
+    /// Upstream `Route.path` (the corner points).
+    pub path: Vec<Vec3>,
+}
+
+/// Upstream `RouteResult<Route>`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TpRouteResult {
+    Searching,
+    AlreadyThere,
+    Found(TpRoute),
+    Failed,
+}
+
+/// A standable goal position around the target (upstream `BlockPos`,
+/// flattened to its bottom-center coordinates).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TpGoalPos {
+    pub x: i64,
+    pub y: i64,
+    pub z: i64,
+}
+
+/// The engine surfaces `ModuleTpAura` reads: target selection, teleport
+/// navigation (`Trip`/`TeleportManager`), the clicker, rotations and terrain.
+pub trait TpAuraHooks {
+    // player state
+    fn player_is_dead_or_dying(&self) -> bool {
+        false
+    }
+    fn player_is_spectator(&self) -> bool {
+        false
+    }
+    fn player_is_passenger(&self) -> bool {
+        false
+    }
+    /// `player.entityInteractionRange()`.
+    fn player_entity_interaction_range(&self) -> f64 {
+        3.0
+    }
+    /// `player.cannotAttackWithItem(player.mainHandItem, 0)`.
+    fn player_cannot_attack_with_item(&self) -> bool {
+        false
+    }
+    /// `player.getEyePositionAt(feet)`.
+    fn player_eye_position_at(&self, feet: Vec3) -> Vec3;
+
+    // TargetSelector
+    /// `targetSelector.targets().firstOrNull { ... }` under the tick gate.
+    fn selector_first_target(&self) -> Option<u64> {
+        None
+    }
+    /// `targetSelector.validate(target)`.
+    fn selector_validate(&self, target: u64) -> bool {
+        false
+    }
+
+    // target geometry
+    /// `target.boundingBox.distanceToSqr(eyes)`.
+    fn target_bounding_box_distance_to_sqr(&self, eyes: Vec3) -> f64 {
+        0.0
+    }
+    /// `target.boundingBox.center`.
+    fn target_bounding_box_center(&self) -> Vec3;
+    /// `target.boundingBox.inflate(target.pickRadius).clip(eyes, end)` (AABB ray clip).
+    fn target_bounding_box_clip(&self, eyes: Vec3, end: Vec3) -> Option<Vec3> {
+        None
+    }
+    /// `target.pickRadius`.
+    fn target_pick_radius(&self) -> f64 {
+        0.0
+    }
+
+    // rotations
+    /// `raytraceBox(eyes, box, range = reach, wallsRange = 0.0)?.rotation`.
+    fn raytrace_box_rotation(&self, eyes: Vec3, reach: f64) -> Option<(f32, f32)> {
+        None
+    }
+    /// `Rotation.lookingAt(box.center, eyes)`.
+    fn rotation_looking_at(&self, point: Vec3, from: Vec3) -> (f32, f32);
+    /// `RotationManager.serverRotation.directionVector`.
+    fn server_rotation_direction(&self) -> Vec3;
+    /// `RotationManager.setRotationTarget(rotations.toRotationTarget(rotation, target),
+    /// priority = IMPORTANT_FOR_USAGE_2, provider = this)`.
+    fn set_rotation_target(&mut self, rotation: (f32, f32), target: u64);
+
+    // clicker (upstream `Clicker`)
+    /// `clicker.willClickAt(arrival)`.
+    fn clicker_will_click_at(&self, arrival: i64) -> bool {
+        false
+    }
+    /// `clicker.isClickTick` (= `willClickAt(0)`).
+    fn clicker_is_click_tick(&self) -> bool {
+        false
+    }
+    /// `clicker.click { ... }`: run the click body; true when it went through.
+    fn clicker_click(&mut self) -> bool {
+        false
+    }
+
+    // Trip / TeleportManager
+    /// `trip.isAvailable` (`TeleportManager.isAvailable(owner)`).
+    fn trip_is_available(&self) -> bool {
+        true
+    }
+    /// `trip.isAway` (`TeleportManager.holds(owner)`).
+    fn trip_is_away(&self) -> bool {
+        false
+    }
+    /// `trip.feet` (`TeleportManager.serverPosition` while away, else the client).
+    fn trip_feet(&self) -> Vec3;
+    /// `trip.request(origin, goals, maxLength, destination)`.
+    fn trip_request(&mut self, origin: Vec3, goals: &[TpGoalPos], max_length: f64, destination: Vec3);
+    /// `trip.poll()`.
+    fn trip_poll(&mut self) -> TpRouteResult;
+    /// `trip.dispatch(route, finish)`; None means leave.
+    fn trip_dispatch(&mut self, route: &TpRoute, finish: TpFinish) -> Option<TpRoute>;
+    /// `trip.run?.state`.
+    fn trip_run_state(&self) -> Option<TpState> {
+        None
+    }
+    /// `trip.comeBack()`.
+    fn trip_come_back(&mut self) -> bool {
+        false
+    }
+    /// `trip.reset()`.
+    fn trip_reset(&mut self);
+    /// `TeleportManager.undo(this)`.
+    fn teleport_manager_undo(&mut self);
+    /// `trip.showReturn()`.
+    fn trip_show_return(&mut self);
+
+    // terrain
+    /// `Terrain.live().reachPositions(target.boundingBox, reach, from)`.
+    fn reach_positions(&self, reach: f64, from: Vec3) -> Vec<TpGoalPos> {
+        Vec::new()
+    }
+
+    // raytracing
+    /// `hasLineOfSight(eyes, hit)`.
+    fn has_line_of_sight(&self, eyes: Vec3, hit: Vec3) -> bool {
+        false
+    }
+
+    // attack
+    /// `attackEntity(target, SwingMode.DO_NOT_HIDE, keepSprint = true)`.
+    fn attack_entity(&mut self, target: u64, keep_sprint: bool);
+
+    // RouteView (the on-screen route/box preview)
+    fn view_target_set(&mut self, target: Option<u64>);
+    fn view_engaged_set(&mut self, engaged: bool);
+    fn view_clear(&mut self);
+    fn view_done(&mut self);
+    fn view_invalid(&mut self);
+    fn view_pending(&mut self);
+    fn view_active_path(&mut self, path: &[Vec3]);
+    fn view_attack_position_set(&mut self, position: Option<Vec3>);
+}
+
+/// Upstream `ModuleTpAura.Phase`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TpAuraPhase {
+    Idle,
+    Routing,
+    Ready,
+    Approach,
+    Attack,
+    Return,
+}
+
+/// Upstream `ModuleTpAura.Engagement`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TpAuraEngagement {
+    pub target: u64,
+    pub route: Option<TpRoute>,
+    pub waited: i64,
+    pub hold_left: i64,
+    pub retries: i64,
+    pub attacked: bool,
+}
+
+/// Upstream `ModuleTpAura` object state.
+#[derive(Clone, Debug)]
+pub struct TpAuraState {
+    pub phase: TpAuraPhase,
+    pub engagement: Option<TpAuraEngagement>,
+    pub ticks: i64,
+    pub rest_until: i64,
+    /// Targets without a route, by entity id, until the tick they may be tried again.
+    pub unreachable: std::collections::HashMap<i64, i64>,
+}
+
+impl Default for TpAuraState {
+    fn default() -> Self {
+        TpAuraState {
+            phase: TpAuraPhase::Idle,
+            engagement: None,
+            ticks: 0,
+            rest_until: 0,
+            unreachable: std::collections::HashMap::new(),
+        }
+    }
+}
+
+/// Upstream `ModuleTpAura.AfterAttack`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TpAfterAttack {
+    Return,
+    Stay,
+}
+
+fn tp_after_attack(module: &Module) -> TpAfterAttack {
+    match module.setting("AfterAttack").map(|v| &v.kind) {
+        Some(ValueKind::Choice(sel, _)) if sel == "Stay" => TpAfterAttack::Stay,
+        _ => TpAfterAttack::Return,
+    }
+}
+
+/// Upstream `ModuleTpAura.reach`.
+fn tp_reach(module: &Module, hooks: &dyn TpAuraHooks) -> f64 {
+    hooks.player_entity_interaction_range() - TP_REACH_MARGIN
+}
+
+pub const TP_REACH_MARGIN: f64 = 0.1;
+pub const TP_TARGET_MOVEMENT_MARGIN: f64 = 0.4;
+pub const TP_ROUTE_DETOUR: f64 = 2.0;
+pub const TP_MAX_WAIT: i64 = 10;
+pub const TP_MAX_RETRIES: i64 = 2;
+pub const TP_FAIL_REST_TICKS: i64 = 10;
+pub const TP_SETBACK_REST_TICKS: i64 = 20;
+pub const TP_UNREACHABLE_TICKS: i64 = 40;
+
+/// Upstream `ModuleTpAura` — teleports next to enemies, attacks them, then
+/// returns or stays (disableOnQuit = true). TargetSelector / Clicker /
+/// Rotations / Steps trees are flattened into the module tree; navigation,
+/// terrain and rotation-manager surfaces live on the hooks.
+pub fn tp_aura() -> Module {
+    Module::new(
+        "TpAura",
+        COMBAT,
+        vec![
+            float("Range", 30.0, 6.0, 100.0),
+            choice("AfterAttack", "Return", &["Return", "Stay"]),
+            int("Hold", 10, 1, 40),
+            // TargetSelector tree (priority default [Type, Distance])
+            multi_choice("Priority", &["Type", "Distance"], &["Type", "Distance", "Health", "Direction", "Fov"]),
+            float("FOV", 180.0, 0.0, 180.0),
+            int("HurtTime", 10, 0, 10),
+            // Clicker tree (keyAttack, itemCooldown default, maxCps 30)
+            choice("Technique", "Human", &["Human", "Constant"]),
+            int_range("CPS", 11, 14, 1, 30),
+            int("MaxPerTick", 2, 1, 5),
+            boolean("MissCooldown", true),
+            // RotationsValueGroup(combatSpecific = true)
+            choice("AngleSmooth", "Linear", &["Linear", "Sigmoid", "Interpolation", "Acceleration", "Ai"]),
+            boolean("ShortStop", false),
+            // StepsValueGroup
+            float("Length", 5.0, 1.0, 9.5),
+            int("PerTick", 3, 1, 5),
+        ],
+    )
+}
+
+/// Upstream `ModuleTpAura.liveEngagement`: the engagement while its target is
+/// still one.
+fn tp_live_engagement(
+    hooks: &dyn TpAuraHooks,
+    state: &mut TpAuraState,
+) -> Option<TpAuraEngagement> {
+    let engagement = state.engagement.clone()?;
+    if hooks.selector_validate(engagement.target) {
+        Some(engagement)
+    } else {
+        None
+    }
+}
+
+/// Upstream `ModuleTpAura.onDisabled()`.
+pub fn tp_aura_on_disabled(hooks: &mut dyn TpAuraHooks, state: &mut TpAuraState) {
+    hooks.teleport_manager_undo();
+    tp_aura_reset(hooks, state);
+    state.rest_until = 0;
+    state.unreachable.clear();
+}
+
+/// Upstream `worldChangeHandler`.
+pub fn tp_aura_world_change_handler(hooks: &mut dyn TpAuraHooks, state: &mut TpAuraState) {
+    tp_aura_reset(hooks, state);
+    state.unreachable.clear();
+}
+
+/// Upstream `tickHandler` (`handler<GameTickEvent>`).
+pub fn tp_aura_tick_handler(module: &Module, hooks: &mut dyn TpAuraHooks, state: &mut TpAuraState) {
+    state.ticks += 1;
+    if hooks.player_is_dead_or_dying() || hooks.player_is_spectator() || hooks.player_is_passenger() {
+        tp_aura_leave(hooks, state);
+        return;
+    }
+
+    match state.phase {
+        TpAuraPhase::Idle => tp_aura_engage(module, hooks, state),
+        TpAuraPhase::Routing => tp_aura_route(module, hooks, state),
+        TpAuraPhase::Ready => tp_aura_launch(module, hooks, state),
+        TpAuraPhase::Approach => tp_aura_approach(module, hooks, state),
+        TpAuraPhase::Attack => tp_aura_attack(module, hooks, state),
+        TpAuraPhase::Return => {
+            if !hooks.trip_is_away() {
+                hooks.view_done();
+                state.phase = TpAuraPhase::Idle;
+            }
+        }
+    }
+}
+
+/// Upstream `rotationUpdateHandler` (`handler<RotationUpdateEvent>`).
+pub fn tp_aura_rotation_update_handler(
+    module: &Module,
+    hooks: &mut dyn TpAuraHooks,
+    state: &mut TpAuraState,
+) {
+    let Some(engagement) = state.engagement.clone() else {
+        return;
+    };
+    let feet = match state.phase {
+        TpAuraPhase::Ready | TpAuraPhase::Approach => {
+            engagement.route.as_ref().map(|route| route.destination)
+        }
+        TpAuraPhase::Attack => Some(hooks.trip_feet()),
+        _ => None,
+    };
+    let Some(feet) = feet else {
+        return;
+    };
+
+    let eyes = hooks.player_eye_position_at(feet);
+    let reach = tp_reach(module, hooks);
+    let rotation = match hooks.raytrace_box_rotation(eyes, reach) {
+        Some(rotation) => rotation,
+        None => {
+            let center = hooks.target_bounding_box_center();
+            hooks.rotation_looking_at(center, eyes)
+        }
+    };
+
+    hooks.set_rotation_target(rotation, engagement.target);
+}
+
+/// Upstream `ModuleTpAura.engage()`.
+fn tp_aura_engage(module: &Module, hooks: &mut dyn TpAuraHooks, state: &mut TpAuraState) {
+    if state.ticks < state.rest_until || !hooks.trip_is_available() {
+        return;
+    }
+
+    let origin = hooks.trip_feet();
+    let target = hooks
+        .selector_first_target()
+        .filter(|target| state.unreachable.get(&(*target as i64)).copied().unwrap_or(0) <= state.ticks);
+    match target {
+        None => {
+            hooks.view_clear();
+            return;
+        }
+        Some(target) => {
+            state.engagement = Some(TpAuraEngagement {
+                target,
+                route: None,
+                waited: 0,
+                hold_left: 0,
+                retries: 0,
+                attacked: false,
+            });
+            hooks.view_target_set(Some(target));
+        }
+    }
+
+    let engagement = state.engagement.as_ref().unwrap();
+    if tp_is_in_reach(module, hooks, origin, engagement.target) {
+        tp_aura_start_attack(state);
+        return;
+    }
+
+    let goals = tp_attack_positions(module, hooks, engagement.target, origin);
+    if goals.is_empty() {
+        let target = engagement.target;
+        tp_aura_fail(hooks, state, target);
+    } else {
+        let range = crit_float(module, "Range", 30.0);
+        tp_aura_request_route(hooks, state, origin, goals, range);
+    }
+}
+
+/// Upstream `ModuleTpAura.requestRoute(origin, goals)`.
+fn tp_aura_request_route(
+    hooks: &mut dyn TpAuraHooks,
+    state: &mut TpAuraState,
+    origin: Vec3,
+    goals: Vec<TpGoalPos>,
+    range: f64,
+) {
+    let destination = goals
+        .first()
+        .map(|goal| Vec3 { x: goal.x as f64 + 0.5, y: goal.y as f64, z: goal.z as f64 + 0.5 })
+        .unwrap_or(Vec3 { x: 0.0, y: 0.0, z: 0.0 });
+    hooks.trip_request(origin, &goals, range * TP_ROUTE_DETOUR, destination);
+    hooks.view_pending();
+    state.phase = TpAuraPhase::Routing;
+}
+
+/// Upstream `ModuleTpAura.route()`.
+fn tp_aura_route(module: &Module, hooks: &mut dyn TpAuraHooks, state: &mut TpAuraState) {
+    let Some(engagement) = tp_live_engagement(hooks, state) else {
+        return tp_aura_leave(hooks, state);
+    };
+    match hooks.trip_poll() {
+        TpRouteResult::Searching => {}
+        TpRouteResult::AlreadyThere => tp_aura_start_attack(state),
+        TpRouteResult::Found(route) => {
+            let mut engagement = engagement;
+            engagement.route = Some(route.clone());
+            engagement.waited = 0;
+            hooks.view_active_path(&route.path);
+            hooks.view_attack_position_set(Some(route.destination));
+            state.engagement = Some(engagement);
+            state.phase = TpAuraPhase::Ready;
+            tp_aura_launch(module, hooks, state);
+        }
+        TpRouteResult::Failed => tp_aura_fail(hooks, state, engagement.target),
+    }
+}
+
+/// Upstream `ModuleTpAura.launch()`: sets off once the clicker is about to
+/// click when the route arrives.
+fn tp_aura_launch(module: &Module, hooks: &mut dyn TpAuraHooks, state: &mut TpAuraState) {
+    let Some(engagement) = tp_live_engagement(hooks, state) else {
+        return tp_aura_leave(hooks, state);
+    };
+    let Some(route) = engagement.route.clone() else {
+        return tp_aura_leave(hooks, state);
+    };
+    if !tp_is_in_reach(module, hooks, route.destination, engagement.target) {
+        return tp_aura_replan(module, hooks, state);
+    }
+
+    let per_tick = setting_int(module, "PerTick", 3);
+    let arrival = tp_batch_count(route.destination, route.start, per_tick);
+    let mut engagement = engagement;
+    if !hooks.clicker_will_click_at(arrival) && engagement.waited < TP_MAX_WAIT {
+        engagement.waited += 1;
+        state.engagement = Some(engagement);
+        return;
+    }
+
+    let finish = if tp_after_attack(module) == TpAfterAttack::Return {
+        TpFinish::Hold
+    } else {
+        TpFinish::Land
+    };
+    let Some(_) = hooks.trip_dispatch(&route, finish) else {
+        return tp_aura_leave(hooks, state);
+    };
+    state.engagement = Some(engagement);
+    state.phase = TpAuraPhase::Approach;
+}
+
+/// Upstream `Route.batches(packetsPerTick).size` (a flattened count of the
+/// per-tick batch split).
+fn tp_batch_count(destination: Vec3, start: Vec3, packets_per_tick: i64) -> i64 {
+    let per_tick = packets_per_tick.clamp(1, 5);
+    let steps = ((destination.x - start.x).abs()
+        + (destination.y - start.y).abs()
+        + (destination.z - start.z).abs()) as i64;
+    (steps / per_tick) + 1
+}
+
+/// Upstream `ModuleTpAura.approach()`.
+fn tp_aura_approach(module: &Module, hooks: &mut dyn TpAuraHooks, state: &mut TpAuraState) {
+    let Some(run_state) = hooks.trip_run_state() else {
+        return tp_aura_leave(hooks, state);
+    };
+    match run_state {
+        TpState::Active => {}
+        TpState::Done => tp_aura_start_attack(state),
+        TpState::Rejected => tp_aura_rejected(module, hooks, state),
+        TpState::Invalid | TpState::Cancelled => {
+            hooks.view_invalid();
+            hooks.trip_show_return();
+            state.phase = TpAuraPhase::Return;
+        }
+    }
+}
+
+/// Upstream `ModuleTpAura.startAttack()`.
+fn tp_aura_start_attack(state: &mut TpAuraState) {
+    if let Some(engagement) = state.engagement.as_mut() {
+        engagement.hold_left = 0;
+        engagement.attacked = false;
+        engagement.retries = 0;
+    }
+    state.phase = TpAuraPhase::Attack;
+}
+
+/// Upstream `ModuleTpAura.attack()`.
+fn tp_aura_attack(module: &Module, hooks: &mut dyn TpAuraHooks, state: &mut TpAuraState) {
+    if hooks.trip_run_state() == Some(TpState::Rejected) {
+        return tp_aura_rejected(module, hooks, state);
+    }
+
+    let return_mode = tp_after_attack(module) == TpAfterAttack::Return;
+    let Some(engagement) = tp_live_engagement(hooks, state)
+        .filter(|engagement| !(engagement.attacked && return_mode))
+    else {
+        return tp_aura_leave(hooks, state);
+    };
+    let target = engagement.target;
+    let feet = hooks.trip_feet();
+    if !tp_is_in_reach(module, hooks, feet, target) {
+        let retries = engagement.retries + 1;
+        state.engagement = Some(TpAuraEngagement { retries, ..engagement });
+        return if retries < TP_MAX_RETRIES {
+            tp_aura_replan(module, hooks, state)
+        } else {
+            tp_aura_leave(hooks, state)
+        };
+    }
+
+    hooks.view_engaged_set(true);
+    if hooks.clicker_is_click_tick()
+        && tp_is_facing(module, hooks, feet, target)
+        && !hooks.player_cannot_attack_with_item()
+        && hooks.clicker_click()
+    {
+        hooks.attack_entity(target, true);
+        if let Some(engagement) = state.engagement.as_mut() {
+            engagement.attacked = true;
+        }
+    }
+
+    if return_mode {
+        let Some(engagement) = state.engagement.as_mut() else {
+            return;
+        };
+        engagement.hold_left -= 1;
+        if engagement.hold_left <= 0 {
+            tp_aura_leave(hooks, state);
+        }
+    }
+}
+
+/// Upstream `ModuleTpAura.replan()`: routes again from where the server has
+/// the player, because the target moved.
+fn tp_aura_replan(module: &Module, hooks: &mut dyn TpAuraHooks, state: &mut TpAuraState) {
+    let Some(target) = state.engagement.as_ref().map(|engagement| engagement.target) else {
+        return tp_aura_leave(hooks, state);
+    };
+    let origin = hooks.trip_feet();
+    let goals = tp_attack_positions(module, hooks, target, origin);
+    if goals.is_empty() {
+        return tp_aura_leave(hooks, state);
+    }
+
+    hooks.view_engaged_set(false);
+    let range = crit_float(module, "Range", 30.0);
+    tp_aura_request_route(hooks, state, origin, goals, range);
+}
+
+/// Upstream `ModuleTpAura.leave()`: ends the engagement and brings the server
+/// back to the client.
+fn tp_aura_leave(hooks: &mut dyn TpAuraHooks, state: &mut TpAuraState) {
+    if state.phase == TpAuraPhase::Return {
+        return;
+    }
+
+    state.phase = if hooks.trip_come_back() {
+        hooks.view_engaged_set(false);
+        hooks.trip_show_return();
+        TpAuraPhase::Return
+    } else {
+        TpAuraPhase::Idle
+    };
+    state.engagement = None;
+}
+
+/// Upstream `ModuleTpAura.fail(target)`.
+fn tp_aura_fail(hooks: &mut dyn TpAuraHooks, state: &mut TpAuraState, target: u64) {
+    state.unreachable.insert(target as i64, state.ticks + TP_UNREACHABLE_TICKS);
+    hooks.view_invalid();
+    hooks.view_target_set(None);
+    state.engagement = None;
+    state.rest_until = state.ticks + TP_FAIL_REST_TICKS;
+    state.phase = TpAuraPhase::Idle;
+}
+
+/// Upstream `ModuleTpAura.rejected()`: the server set the player back, so it
+/// gets some rest before trying again.
+fn tp_aura_rejected(module: &Module, hooks: &mut dyn TpAuraHooks, state: &mut TpAuraState) {
+    tp_aura_reset(hooks, state);
+    hooks.view_invalid();
+    state.rest_until = state.ticks + TP_SETBACK_REST_TICKS;
+}
+
+/// Upstream `ModuleTpAura.reset()`.
+pub fn tp_aura_reset(hooks: &mut dyn TpAuraHooks, state: &mut TpAuraState) {
+    hooks.trip_reset();
+    state.phase = TpAuraPhase::Idle;
+    state.engagement = None;
+    hooks.view_clear();
+}
+
+/// Upstream `ModuleTpAura.isInReach(feet, target)`:
+/// `target.boundingBox.distanceToSqr(player.getEyePositionAt(feet)) <= Mth.square(reach)`.
+fn tp_is_in_reach(module: &Module, hooks: &dyn TpAuraHooks, feet: Vec3, target: u64) -> bool {
+    let reach = tp_reach(module, hooks);
+    hooks.target_bounding_box_distance_to_sqr(hooks.player_eye_position_at(feet)) <= reach * reach
+}
+
+/// Upstream `ModuleTpAura.isFacing(eyes, target)`: whether the rotation the
+/// server has hits the target from the eyes.
+fn tp_is_facing(module: &Module, hooks: &dyn TpAuraHooks, feet: Vec3, target: u64) -> bool {
+    let reach = tp_reach(module, hooks);
+    let eyes = hooks.player_eye_position_at(feet);
+    let pick_radius = hooks.target_pick_radius();
+    let _ = target;
+    let direction = hooks.server_rotation_direction();
+    let end = Vec3 {
+        x: eyes.x + direction.x * (reach + TP_REACH_MARGIN),
+        y: eyes.y + direction.y * (reach + TP_REACH_MARGIN),
+        z: eyes.z + direction.z * (reach + TP_REACH_MARGIN),
+    };
+    let Some(hit) = hooks.target_bounding_box_clip(eyes, end) else {
+        return false;
+    };
+    hooks.has_line_of_sight(eyes, hit)
+}
+
+/// Upstream `ModuleTpAura.attackPositions(target, from)`: standable positions
+/// around the target that see it within reach, closest to `from` first
+/// (`Terrain.live().reachPositions(target.boundingBox, reach - margin, from)`).
+fn tp_attack_positions(module: &Module, hooks: &dyn TpAuraHooks, target: u64, from: Vec3) -> Vec<TpGoalPos> {
+    let reach = tp_reach(module, hooks) - TP_TARGET_MOVEMENT_MARGIN;
+    let _ = target;
+    hooks.reach_positions(reach, from)
+}
+
+#[cfg(test)]
+mod tp_aura_tests {
+    use super::*;
+
+    struct TpMock {
+        dead: bool,
+        spectator: bool,
+        passenger: bool,
+        interaction_range: f64,
+        cannot_attack: bool,
+        eye: Vec3,
+        client_pos: Vec3,
+        server_pos: Vec3,
+        first_target: Option<u64>,
+        valid: bool,
+        bb_distance_sqr: f64,
+        bb_center: Vec3,
+        bb_clip: Option<Vec3>,
+        pick_radius: f64,
+        raytrace: Option<(f32, f32)>,
+        looking_at: (f32, f32),
+        server_dir: Vec3,
+        rotation_targets: Vec<(f32, f32, u64)>,
+        will_click: bool,
+        is_click_tick: bool,
+        click_ok: bool,
+        clicks: u32,
+        trip_available: bool,
+        trip_away: bool,
+        poll: TpRouteResult,
+        dispatch_ok: bool,
+        dispatches: Vec<TpFinish>,
+        run_state: Option<TpState>,
+        come_back: bool,
+        come_backs: u32,
+        resets: u32,
+        undos: u32,
+        show_returns: u32,
+        goals: Vec<TpGoalPos>,
+        los: bool,
+        attacks: Vec<u64>,
+        view_target: Option<u64>,
+        view_engaged: bool,
+        view_invalids: u32,
+        view_clears: u32,
+        view_dones: u32,
+        view_pendings: u32,
+        view_actives: u32,
+        view_attack_positions: u32,
+    }
+
+    impl Default for TpMock {
+        fn default() -> Self {
+            TpMock {
+                dead: false,
+                spectator: false,
+                passenger: false,
+                interaction_range: 3.0,
+                cannot_attack: false,
+                eye: Vec3 { x: 0.0, y: 1.62, z: 0.0 },
+                client_pos: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+                server_pos: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+                first_target: None,
+                valid: true,
+                bb_distance_sqr: 0.0,
+                bb_center: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+                bb_clip: None,
+                pick_radius: 0.0,
+                raytrace: None,
+                looking_at: (1.0, 2.0),
+                server_dir: Vec3 { x: 0.0, y: 0.0, z: 1.0 },
+                rotation_targets: Vec::new(),
+                will_click: false,
+                is_click_tick: false,
+                click_ok: false,
+                clicks: 0,
+                trip_available: true,
+                trip_away: false,
+                poll: TpRouteResult::Searching,
+                dispatch_ok: true,
+                dispatches: Vec::new(),
+                run_state: None,
+                come_back: false,
+                come_backs: 0,
+                resets: 0,
+                undos: 0,
+                show_returns: 0,
+                goals: Vec::new(),
+                los: false,
+                attacks: Vec::new(),
+                view_target: None,
+                view_engaged: false,
+                view_invalids: 0,
+                view_clears: 0,
+                view_dones: 0,
+                view_pendings: 0,
+                view_actives: 0,
+                view_attack_positions: 0,
+            }
+        }
+    }
+
+    impl TpAuraHooks for TpMock {
+        fn player_eye_position_at(&self, _feet: Vec3) -> Vec3 {
+            self.eye
+        }
+        fn player_entity_interaction_range(&self) -> f64 {
+            self.interaction_range
+        }
+        fn player_cannot_attack_with_item(&self) -> bool {
+            self.cannot_attack
+        }
+        fn player_is_dead_or_dying(&self) -> bool {
+            self.dead
+        }
+        fn player_is_spectator(&self) -> bool {
+            self.spectator
+        }
+        fn player_is_passenger(&self) -> bool {
+            self.passenger
+        }
+        fn selector_first_target(&self) -> Option<u64> {
+            self.first_target
+        }
+        fn selector_validate(&self, _target: u64) -> bool {
+            self.valid
+        }
+        fn target_bounding_box_distance_to_sqr(&self, _eyes: Vec3) -> f64 {
+            self.bb_distance_sqr
+        }
+        fn target_bounding_box_center(&self) -> Vec3 {
+            self.bb_center
+        }
+        fn target_bounding_box_clip(&self, _eyes: Vec3, _end: Vec3) -> Option<Vec3> {
+            self.bb_clip
+        }
+        fn target_pick_radius(&self) -> f64 {
+            self.pick_radius
+        }
+        fn raytrace_box_rotation(&self, _eyes: Vec3, _reach: f64) -> Option<(f32, f32)> {
+            self.raytrace
+        }
+        fn rotation_looking_at(&self, _point: Vec3, _from: Vec3) -> (f32, f32) {
+            self.looking_at
+        }
+        fn server_rotation_direction(&self) -> Vec3 {
+            self.server_dir
+        }
+        fn set_rotation_target(&mut self, rotation: (f32, f32), target: u64) {
+            self.rotation_targets.push((rotation.0, rotation.1, target));
+        }
+        fn clicker_will_click_at(&self, _arrival: i64) -> bool {
+            self.will_click
+        }
+        fn clicker_is_click_tick(&self) -> bool {
+            self.is_click_tick
+        }
+        fn clicker_click(&mut self) -> bool {
+            self.clicks += 1;
+            self.click_ok
+        }
+        fn trip_is_available(&self) -> bool {
+            self.trip_available
+        }
+        fn trip_is_away(&self) -> bool {
+            self.trip_away
+        }
+        fn trip_feet(&self) -> Vec3 {
+            if self.trip_away {
+                self.server_pos
+            } else {
+                self.client_pos
+            }
+        }
+        fn trip_request(&mut self, _origin: Vec3, _goals: &[TpGoalPos], _max_length: f64, _destination: Vec3) {}
+        fn trip_poll(&mut self) -> TpRouteResult {
+            std::mem::replace(&mut self.poll, TpRouteResult::Searching)
+        }
+        fn trip_dispatch(&mut self, _route: &TpRoute, finish: TpFinish) -> Option<TpRoute> {
+            if self.dispatch_ok {
+                self.dispatches.push(finish);
+                Some(TpRoute { start: _origin(_route), destination: _route.destination, path: _route.path.clone() })
+            } else {
+                None
+            }
+        }
+        fn trip_run_state(&self) -> Option<TpState> {
+            self.run_state
+        }
+        fn trip_come_back(&mut self) -> bool {
+            self.come_backs += 1;
+            self.come_back
+        }
+        fn trip_reset(&mut self) {
+            self.resets += 1;
+        }
+        fn teleport_manager_undo(&mut self) {
+            self.undos += 1;
+        }
+        fn trip_show_return(&mut self) {
+            self.show_returns += 1;
+        }
+        fn reach_positions(&self, _reach: f64, _from: Vec3) -> Vec<TpGoalPos> {
+            self.goals.clone()
+        }
+        fn has_line_of_sight(&self, _eyes: Vec3, _hit: Vec3) -> bool {
+            self.los
+        }
+        fn attack_entity(&mut self, target: u64, _keep_sprint: bool) {
+            self.attacks.push(target);
+        }
+        fn view_target_set(&mut self, target: Option<u64>) {
+            self.view_target = target;
+        }
+        fn view_engaged_set(&mut self, engaged: bool) {
+            self.view_engaged = engaged;
+        }
+        fn view_clear(&mut self) {
+            self.view_clears += 1;
+        }
+        fn view_done(&mut self) {
+            self.view_dones += 1;
+        }
+        fn view_invalid(&mut self) {
+            self.view_invalids += 1;
+        }
+        fn view_pending(&mut self) {
+            self.view_pendings += 1;
+        }
+        fn view_active_path(&mut self, _path: &[Vec3]) {
+            self.view_actives += 1;
+        }
+        fn view_attack_position_set(&mut self, _position: Option<Vec3>) {
+            self.view_attack_positions += 1;
+        }
+    }
+
+    fn _origin(route: &TpRoute) -> Vec3 {
+        route.start
+    }
+
+    fn tp_found_route() -> TpRoute {
+        TpRoute {
+            start: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            destination: Vec3 { x: 1.0, y: 0.0, z: 1.0 },
+            path: vec![Vec3 { x: 0.0, y: 0.0, z: 0.0 }, Vec3 { x: 1.0, y: 0.0, z: 1.0 }],
+        }
+    }
+
+    fn tp_engage(module: &Module, hooks: &mut TpMock, state: &mut TpAuraState) {
+        state.ticks += 1;
+        hooks.first_target = Some(7);
+        tp_aura_engage(module, hooks, state);
+    }
+
+    #[test]
+    fn engage_starts_attack_or_routes() {
+        let module = tp_aura();
+        let mut hooks = TpMock::default();
+        let mut state = TpAuraState::default();
+
+        // In reach (distance 0 <= reach^2): straight to attack.
+        tp_engage(&module, &mut hooks, &mut state);
+        assert_eq!(state.phase, TpAuraPhase::Attack);
+        assert_eq!(state.engagement.as_ref().unwrap().target, 7);
+        assert_eq!(hooks.view_target, Some(7));
+        assert_eq!(hooks.view_clears, 0);
+
+        // Out of reach with goals: route requested.
+        let mut state = TpAuraState::default();
+        let mut hooks = TpMock::default();
+        hooks.bb_distance_sqr = 1_000_000.0;
+        hooks.goals = vec![TpGoalPos { x: 1, y: 0, z: 1 }];
+        tp_engage(&module, &mut hooks, &mut state);
+        assert_eq!(state.phase, TpAuraPhase::Routing);
+        assert_eq!(hooks.view_pendings, 1);
+        assert_eq!(hooks.view_target, Some(7));
+
+        // Out of reach with no goals: failed.
+        let mut state = TpAuraState::default();
+        let mut hooks = TpMock::default();
+        hooks.bb_distance_sqr = 1_000_000.0;
+        hooks.goals = Vec::new();
+        tp_engage(&module, &mut hooks, &mut state);
+        assert_eq!(state.phase, TpAuraPhase::Idle);
+        assert_eq!(state.engagement, None);
+        assert_eq!(state.rest_until, 1 + TP_FAIL_REST_TICKS);
+        assert_eq!(state.unreachable.get(&7), Some(&(1 + TP_UNREACHABLE_TICKS)));
+        assert_eq!(hooks.view_target, None);
+
+        // Resting: no engagement even with a target.
+        let mut state = TpAuraState::default();
+        let mut hooks = TpMock::default();
+        state.rest_until = 10;
+        tp_engage(&module, &mut hooks, &mut state);
+        assert_eq!(state.engagement, None);
+
+        // Trip unavailable: no engagement.
+        let mut state = TpAuraState::default();
+        let mut hooks = TpMock::default();
+        hooks.trip_available = false;
+        tp_engage(&module, &mut hooks, &mut state);
+        assert_eq!(state.engagement, None);
+    }
+
+    #[test]
+    fn route_poll_branches() {
+        let module = tp_aura();
+
+        // Found: engagement holds the route and launch dispatches.
+        let mut hooks = TpMock::default();
+        let mut state = TpAuraState::default();
+        hooks.bb_distance_sqr = 1_000_000.0;
+        hooks.goals = vec![TpGoalPos { x: 1, y: 0, z: 1 }];
+        tp_engage(&module, &mut hooks, &mut state);
+        hooks.will_click = true;
+        hooks.poll = TpRouteResult::Found(tp_found_route());
+        hooks.bb_distance_sqr = 0.0;
+        tp_aura_tick_handler(&module, &mut hooks, &mut state);
+        assert_eq!(hooks.poll, TpRouteResult::Searching); // consumed
+        assert_eq!(state.phase, TpAuraPhase::Approach);
+        assert_eq!(hooks.dispatches, vec![TpFinish::Hold]);
+        assert!(state.engagement.as_ref().unwrap().route.is_some());
+        assert_eq!(hooks.view_actives, 1);
+        assert_eq!(hooks.view_attack_positions, 1);
+
+        // AlreadyThere: straight to attack.
+        let mut hooks = TpMock::default();
+        let mut state = TpAuraState::default();
+        state.engagement = Some(TpAuraEngagement {
+            target: 7,
+            route: None,
+            waited: 0,
+            hold_left: 0,
+            retries: 0,
+            attacked: false,
+        });
+        state.phase = TpAuraPhase::Routing;
+        hooks.poll = TpRouteResult::AlreadyThere;
+        tp_aura_tick_handler(&module, &mut hooks, &mut state);
+        assert_eq!(state.phase, TpAuraPhase::Attack);
+
+        // Failed: fail path.
+        let mut hooks = TpMock::default();
+        let mut state = TpAuraState::default();
+        state.engagement = Some(TpAuraEngagement {
+            target: 7,
+            route: None,
+            waited: 0,
+            hold_left: 0,
+            retries: 0,
+            attacked: false,
+        });
+        state.phase = TpAuraPhase::Routing;
+        hooks.poll = TpRouteResult::Failed;
+        tp_aura_tick_handler(&module, &mut hooks, &mut state);
+        assert_eq!(state.phase, TpAuraPhase::Idle);
+        assert_eq!(state.rest_until, 1 + TP_FAIL_REST_TICKS);
+
+        // Searching: stays.
+        let mut hooks = TpMock::default();
+        let mut state = TpAuraState::default();
+        state.engagement = Some(TpAuraEngagement {
+            target: 7,
+            route: None,
+            waited: 0,
+            hold_left: 0,
+            retries: 0,
+            attacked: false,
+        });
+        state.phase = TpAuraPhase::Routing;
+        tp_aura_tick_handler(&module, &mut hooks, &mut state);
+        assert_eq!(state.phase, TpAuraPhase::Routing);
+
+        // Invalid target: leave.
+        let mut hooks = TpMock::default();
+        let mut state = TpAuraState::default();
+        state.engagement = Some(TpAuraEngagement {
+            target: 7,
+            route: None,
+            waited: 0,
+            hold_left: 0,
+            retries: 0,
+            attacked: false,
+        });
+        state.phase = TpAuraPhase::Routing;
+        hooks.valid = false;
+        tp_aura_tick_handler(&module, &mut hooks, &mut state);
+        assert_eq!(state.engagement, None);
+        assert_eq!(state.phase, TpAuraPhase::Idle);
+    }
+
+    #[test]
+    fn launch_waits_for_click_or_max_wait() {
+        let module = tp_aura();
+        let mut hooks = TpMock::default();
+        let mut state = TpAuraState::default();
+        state.engagement = Some(TpAuraEngagement {
+            target: 7,
+            route: Some(tp_found_route()),
+            waited: 0,
+            hold_left: 0,
+            retries: 0,
+            attacked: false,
+        });
+        state.phase = TpAuraPhase::Ready;
+
+        // No click planned and under max wait: wait.
+        tp_aura_tick_handler(&module, &mut hooks, &mut state);
+        assert_eq!(state.phase, TpAuraPhase::Ready);
+        assert_eq!(state.engagement.as_ref().unwrap().waited, 1);
+
+        // Click planned: dispatch.
+        hooks.will_click = true;
+        tp_aura_tick_handler(&module, &mut hooks, &mut state);
+        assert_eq!(state.phase, TpAuraPhase::Approach);
+        assert_eq!(hooks.dispatches, vec![TpFinish::Hold]);
+
+        // AfterAttack Stay dispatches LAND.
+        let mut module = tp_aura();
+        for value in &mut module.settings {
+            if value.name == "AfterAttack" {
+                value.kind = ValueKind::Choice("Stay".to_string(), Vec::new());
+            }
+        }
+        let mut hooks = TpMock::default();
+        let mut state = TpAuraState::default();
+        state.engagement = Some(TpAuraEngagement {
+            target: 7,
+            route: Some(tp_found_route()),
+            waited: TP_MAX_WAIT,
+            hold_left: 0,
+            retries: 0,
+            attacked: false,
+        });
+        state.phase = TpAuraPhase::Ready;
+        tp_aura_tick_handler(&module, &mut hooks, &mut state);
+        assert_eq!(hooks.dispatches, vec![TpFinish::Land]);
+    }
+
+    #[test]
+    fn approach_and_return_states() {
+        let module = tp_aura();
+
+        // DONE: attack phase.
+        let mut hooks = TpMock::default();
+        let mut state = TpAuraState::default();
+        state.engagement = Some(TpAuraEngagement {
+            target: 7,
+            route: Some(tp_found_route()),
+            waited: 0,
+            hold_left: 0,
+            retries: 0,
+            attacked: false,
+        });
+        state.phase = TpAuraPhase::Approach;
+        hooks.run_state = Some(TpState::Done);
+        tp_aura_tick_handler(&module, &mut hooks, &mut state);
+        assert_eq!(state.phase, TpAuraPhase::Attack);
+        assert_eq!(state.engagement.as_ref().unwrap().hold_left, 0);
+
+        // REJECTED: reset + rest.
+        let mut hooks = TpMock::default();
+        let mut state = TpAuraState::default();
+        state.engagement = Some(TpAuraEngagement {
+            target: 7,
+            route: Some(tp_found_route()),
+            waited: 0,
+            hold_left: 0,
+            retries: 0,
+            attacked: false,
+        });
+        state.phase = TpAuraPhase::Approach;
+        state.ticks = 5;
+        hooks.run_state = Some(TpState::Rejected);
+        tp_aura_tick_handler(&module, &mut hooks, &mut state);
+        assert_eq!(state.phase, TpAuraPhase::Idle);
+        assert_eq!(state.rest_until, 6 + TP_SETBACK_REST_TICKS);
+        assert_eq!(hooks.resets, 1);
+        assert_eq!(hooks.view_invalids, 1);
+
+        // INVALID: show return and go to RETURN.
+        let mut hooks = TpMock::default();
+        let mut state = TpAuraState::default();
+        state.engagement = Some(TpAuraEngagement {
+            target: 7,
+            route: Some(tp_found_route()),
+            waited: 0,
+            hold_left: 0,
+            retries: 0,
+            attacked: false,
+        });
+        state.phase = TpAuraPhase::Approach;
+        hooks.run_state = Some(TpState::Invalid);
+        tp_aura_tick_handler(&module, &mut hooks, &mut state);
+        assert_eq!(state.phase, TpAuraPhase::Return);
+        assert_eq!(hooks.show_returns, 1);
+
+        // RETURN finishes when the trip is back.
+        let mut hooks = TpMock::default();
+        let mut state = TpAuraState::default();
+        state.phase = TpAuraPhase::Return;
+        hooks.trip_away = true;
+        tp_aura_tick_handler(&module, &mut hooks, &mut state);
+        assert_eq!(state.phase, TpAuraPhase::Return);
+        assert_eq!(hooks.view_dones, 0);
+        hooks.trip_away = false;
+        tp_aura_tick_handler(&module, &mut hooks, &mut state);
+        assert_eq!(state.phase, TpAuraPhase::Idle);
+        assert_eq!(hooks.view_dones, 1);
+    }
+
+    #[test]
+    fn attack_clicks_and_returns() {
+        let module = tp_aura();
+
+        // In reach, click tick, facing, item ready: attack lands.
+        let mut hooks = TpMock::default();
+        let mut state = TpAuraState::default();
+        state.engagement = Some(TpAuraEngagement {
+            target: 7,
+            route: Some(tp_found_route()),
+            waited: 0,
+            hold_left: 5,
+            retries: 0,
+            attacked: false,
+        });
+        state.phase = TpAuraPhase::Attack;
+        hooks.is_click_tick = true;
+        hooks.click_ok = true;
+        hooks.los = true;
+        hooks.bb_clip = Some(Vec3 { x: 0.0, y: 1.0, z: 2.0 });
+        tp_aura_tick_handler(&module, &mut hooks, &mut state);
+        assert_eq!(hooks.attacks, vec![7]);
+        assert!(state.engagement.as_ref().unwrap().attacked);
+        // hold counts down: 5 -> 4, stays in ATTACK.
+        assert_eq!(state.phase, TpAuraPhase::Attack);
+
+        // holdLeft drops to 0: leave (come_back false -> IDLE).
+        let mut hooks = TpMock::default();
+        let mut state = TpAuraState::default();
+        state.engagement = Some(TpAuraEngagement {
+            target: 7,
+            route: Some(tp_found_route()),
+            waited: 0,
+            hold_left: 1,
+            retries: 0,
+            attacked: false,
+        });
+        state.phase = TpAuraPhase::Attack;
+        hooks.is_click_tick = true;
+        hooks.click_ok = true;
+        hooks.bb_clip = Some(Vec3 { x: 0.0, y: 1.0, z: 2.0 });
+        hooks.los = true;
+        tp_aura_tick_handler(&module, &mut hooks, &mut state);
+        assert_eq!(state.phase, TpAuraPhase::Idle);
+        assert_eq!(state.engagement, None);
+
+        // attacked + RETURN: leave immediately.
+        let mut hooks = TpMock::default();
+        let mut state = TpAuraState::default();
+        state.engagement = Some(TpAuraEngagement {
+            target: 7,
+            route: Some(tp_found_route()),
+            waited: 0,
+            hold_left: 5,
+            retries: 0,
+            attacked: true,
+        });
+        state.phase = TpAuraPhase::Attack;
+        tp_aura_tick_handler(&module, &mut hooks, &mut state);
+        assert_eq!(state.engagement, None);
+
+        // Stay mode keeps attacking after the click.
+        let mut module = tp_aura();
+        for value in &mut module.settings {
+            if value.name == "AfterAttack" {
+                value.kind = ValueKind::Choice("Stay".to_string(), Vec::new());
+            }
+        }
+        let mut hooks = TpMock::default();
+        let mut state = TpAuraState::default();
+        state.engagement = Some(TpAuraEngagement {
+            target: 7,
+            route: Some(tp_found_route()),
+            waited: 0,
+            hold_left: 5,
+            retries: 0,
+            attacked: true,
+        });
+        state.phase = TpAuraPhase::Attack;
+        tp_aura_tick_handler(&module, &mut hooks, &mut state);
+        assert!(state.engagement.is_some());
+
+        // Out of reach retries then leaves.
+        let mut hooks = TpMock::default();
+        let mut state = TpAuraState::default();
+        state.engagement = Some(TpAuraEngagement {
+            target: 7,
+            route: Some(tp_found_route()),
+            waited: 0,
+            hold_left: 5,
+            retries: TP_MAX_RETRIES,
+            attacked: false,
+        });
+        state.phase = TpAuraPhase::Attack;
+        hooks.bb_distance_sqr = 1_000_000.0;
+        tp_aura_tick_handler(&module, &mut hooks, &mut state);
+        assert_eq!(state.engagement, None);
+    }
+
+    #[test]
+    fn death_and_disabled_reset_everything() {
+        let module = tp_aura();
+
+        // Dead player: leave.
+        let mut hooks = TpMock::default();
+        let mut state = TpAuraState::default();
+        state.engagement = Some(TpAuraEngagement {
+            target: 7,
+            route: Some(tp_found_route()),
+            waited: 0,
+            hold_left: 5,
+            retries: 0,
+            attacked: false,
+        });
+        state.phase = TpAuraPhase::Approach;
+        hooks.dead = true;
+        tp_aura_tick_handler(&module, &mut hooks, &mut state);
+        assert_eq!(state.engagement, None);
+
+        // onDisabled: undo + reset.
+        let mut hooks = TpMock::default();
+        let mut state = TpAuraState::default();
+        state.engagement = Some(TpAuraEngagement {
+            target: 7,
+            route: Some(tp_found_route()),
+            waited: 0,
+            hold_left: 5,
+            retries: 0,
+            attacked: false,
+        });
+        state.phase = TpAuraPhase::Attack;
+        state.rest_until = 10;
+        state.unreachable.insert(7, 10);
+        tp_aura_on_disabled(&mut hooks, &mut state);
+        assert_eq!(hooks.undos, 1);
+        assert_eq!(hooks.resets, 1);
+        assert_eq!(state.rest_until, 0);
+        assert!(state.unreachable.is_empty());
+
+        // World change: reset + clear unreachable.
+        let mut hooks = TpMock::default();
+        let mut state = TpAuraState::default();
+        state.unreachable.insert(7, 10);
+        state.phase = TpAuraPhase::Attack;
+        tp_aura_world_change_handler(&mut hooks, &mut state);
+        assert_eq!(hooks.resets, 1);
+        assert!(state.unreachable.is_empty());
+        assert_eq!(state.phase, TpAuraPhase::Idle);
+    }
+
+    #[test]
+    fn rotation_update_targets_the_engagement() {
+        let module = tp_aura();
+
+        // APPROACH with a route: aims from the route destination.
+        let mut hooks = TpMock::default();
+        let mut state = TpAuraState::default();
+        state.engagement = Some(TpAuraEngagement {
+            target: 7,
+            route: Some(tp_found_route()),
+            waited: 0,
+            hold_left: 5,
+            retries: 0,
+            attacked: false,
+        });
+        state.phase = TpAuraPhase::Approach;
+        tp_aura_rotation_update_handler(&module, &mut hooks, &mut state);
+        assert_eq!(hooks.rotation_targets, vec![(1.0, 2.0, 7)]);
+
+        // Raytrace hit: uses its rotation.
+        let mut hooks = TpMock::default();
+        let mut state = TpAuraState::default();
+        state.engagement = Some(TpAuraEngagement {
+            target: 7,
+            route: Some(tp_found_route()),
+            waited: 0,
+            hold_left: 5,
+            retries: 0,
+            attacked: false,
+        });
+        state.phase = TpAuraPhase::Attack;
+        hooks.raytrace = Some((5.0, 6.0));
+        tp_aura_rotation_update_handler(&module, &mut hooks, &mut state);
+        assert_eq!(hooks.rotation_targets, vec![(5.0, 6.0, 7)]);
+
+        // No engagement: nothing.
+        let mut hooks = TpMock::default();
+        let mut state = TpAuraState::default();
+        tp_aura_rotation_update_handler(&module, &mut hooks, &mut state);
+        assert!(hooks.rotation_targets.is_empty());
+    }
+
+    #[test]
+    fn is_facing_needs_clip_and_los() {
+        let module = tp_aura();
+        let mut hooks = TpMock::default();
+        let feet = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+        // No clip: not facing.
+        assert!(!tp_is_facing(&module, &hooks, feet, 7));
+
+        // Clip + line of sight: facing.
+        hooks.bb_clip = Some(Vec3 { x: 0.0, y: 1.0, z: 3.0 });
+        hooks.los = true;
+        assert!(tp_is_facing(&module, &hooks, feet, 7));
+
+        // Clip but blocked: not facing.
+        hooks.los = false;
+        assert!(!tp_is_facing(&module, &hooks, feet, 7));
+    }
+
+    #[test]
+    fn unreachable_gates_reengagement() {
+        let module = tp_aura();
+        let mut hooks = TpMock::default();
+        let mut state = TpAuraState::default();
+
+        // Fail puts the target on the unreachable list.
+        hooks.bb_distance_sqr = 1_000_000.0;
+        hooks.goals = Vec::new();
+        tp_engage(&module, &mut hooks, &mut state);
+        assert_eq!(state.unreachable.get(&7), Some(&(1 + TP_UNREACHABLE_TICKS)));
+
+        // While the gate holds, engage picks nothing.
+        let mut hooks = TpMock::default();
+        tp_engage(&module, &mut hooks, &mut state);
+        assert_eq!(state.engagement, None);
+
+        // After the gate passes, the target is picked again.
+        state.ticks = TP_UNREACHABLE_TICKS + 1;
+        let mut hooks = TpMock::default();
+        tp_engage(&module, &mut hooks, &mut state);
+        assert_eq!(state.engagement.as_ref().unwrap().target, 7);
+    }
+}

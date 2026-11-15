@@ -807,8 +807,20 @@ pub struct Vec3 {
     pub z: f64,
 }
 
+impl std::ops::Sub for Vec3 {
+    type Output = Vec3;
+
+    fn sub(self, other: Vec3) -> Vec3 {
+        Vec3 { x: self.x - other.x, y: self.y - other.y, z: self.z - other.z }
+    }
+}
+
 impl Vec3 {
     pub const ZERO: Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    pub fn dot(&self, other: Vec3) -> f64 {
+        self.x * other.x + self.y * other.y + self.z * other.z
+    }
 
     pub fn distance_to(&self, other: Vec3) -> f64 {
         ((self.x - other.x).powi(2)
@@ -1267,6 +1279,453 @@ pub fn fake_lag_blink_packet_handler<N: FnMut(String, String)>(
 pub fn fake_lag_on_disabled(state: &mut FakeLagState) {
     state.is_enemy_nearby = false;
 }
+// ----- Seams + ModuleSuperKnockback.kt -----
+
+/// Upstream `AttackEntityEvent` flattened to the attacked entity snapshot.
+#[derive(Clone, Copy, Debug)]
+pub struct SkTarget {
+    /// Upstream `enemy is LivingEntity`.
+    pub is_living_entity: bool,
+    /// `enemy.hurtTime` (0 when the target is not a living entity).
+    pub hurt_time: i64,
+    /// `enemy.lookAngle`.
+    pub look_angle: Vec3,
+    /// `enemy.position()`.
+    pub position: Vec3,
+}
+
+/// The slice of the upstream `player` SuperKnockback reads.
+#[derive(Clone, Copy, Debug)]
+pub struct SkPlayer {
+    pub position: Vec3,
+    pub on_ground: bool,
+    pub is_inside_water_or_bubble_column: bool,
+    pub is_sprinting: bool,
+    pub was_sprinting: bool,
+    /// `player.input.movementForward`.
+    pub movement_forward: f32,
+    /// `player.input.movementSideways`.
+    pub movement_sideways: f32,
+    /// `player.input.hasForwardImpulse()`.
+    pub has_forward_impulse: bool,
+}
+
+/// Upstream `network.sendStartSprinting()/sendStopSprinting()` seam.
+pub trait SkNetwork {
+    fn send_start_sprinting(&mut self);
+    fn send_stop_sprinting(&mut self);
+}
+
+pub struct SkHooks<'a> {
+    /// Upstream `ModuleCriticals.wouldDoCriticalHit()`.
+    pub criticals_would_hit: bool,
+    /// Upstream `debugParameter("State") { ... }` labels, in order.
+    pub debug: &'a mut Vec<String>,
+    pub network: &'a mut dyn SkNetwork,
+}
+
+fn sk_debug(hooks: &mut SkHooks, label: &str) {
+    hooks.debug.push(label.to_string());
+}
+
+/// Upstream `SprintEvent.Source`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SprintEventSource {
+    MovementTick,
+    Input,
+    Other,
+}
+
+pub struct SprintEvent {
+    pub source: SprintEventSource,
+    pub sprint: bool,
+}
+
+/// Upstream `DirectionalInput` (only `NONE` is written by this module).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DirectionalInput {
+    None,
+    Other,
+}
+
+pub struct MovementInputEvent {
+    pub directional_input: DirectionalInput,
+}
+
+/// Upstream `Mode` tags.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SkMode {
+    Packet,
+    SprintTap,
+    WTap,
+}
+
+fn sk_mode(module: &Module) -> Option<SkMode> {
+    match module.setting("Mode").map(|v| &v.kind) {
+        Some(ValueKind::Choice(sel, _)) if sel == "Packet" => Some(SkMode::Packet),
+        Some(ValueKind::Choice(sel, _)) if sel == "SprintTap" => Some(SkMode::SprintTap),
+        Some(ValueKind::Choice(sel, _)) if sel == "WTap" => Some(SkMode::WTap),
+        _ => None,
+    }
+}
+
+/// Upstream `Conditions` tags with their predicates.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SkCondition {
+    OnlyFacing,
+    OnlyOnGround,
+    NotInWater,
+}
+
+impl SkCondition {
+    fn tag(&self) -> &'static str {
+        match self {
+            Self::OnlyFacing => "OnlyFacing",
+            Self::OnlyOnGround => "OnlyOnGround",
+            Self::NotInWater => "NotInWater",
+        }
+    }
+
+    fn from_tag(tag: &str) -> Option<Self> {
+        match tag {
+            "OnlyFacing" => Some(Self::OnlyFacing),
+            "OnlyOnGround" => Some(Self::OnlyOnGround),
+            "NotInWater" => Some(Self::NotInWater),
+            _ => None,
+        }
+    }
+}
+
+fn sk_conditions_selected(module: &Module) -> Vec<SkCondition> {
+    match module.setting("Conditions").map(|v| &v.kind) {
+        Some(ValueKind::MultiChoice(sel, _)) => sel.iter().filter_map(|t| SkCondition::from_tag(t)).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Upstream `Conditions.matchesAll(target)`: every selected predicate tests true.
+pub fn sk_conditions_match_all(module: &Module, player: &SkPlayer, target: &SkTarget) -> bool {
+    sk_conditions_selected(module).iter().all(|c| match c {
+        SkCondition::OnlyFacing => {
+            target.look_angle.dot(player.position - target.position) >= 0.0
+        }
+        SkCondition::OnlyOnGround => player.on_ground,
+        SkCondition::NotInWater => !player.is_inside_water_or_bubble_column,
+    })
+}
+
+fn sk_hurt_time(module: &Module) -> i64 {
+    match module.setting("HurtTime").map(|v| &v.kind) {
+        Some(ValueKind::Int(v, _, _)) => *v,
+        _ => 10,
+    }
+}
+
+/// Upstream `percentageChance("Chance", 100f)`'s `asBoolean`: 0 -> false,
+/// 100 -> true, else `random.nextFloat(100) < percentage`. `roll` stands in
+/// for the random draw in 0..100.
+pub fn sk_chance_as_boolean(module: &Module, roll: f64) -> bool {
+    let v = match module.setting("Chance").map(|x| &x.kind) {
+        Some(ValueKind::Float(f, _, _)) => *f,
+        _ => 100.0,
+    };
+    if v == 0.0 {
+        false
+    } else if v == 100.0 {
+        true
+    } else {
+        roll < v
+    }
+}
+
+fn sk_only_on_move_enabled(module: &Module) -> bool {
+    match module.setting("OnlyOnMove").map(|v| &v.kind) {
+        Some(ValueKind::Bool(b)) => *b,
+        _ => true,
+    }
+}
+
+fn sk_only_forward(module: &Module) -> bool {
+    match module.setting("OnlyForward").map(|v| &v.kind) {
+        Some(ValueKind::Bool(b)) => *b,
+        _ => true,
+    }
+}
+
+/// Upstream `shouldOperate(target)`.
+pub fn sk_should_operate(module: &Module, player: &SkPlayer, target: &SkTarget) -> bool {
+    if sk_only_on_move_enabled(module) {
+        let is_moving_sideways = player.movement_sideways != 0.0;
+        let is_moving = player.movement_forward != 0.0 || is_moving_sideways;
+
+        if !is_moving || (sk_only_forward(module) && is_moving_sideways) {
+            return false;
+        }
+    }
+
+    sk_conditions_match_all(module, player, target)
+}
+
+/// Upstream `shouldStopSprinting(event)`.
+pub fn sk_should_stop_sprinting(
+    module: &Module,
+    player: &SkPlayer,
+    target: &SkTarget,
+    criticals_would_hit: bool,
+    chance_roll: f64,
+) -> bool {
+    if !player.is_sprinting || !player.was_sprinting {
+        return false;
+    }
+
+    target.is_living_entity
+        && target.hurt_time <= sk_hurt_time(module)
+        && sk_chance_as_boolean(module, chance_roll)
+        && !criticals_would_hit
+}
+
+/// Upstream: `ModuleSuperKnockback` — increases knockback dealt to other
+/// entities (alias `WTap`). The `Mode` choice groups Packet/SprintTap/WTap;
+/// `OnlyOnMove` is a toggleable group carried as its enabled + OnlyForward
+/// booleans.
+pub fn super_knockback() -> Module {
+    Module::new(
+        "SuperKnockback",
+        COMBAT,
+        vec![
+            choice("Mode", "Packet", &["Packet", "SprintTap", "WTap"]), // tagBy(this)
+            int("HurtTime", 10, 0, 10),
+            float("Chance", 100.0, 0.0, 100.0), // "%"
+            multi_choice(
+                "Conditions",
+                &["NotInWater"],
+                &["OnlyFacing", "OnlyOnGround", "NotInWater"],
+            ),
+            boolean("OnlyOnMove", true),
+            boolean("OnlyForward", true),
+        ],
+    )
+}
+
+/// Upstream SprintTap's `cancelSprint` + sequence, WTap's `inSequence` /
+/// `cancelMovement` + sequence. The `sequenceHandler` coroutines are carried
+/// as per-tick phase machines (`waitTicks`/`tickUntil`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SprintTapPhase {
+    /// `tickUntil { !player.isSprinting && !player.wasSprinting }`.
+    WaitStopSprinting,
+    /// `waitTicks(reSprintTicks.random())`; the count is ticks left.
+    WaitReSprint(u64),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WTapPhase {
+    /// `waitTicks(ticksUntilMovementBlock.random())`; the count is ticks left.
+    WaitMovementBlock(u64),
+    /// `tickUntil { !player.input.hasForwardImpulse() }`.
+    WaitForwardImpulseClear,
+    /// `waitTicks(ticksUntilAllowedMovement.random())`; the count is ticks left.
+    WaitAllowedMovement(u64),
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SuperKnockbackState {
+    pub cancel_sprint: bool,
+    pub sprint_tap: Option<SprintTapPhase>,
+    /// `reSprintTicks.random()` pick held for the WaitReSprint hand-off.
+    pub re_sprint_ticks: u64,
+    pub in_sequence: bool,
+    pub cancel_movement: bool,
+    pub w_tap: Option<WTapPhase>,
+    /// `ticksUntilAllowedMovement.random()` pick held for the
+    /// WaitAllowedMovement hand-off.
+    pub until_allowed_movement_ticks: u64,
+}
+
+pub fn super_knockback_state() -> SuperKnockbackState {
+    SuperKnockbackState::default()
+}
+
+/// Upstream Packet mode's `attackHandler` (`handler<AttackEntityEvent>`).
+pub fn sk_packet_attack_handler(
+    module: &Module,
+    player: &mut SkPlayer,
+    target: &SkTarget,
+    hooks: &mut SkHooks,
+    chance_roll: f64,
+) {
+    if !sk_should_operate(module, player, target) {
+        return;
+    }
+
+    if target.is_living_entity
+        && target.hurt_time <= sk_hurt_time(module)
+        && sk_chance_as_boolean(module, chance_roll)
+        && !hooks.criticals_would_hit
+    {
+        if player.is_sprinting {
+            hooks.network.send_stop_sprinting();
+        }
+
+        hooks.network.send_start_sprinting();
+        hooks.network.send_stop_sprinting();
+        hooks.network.send_start_sprinting();
+
+        player.is_sprinting = true;
+        player.was_sprinting = true;
+    }
+}
+
+/// Upstream SprintTap's `attackHandler` (`sequenceHandler<AttackEntityEvent>`),
+/// start of the sequence. `re_sprint` stands in for `reSprintTicks.random()`.
+pub fn sk_sprint_tap_attack(
+    module: &Module,
+    state: &mut SuperKnockbackState,
+    player: &SkPlayer,
+    target: &SkTarget,
+    hooks: &mut SkHooks,
+    chance_roll: f64,
+    re_sprint: u64,
+) {
+    if !sk_should_operate(module, player, target)
+        || !sk_should_stop_sprinting(
+            module,
+            player,
+            target,
+            hooks.criticals_would_hit,
+            chance_roll,
+        )
+        || state.cancel_sprint
+    {
+        return;
+    }
+
+    sk_debug(hooks, "Disallowing Sprint");
+    state.cancel_sprint = true;
+    state.sprint_tap = Some(SprintTapPhase::WaitStopSprinting);
+    state.re_sprint_ticks = re_sprint;
+}
+
+/// Upstream WTap's `attackHandler` (`sequenceHandler<AttackEntityEvent>`),
+/// start of the sequence. `until_block` / `until_allowed` stand in for the
+/// random picks of `ticksUntilMovementBlock` / `ticksUntilAllowedMovement`.
+pub fn sk_w_tap_attack(
+    module: &Module,
+    state: &mut SuperKnockbackState,
+    player: &SkPlayer,
+    target: &SkTarget,
+    hooks: &mut SkHooks,
+    chance_roll: f64,
+    until_block: u64,
+    until_allowed: u64,
+) {
+    if !sk_should_operate(module, player, target)
+        || !sk_should_stop_sprinting(
+            module,
+            player,
+            target,
+            hooks.criticals_would_hit,
+            chance_roll,
+        )
+        || state.in_sequence
+    {
+        return;
+    }
+
+    state.in_sequence = true;
+    sk_debug(hooks, "Waiting for Movement Block");
+    state.w_tap = Some(WTapPhase::WaitMovementBlock(until_block));
+    state.until_allowed_movement_ticks = until_allowed;
+}
+
+/// Upstream SprintTap's `movementHandler` (`handler<SprintEvent>`,
+/// CRITICAL_MODIFICATION priority).
+pub fn sk_sprint_handler(state: &SuperKnockbackState, event: &mut SprintEvent) {
+    if state.cancel_sprint
+        && (event.source == SprintEventSource::MovementTick
+            || event.source == SprintEventSource::Input)
+    {
+        event.sprint = false;
+    }
+}
+
+/// Upstream WTap's `movementHandler` (`handler<MovementInputEvent>`).
+pub fn sk_movement_input_handler(state: &SuperKnockbackState, event: &mut MovementInputEvent) {
+    if state.in_sequence && state.cancel_movement {
+        event.directional_input = DirectionalInput::None;
+    }
+}
+
+/// Upstream sequence continuation (`tickUntil`/`waitTicks` bodies), driven
+/// once per game tick while a sequence is open.
+pub fn sk_tick(state: &mut SuperKnockbackState, player: &SkPlayer, hooks: &mut SkHooks) {
+    if let Some(phase) = state.sprint_tap {
+        match phase {
+            SprintTapPhase::WaitStopSprinting => {
+                // Upstream `tickUntil { val player = mc.player ?: return@tickUntil true; ... }`.
+                if !player.is_sprinting && !player.was_sprinting {
+                    sk_debug(hooks, "Waiting for ReSprint");
+                    state.sprint_tap = Some(SprintTapPhase::WaitReSprint(state.re_sprint_ticks));
+                }
+            }
+            SprintTapPhase::WaitReSprint(left) => {
+                if left <= 1 {
+                    sk_debug(hooks, "Allowing Sprint");
+                    state.cancel_sprint = false;
+                    state.sprint_tap = None;
+                } else {
+                    state.sprint_tap = Some(SprintTapPhase::WaitReSprint(left - 1));
+                }
+            }
+        }
+    }
+
+    if let Some(phase) = state.w_tap {
+        match phase {
+            WTapPhase::WaitMovementBlock(left) => {
+                if left <= 1 {
+                    sk_debug(hooks, "Disallowing Movement");
+                    state.cancel_movement = true;
+                    state.w_tap = Some(WTapPhase::WaitForwardImpulseClear);
+                } else {
+                    state.w_tap = Some(WTapPhase::WaitMovementBlock(left - 1));
+                }
+            }
+            WTapPhase::WaitForwardImpulseClear => {
+                if !player.has_forward_impulse {
+                    sk_debug(hooks, "Waiting for Allowed Movement");
+                    state.w_tap = Some(WTapPhase::WaitAllowedMovement(
+                        state.until_allowed_movement_ticks,
+                    ));
+                }
+            }
+            WTapPhase::WaitAllowedMovement(left) => {
+                if left <= 1 {
+                    sk_debug(hooks, "Allowing Movement");
+                    state.cancel_movement = false;
+                    state.in_sequence = false;
+                    state.w_tap = None;
+                } else {
+                    state.w_tap = Some(WTapPhase::WaitAllowedMovement(left - 1));
+                }
+            }
+        }
+    }
+}
+
+/// Upstream SprintTap `disable()`: `cancelSprint = false`.
+pub fn sk_sprint_tap_disable(state: &mut SuperKnockbackState) {
+    state.cancel_sprint = false;
+    state.sprint_tap = None;
+}
+
+/// Upstream WTap `disable()`: `cancelMovement = false; inSequence = false`.
+pub fn sk_w_tap_disable(state: &mut SuperKnockbackState) {
+    state.cancel_movement = false;
+    state.in_sequence = false;
+    state.w_tap = None;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1784,5 +2243,350 @@ mod tests4 {
         };
         let mut blink = MockBlink::with_positions(vec![server_pos]);
         assert_eq!(run(&mut world, &mut blink, &mut dodge), Some(BlinkAction::Queue));
+    }
+}
+
+#[cfg(test)]
+mod tests5 {
+    use super::*;
+
+    struct MockNet {
+        calls: Vec<&'static str>,
+    }
+
+    impl MockNet {
+        fn new() -> Self {
+            Self { calls: Vec::new() }
+        }
+    }
+
+    impl SkNetwork for MockNet {
+        fn send_start_sprinting(&mut self) {
+            self.calls.push("start");
+        }
+        fn send_stop_sprinting(&mut self) {
+            self.calls.push("stop");
+        }
+    }
+
+    fn sprinting_player() -> SkPlayer {
+        SkPlayer {
+            position: Vec3 { x: 0.0, y: 64.0, z: 0.0 },
+            on_ground: true,
+            is_inside_water_or_bubble_column: false,
+            is_sprinting: true,
+            was_sprinting: true,
+            movement_forward: 1.0,
+            movement_sideways: 0.0,
+            has_forward_impulse: true,
+        }
+    }
+
+    fn living_target() -> SkTarget {
+        SkTarget {
+            is_living_entity: true,
+            hurt_time: 0,
+            look_angle: Vec3 { x: -1.0, y: 0.0, z: 0.0 }, // faces the player at +x
+            position: Vec3 { x: 3.0, y: 64.0, z: 0.0 },
+        }
+    }
+
+    fn hooks<'a>(net: &'a mut MockNet, debug: &'a mut Vec<String>) -> SkHooks<'a> {
+        SkHooks { criticals_would_hit: false, debug, network: net }
+    }
+
+    #[test]
+    fn settings_shape_and_mode_selection() {
+        let m = super_knockback();
+        assert_eq!(m.setting("Mode").unwrap().to_json(), crate::value::Json::Str("Packet".into()));
+        match &m.setting("HurtTime").unwrap().kind {
+            ValueKind::Int(10, 0, 10) => {}
+            other => panic!("HurtTime {other:?}"),
+        }
+        match &m.setting("Chance").unwrap().kind {
+            ValueKind::Float(100.0, 0.0, 100.0) => {}
+            other => panic!("Chance {other:?}"),
+        }
+        assert_eq!(
+            m.setting("Conditions").unwrap().to_json(),
+            crate::value::Json::Arr(vec![crate::value::Json::Str("NotInWater".into())])
+        );
+        assert!(matches!(m.setting("OnlyOnMove").unwrap().kind, ValueKind::Bool(true)));
+
+        let mut m2 = super_knockback();
+        m2.setting_mut("Mode").unwrap().kind =
+            ValueKind::Choice("WTap".into(), vec!["Packet".into(), "SprintTap".into(), "WTap".into()]);
+        assert_eq!(sk_mode(&m2), Some(SkMode::WTap));
+    }
+
+    #[test]
+    fn chance_as_boolean_edge_cases() {
+        let m = super_knockback();
+        assert!(sk_chance_as_boolean(&m, 0.0)); // 100% always true
+        assert!(sk_chance_as_boolean(&m, 99.999));
+
+        let mut m0 = super_knockback();
+        m0.setting_mut("Chance").unwrap().kind = ValueKind::Float(0.0, 0.0, 100.0);
+        assert!(!sk_chance_as_boolean(&m0, 0.0));
+        assert!(!sk_chance_as_boolean(&m0, 50.0));
+
+        let mut m50 = super_knockback();
+        m50.setting_mut("Chance").unwrap().kind = ValueKind::Float(50.0, 0.0, 100.0);
+        assert!(sk_chance_as_boolean(&m50, 49.9));
+        assert!(!sk_chance_as_boolean(&m50, 50.0));
+    }
+
+    #[test]
+    fn should_operate_movement_and_conditions() {
+        let m = super_knockback();
+        let player = sprinting_player();
+        let target = living_target();
+
+        // Moving forward: passes OnlyOnMove + NotInWater.
+        assert!(sk_should_operate(&m, &player, &target));
+
+        // Standing still: fails OnlyOnMove.
+        let still = SkPlayer { movement_forward: 0.0, ..player };
+        assert!(!sk_should_operate(&m, &still, &target));
+
+        // Moving sideways with OnlyForward: fails.
+        let sideways = SkPlayer { movement_forward: 0.0, movement_sideways: 1.0, ..player };
+        assert!(!sk_should_operate(&m, &sideways, &target));
+
+        // Moving sideways with OnlyForward off: passes.
+        let mut m2 = super_knockback();
+        m2.setting_mut("OnlyForward").unwrap().kind = ValueKind::Bool(false);
+        assert!(sk_should_operate(&m2, &sideways, &target));
+
+        // NotInWater condition: player in water fails.
+        let in_water = SkPlayer { is_inside_water_or_bubble_column: true, ..player };
+        assert!(!sk_should_operate(&m, &in_water, &target));
+
+        // OnlyOnGround condition: player in the air fails.
+        let mut m3 = super_knockback();
+        m3.setting_mut("Conditions").unwrap().kind = ValueKind::MultiChoice(
+            vec!["OnlyOnGround".into()],
+            vec!["OnlyFacing".into(), "OnlyOnGround".into(), "NotInWater".into()],
+        );
+        let airborne = SkPlayer { on_ground: false, ..player };
+        assert!(!sk_should_operate(&m3, &airborne, &target));
+        assert!(sk_should_operate(&m3, &player, &target));
+
+        // OnlyFacing: player behind the target (look angle dot <= 0) fails;
+        // facing player passes. Player at 0,0 target at 3,0: direction to player is -x.
+        let mut m4 = super_knockback();
+        m4.setting_mut("Conditions").unwrap().kind = ValueKind::MultiChoice(
+            vec!["OnlyFacing".into()],
+            vec!["OnlyFacing".into(), "OnlyOnGround".into(), "NotInWater".into()],
+        );
+        let facing = SkTarget { look_angle: Vec3 { x: -1.0, y: 0.0, z: 0.0 }, ..living_target() };
+        let away = SkTarget { look_angle: Vec3 { x: 1.0, y: 0.0, z: 0.0 }, ..living_target() };
+        assert!(sk_should_operate(&m4, &player, &facing));
+        assert!(!sk_should_operate(&m4, &player, &away));
+    }
+
+    #[test]
+    fn packet_mode_sends_the_w_tap_packet_order() {
+        let m = super_knockback();
+        let mut player = sprinting_player();
+        let target = living_target();
+        let mut net = MockNet::new();
+        let mut debug: Vec<String> = Vec::new();
+        sk_packet_attack_handler(&m, &mut player, &target, &mut hooks(&mut net, &mut debug), 100.0);
+        assert_eq!(net.calls, vec!["stop", "start", "stop", "start"]);
+        assert!(player.is_sprinting && player.was_sprinting);
+
+        // Not sprinting: no stop first.
+        let mut player = sprinting_player();
+        player.is_sprinting = false;
+        player.was_sprinting = false;
+        let mut net = MockNet::new();
+        let mut debug: Vec<String> = Vec::new();
+        sk_packet_attack_handler(&m, &mut player, &target, &mut hooks(&mut net, &mut debug), 100.0);
+        assert_eq!(net.calls, vec!["start", "stop", "start"]);
+
+        // HurtTime above the limit: nothing.
+        let stale = SkTarget { hurt_time: 11, ..living_target() };
+        let mut player = sprinting_player();
+        let mut net = MockNet::new();
+        let mut debug: Vec<String> = Vec::new();
+        sk_packet_attack_handler(&m, &mut player, &stale, &mut hooks(&mut net, &mut debug), 100.0);
+        assert!(net.calls.is_empty());
+
+        // Non-living entity: nothing.
+        let block = SkTarget { is_living_entity: false, ..living_target() };
+        let mut player = sprinting_player();
+        let mut net = MockNet::new();
+        let mut debug: Vec<String> = Vec::new();
+        sk_packet_attack_handler(&m, &mut player, &block, &mut hooks(&mut net, &mut debug), 100.0);
+        assert!(net.calls.is_empty());
+
+        // Criticals would hit: nothing.
+        let mut player = sprinting_player();
+        let mut net = MockNet::new();
+        let mut debug: Vec<String> = Vec::new();
+        let mut hk = hooks(&mut net, &mut debug);
+        hk.criticals_would_hit = true;
+        sk_packet_attack_handler(&m, &mut player, &target, &mut hk, 100.0);
+        assert!(net.calls.is_empty());
+
+        // Not operating (standing still): nothing.
+        let still = SkPlayer { movement_forward: 0.0, ..sprinting_player() };
+        let mut player = still;
+        let mut net = MockNet::new();
+        let mut debug: Vec<String> = Vec::new();
+        sk_packet_attack_handler(&m, &mut player, &target, &mut hooks(&mut net, &mut debug), 100.0);
+        assert!(net.calls.is_empty());
+    }
+
+    #[test]
+    fn sprint_tap_sequence_lifecycle() {
+        let m = super_knockback();
+        let player = sprinting_player();
+        let target = living_target();
+        let mut state = super_knockback_state();
+        let mut net = MockNet::new();
+        let mut debug: Vec<String> = Vec::new();
+
+        sk_sprint_tap_attack(&m, &mut state, &player, &target, &mut hooks(&mut net, &mut debug), 100.0, 2);
+        assert!(state.cancel_sprint);
+        assert_eq!(state.sprint_tap, Some(SprintTapPhase::WaitStopSprinting));
+        assert_eq!(debug, vec!["Disallowing Sprint".to_string()]);
+
+        // Sprint event is blocked while cancelled.
+        let mut ev = SprintEvent { source: SprintEventSource::MovementTick, sprint: true };
+        sk_sprint_handler(&state, &mut ev);
+        assert!(!ev.sprint);
+        let mut ev = SprintEvent { source: SprintEventSource::Input, sprint: true };
+        sk_sprint_handler(&state, &mut ev);
+        assert!(!ev.sprint);
+        let mut ev = SprintEvent { source: SprintEventSource::Other, sprint: true };
+        sk_sprint_handler(&state, &mut ev);
+        assert!(ev.sprint); // other sources pass
+
+        // Still sprinting: tickUntil keeps waiting.
+        let mut debug2: Vec<String> = Vec::new();
+        sk_tick(&mut state, &player, &mut hooks(&mut net, &mut debug2));
+        assert_eq!(state.sprint_tap, Some(SprintTapPhase::WaitStopSprinting));
+
+        // Player stopped sprinting: waits ReSprint ticks.
+        let stopped = SkPlayer { is_sprinting: false, was_sprinting: false, ..player };
+        let mut debug2: Vec<String> = Vec::new();
+        sk_tick(&mut state, &stopped, &mut hooks(&mut net, &mut debug2));
+        assert_eq!(state.sprint_tap, Some(SprintTapPhase::WaitReSprint(2)));
+        assert_eq!(debug2, vec!["Waiting for ReSprint".to_string()]);
+
+        // Two ticks later the sprint is allowed again.
+        sk_tick(&mut state, &stopped, &mut hooks(&mut net, &mut debug2));
+        sk_tick(&mut state, &stopped, &mut hooks(&mut net, &mut debug2));
+        assert_eq!(state.sprint_tap, None);
+        assert!(!state.cancel_sprint);
+
+        // A second attack while the sequence already ended works again.
+        let mut debug2: Vec<String> = Vec::new();
+        sk_sprint_tap_attack(&m, &mut state, &stopped, &target, &mut hooks(&mut net, &mut debug2), 100.0, 0);
+        // shouldStopSprinting requires isSprinting && wasSprinting
+        assert!(!state.cancel_sprint);
+
+        // Disable resets.
+        sk_sprint_tap_disable(&mut state);
+        assert!(!state.cancel_sprint && state.sprint_tap.is_none());
+    }
+
+    #[test]
+    fn sprint_tap_attack_gates() {
+        let m = super_knockback();
+        let player = sprinting_player();
+        let target = living_target();
+        let mut state = super_knockback_state();
+        let mut net = MockNet::new();
+
+        // Not sprinting (shouldStopSprinting false): no sequence.
+        let calm = SkPlayer { is_sprinting: false, was_sprinting: false, ..player };
+        let mut debug: Vec<String> = Vec::new();
+        sk_sprint_tap_attack(&m, &mut state, &calm, &target, &mut hooks(&mut net, &mut debug), 100.0, 1);
+        assert!(!state.cancel_sprint && state.sprint_tap.is_none());
+
+        // Criticals would hit: no sequence.
+        let mut debug: Vec<String> = Vec::new();
+        let mut hk = hooks(&mut net, &mut debug);
+        hk.criticals_would_hit = true;
+        sk_sprint_tap_attack(&m, &mut state, &player, &target, &mut hk, 100.0, 1);
+        assert!(!state.cancel_sprint);
+
+        // Already cancelled: no re-entry.
+        state.cancel_sprint = true;
+        let mut debug: Vec<String> = Vec::new();
+        sk_sprint_tap_attack(&m, &mut state, &player, &target, &mut hooks(&mut net, &mut debug), 100.0, 1);
+        assert_eq!(state.sprint_tap, None);
+    }
+
+    #[test]
+    fn w_tap_sequence_lifecycle() {
+        let m = super_knockback();
+        let player = sprinting_player();
+        let target = living_target();
+        let mut state = super_knockback_state();
+        let mut net = MockNet::new();
+        let mut debug: Vec<String> = Vec::new();
+
+        sk_w_tap_attack(&m, &mut state, &player, &target, &mut hooks(&mut net, &mut debug), 100.0, 1, 2);
+        assert!(state.in_sequence);
+        assert_eq!(state.w_tap, Some(WTapPhase::WaitMovementBlock(1)));
+        assert_eq!(debug, vec!["Waiting for Movement Block".to_string()]);
+
+        // Movement is NOT yet blocked during the block countdown.
+        let mut ev = MovementInputEvent { directional_input: DirectionalInput::Other };
+        sk_movement_input_handler(&state, &mut ev);
+        assert_eq!(ev.directional_input, DirectionalInput::Other);
+
+        // Countdown tick.
+        sk_tick(&mut state, &player, &mut hooks(&mut net, &mut debug));
+        assert_eq!(state.w_tap, Some(WTapPhase::WaitForwardImpulseClear));
+        assert_eq!(debug.last().unwrap(), "Disallowing Movement");
+
+        // Now movement input is zeroed.
+        let mut ev = MovementInputEvent { directional_input: DirectionalInput::Other };
+        sk_movement_input_handler(&state, &mut ev);
+        assert_eq!(ev.directional_input, DirectionalInput::None);
+
+        // Forward impulse still held: tickUntil waits.
+        sk_tick(&mut state, &player, &mut hooks(&mut net, &mut debug));
+        assert_eq!(state.w_tap, Some(WTapPhase::WaitForwardImpulseClear));
+
+        // Impulse cleared: waits allowed movement.
+        let quiet = SkPlayer { has_forward_impulse: false, ..player };
+        sk_tick(&mut state, &quiet, &mut hooks(&mut net, &mut debug));
+        assert_eq!(state.w_tap, Some(WTapPhase::WaitAllowedMovement(2)));
+        assert_eq!(debug.last().unwrap(), "Waiting for Allowed Movement");
+
+        // Two ticks later movement is allowed again.
+        sk_tick(&mut state, &quiet, &mut hooks(&mut net, &mut debug));
+        sk_tick(&mut state, &quiet, &mut hooks(&mut net, &mut debug));
+        assert_eq!(state.w_tap, None);
+        assert!(!state.cancel_movement && !state.in_sequence);
+
+        // Disable resets.
+        sk_w_tap_disable(&mut state);
+        assert!(!state.cancel_movement && !state.in_sequence && state.w_tap.is_none());
+    }
+
+    #[test]
+    fn w_tap_no_reentry_while_in_sequence() {
+        let m = super_knockback();
+        let player = sprinting_player();
+        let target = living_target();
+        let mut state = super_knockback_state();
+        let mut net = MockNet::new();
+
+        let mut debug: Vec<String> = Vec::new();
+        sk_w_tap_attack(&m, &mut state, &player, &target, &mut hooks(&mut net, &mut debug), 100.0, 0, 0);
+        assert!(state.in_sequence);
+
+        let mut debug: Vec<String> = Vec::new();
+        sk_w_tap_attack(&m, &mut state, &player, &target, &mut hooks(&mut net, &mut debug), 100.0, 0, 0);
+        // Still in the first phase, not re-entered.
+        assert_eq!(state.w_tap, Some(WTapPhase::WaitMovementBlock(0)));
+        assert_eq!(debug.len(), 0);
     }
 }

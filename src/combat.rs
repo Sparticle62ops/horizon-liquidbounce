@@ -5,7 +5,7 @@
 
 use crate::category::COMBAT;
 use crate::module::Module;
-use crate::value::{boolean, choice, float, float_range, int, int_range, multi_choice, ValueKind};
+use crate::value::{boolean, choice, float, float_range, int, int_range, items, multi_choice, Json, ValueKind};
 
 // ----- ModuleNoMissCooldown.kt -----
 
@@ -2588,5 +2588,2682 @@ mod tests5 {
         // Still in the first phase, not re-entered.
         assert_eq!(state.w_tap, Some(WTapPhase::WaitMovementBlock(0)));
         assert_eq!(debug.len(), 0);
+    }
+}
+
+// ----- Rotation math (upstream utils/aiming/data/Rotation.kt) -----
+
+/// Upstream `Rotation` (yaw/pitch in degrees). `isNormalized` is dropped:
+/// every constructor here already produces wrapped values.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Rotation {
+    pub yaw: f32,
+    pub pitch: f32,
+}
+
+/// Upstream `Mth.wrapDegrees`.
+pub fn wrap_degrees(value: f32) -> f32 {
+    let d = (value as f64) % 360.0;
+    let d = if d >= 180.0 { d - 360.0 } else { d };
+    let d = if d < -180.0 { d + 360.0 } else { d };
+    d as f32
+}
+
+/// Upstream `Rotation.fromRotationVec`.
+pub fn rotation_from_vec(diff_x: f64, diff_y: f64, diff_z: f64) -> Rotation {
+    Rotation {
+        yaw: wrap_degrees((diff_z.atan2(diff_x) as f32).to_degrees() - 90.0),
+        pitch: wrap_degrees(
+            -(diff_y.atan2((diff_x * diff_x + diff_z * diff_z).sqrt()) as f32).to_degrees(),
+        ),
+    }
+}
+
+impl Rotation {
+    /// Upstream `Rotation.lookingAt(point, from)`.
+    pub fn looking_at(point: Vec3, from: Vec3) -> Rotation {
+        rotation_from_vec(point.x - from.x, point.y - from.y, point.z - from.z)
+    }
+
+    /// Upstream `directionVector` (`Vec3.directionFromRotation(pitch, yaw)`).
+    pub fn direction_vector(&self) -> Vec3 {
+        let f = self.pitch as f64 * (std::f64::consts::PI / 180.0);
+        let f1 = -(self.yaw as f64) * (std::f64::consts::PI / 180.0);
+        let f2 = f1.cos();
+        let f3 = f1.sin();
+        let f4 = f.cos();
+        let f5 = f.sin();
+        Vec3 { x: f3 * f4, y: -f5, z: f2 * f4 }
+    }
+
+    /// Upstream `directionAngleTo`: angle between both direction vectors.
+    pub fn direction_angle_to(&self, other: Rotation) -> f32 {
+        let d = self.direction_vector();
+        let o = other.direction_vector();
+        let cx = d.y * o.z - d.z * o.y;
+        let cy = d.z * o.x - d.x * o.z;
+        let cz = d.x * o.y - d.y * o.x;
+        let cross = (cx * cx + cy * cy + cz * cz).sqrt();
+        (cross.atan2(d.dot(o)) as f32).to_degrees()
+    }
+
+    /// Upstream `interpolateTo` (`fma(factor, other - this, this)`).
+    pub fn interpolate_to(&self, other: Rotation, factor: f32) -> Rotation {
+        Rotation {
+            yaw: factor * (other.yaw - self.yaw) + self.yaw,
+            pitch: factor * (other.pitch - self.pitch) + self.pitch,
+        }
+    }
+}
+
+/// Upstream `sq` (`utils/math`).
+fn sq(v: f64) -> f64 {
+    v * v
+}
+
+// ----- KillAuraRequirements (upstream .../killaura/KillAuraRequirements.kt) -----
+
+/// Upstream `KillAuraRequirements` tags.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum KillAuraRequirement {
+    Click,
+    MouseMovement,
+    Weapon,
+    EmptyHand,
+    VanillaName,
+    NotBreaking,
+}
+
+impl KillAuraRequirement {
+    pub fn tag(self) -> &'static str {
+        match self {
+            KillAuraRequirement::Click => "Click",
+            KillAuraRequirement::MouseMovement => "MouseMovement",
+            KillAuraRequirement::Weapon => "Weapon",
+            KillAuraRequirement::EmptyHand => "EmptyHand",
+            KillAuraRequirement::VanillaName => "VanillaName",
+            KillAuraRequirement::NotBreaking => "NotBreaking",
+        }
+    }
+
+    pub fn from_tag(tag: &str) -> Option<KillAuraRequirement> {
+        Some(match tag {
+            "Click" => KillAuraRequirement::Click,
+            "MouseMovement" => KillAuraRequirement::MouseMovement,
+            "Weapon" => KillAuraRequirement::Weapon,
+            "EmptyHand" => KillAuraRequirement::EmptyHand,
+            "VanillaName" => KillAuraRequirement::VanillaName,
+            "NotBreaking" => KillAuraRequirement::NotBreaking,
+            _ => return None,
+        })
+    }
+}
+
+/// The client/main-hand inputs the upstream per-tag predicates read, one
+/// snapshot the caller (or mock) supplies.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct KillAuraRequirementInputs {
+    /// `mc.options.keyAttack.isPressedOnAny || keyAttack.wasPressedRecently(250)`
+    pub click_pressed: bool,
+    /// `wasMouseMovedRecently(100)`
+    pub mouse_moved_recently: bool,
+    /// `player.mainHandItem.isWeapon()` (sword, past-1.8 axe, mace or knockback book)
+    pub main_hand_is_weapon: bool,
+    /// `player.mainHandItem.isEmpty`
+    pub main_hand_is_empty: bool,
+    /// `player.mainHandItem.customName != null`
+    pub main_hand_has_custom_name: bool,
+    /// `mc.gameMode?.isDestroying == false` carried as not_breaking
+    pub not_breaking: bool,
+}
+
+/// Upstream `KillAuraRequirements.getAsBoolean`.
+pub fn killaura_requirement_as_boolean(
+    req: KillAuraRequirement,
+    inputs: &KillAuraRequirementInputs,
+) -> bool {
+    match req {
+        KillAuraRequirement::Click => inputs.click_pressed,
+        KillAuraRequirement::MouseMovement => inputs.mouse_moved_recently,
+        KillAuraRequirement::Weapon => inputs.main_hand_is_weapon,
+        KillAuraRequirement::EmptyHand => inputs.main_hand_is_empty,
+        KillAuraRequirement::VanillaName => !inputs.main_hand_has_custom_name,
+        KillAuraRequirement::NotBreaking => inputs.not_breaking,
+    }
+}
+
+/// Upstream `requires.all { it.asBoolean }` over the module's `Requires`
+/// multi-enum setting.
+pub fn killaura_requirements_met(
+    module: &Module,
+    inputs: &KillAuraRequirementInputs,
+) -> bool {
+    let Some(ValueKind::MultiChoice(selected, _)) =
+        module.setting("Requires").map(|v| &v.kind)
+    else {
+        return false;
+    };
+    selected.iter().all(|tag| {
+        KillAuraRequirement::from_tag(tag)
+            .map(|r| killaura_requirement_as_boolean(r, inputs))
+            .unwrap_or(false)
+    })
+}
+
+/// Upstream `RotationManager.setRotationTarget(rotation, priority, requester)`
+/// record; `considerInventory` is the `toRotationTarget` flag.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RotationTargetCall {
+    pub rotation: Rotation,
+    pub consider_inventory: bool,
+}
+
+// ----- Seams + ModuleAutoRod.kt -----
+
+/// Upstream `FishingHook` slice AutoRod reads each tick.
+#[derive(Clone, Copy, Debug)]
+pub struct ArFishingBobber {
+    /// `fishingBobberEntity.hookedIn != null`
+    pub hooked_in: bool,
+    /// `fishingBobberEntity.knownMovement`
+    pub known_movement: Vec3,
+}
+
+/// Upstream `HotbarItemSlot` slice AutoRod reads (OffhandWithHotbar rod slot).
+#[derive(Clone, Copy, Debug)]
+pub struct ArRodSlot {
+    /// `slot.isSelected`
+    pub is_selected: bool,
+    /// `slot.itemStack.is(Items.FISHING_ROD)`
+    pub is_fishing_rod: bool,
+    /// `slot.inventorySlot`, handed to `useHotbarSlotOrOffhand`.
+    pub inventory_slot: i64,
+}
+
+/// Upstream `LivingEntity` target slice AutoRod reads.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct ArTarget {
+    /// `enemy.getActualHealth()`
+    pub health: f64,
+}
+
+/// Upstream `player` slice AutoRod reads.
+#[derive(Clone, Debug)]
+pub struct ArPlayer {
+    pub eye_position: Vec3,
+    pub health: f64,
+    /// `player.mainHandItem.item` registry id (matched against HoldingItemsForIgnore).
+    pub main_hand_item: String,
+    /// `player.isUsingItem`
+    pub is_using_item: bool,
+    /// `player.mainHandItem.isConsumable()`
+    pub main_hand_is_consumable: bool,
+    /// `player.offhandItem.isConsumable()`
+    pub offhand_is_consumable: bool,
+}
+
+/// Engine seams AutoRod needs. `targets()` returns the tracker's entries in
+/// its standing priority order (DISTANCE); `distance_to_sqr` reports the
+/// live `player.distanceToSqr(enemy)` the condition lambdas re-evaluate.
+pub trait ArWorld {
+    fn targets(&mut self) -> Vec<ArTarget>;
+    fn distance_to_sqr(&mut self, target: &ArTarget) -> f64;
+    /// `world.entityGetter.firstOrNull(EntityTypes.FISHING_BOBBER) { it.playerOwner === player }`
+    fn find_own_bobber(&mut self) -> Option<ArFishingBobber>;
+    /// `Slots.OffhandWithHotbar.findSlot(Items.FISHING_ROD)`
+    fn find_rod_slot(&mut self) -> Option<ArRodSlot>;
+    /// `player.hasLineOfSight(enemy)`
+    fn has_line_of_sight(&mut self, target: &ArTarget) -> bool;
+    /// `PointTracker.findPoint(eyes, target, 1)` → the aimed point position.
+    fn find_point(&mut self, eyes: Vec3, target: &ArTarget) -> Option<Vec3>;
+    /// `SituationalProjectileAngleCalculator.calculateAngleForEntity(TrajectoryInfo.FISHING_ROD, target)`
+    fn projectile_angle(&mut self, target: &ArTarget) -> Option<Rotation>;
+}
+
+/// Upstream `SilentHotbar` + `interaction` seams.
+pub trait ArHotbar {
+    /// `useHotbarSlotOrOffhand(slot, ticksUntilReset, swingMode).consumesAction()`
+    fn use_hotbar_slot_or_offhand(
+        &mut self,
+        slot: &ArRodSlot,
+        ticks_until_reset: i64,
+        swing_mode: &str,
+    ) -> bool;
+    /// `interaction.releaseUsingItemInTickLoop()`
+    fn release_using_item_in_tick_loop(&mut self);
+    /// `SilentHotbar.resetSlot(this)`
+    fn reset_slot(&mut self);
+}
+
+pub struct ArHooks<'a> {
+    pub world: &'a mut dyn ArWorld,
+    pub hotbar: &'a mut dyn ArHotbar,
+    /// `RotationManager.serverRotation`
+    pub server_rotation: Rotation,
+    /// `RotationManager.setRotationTarget` calls, in order.
+    pub rotation_targets: &'a mut Vec<RotationTargetCall>,
+    /// `ModuleBlink.running` / `ModuleScaffold.running` / `ModuleFreeze.running`
+    pub blink_running: bool,
+    pub scaffold_running: bool,
+    pub freeze_running: bool,
+    /// `InventoryManager.isInventoryOpen` (Ignore.OpenInventory, first clause)
+    pub inventory_open: bool,
+    /// `mc.gui.screen() is AbstractContainerScreen` (Ignore.OpenInventory, second clause)
+    pub container_screen_open: bool,
+    /// Debug feed (`debugParameter`), shared shape with SuperKnockback.
+    pub debug: &'a mut Vec<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ArGravityType {
+    Linear,
+    Projectile,
+}
+
+fn ar_gravity_type(module: &Module) -> ArGravityType {
+    match module.setting("GravityType").and_then(|v| v.kind.choice()) {
+        Some("Projectile") => ArGravityType::Projectile,
+        _ => ArGravityType::Linear,
+    }
+}
+
+/// Upstream `Ignore` tags, carried as their `asBoolean` inputs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ArIgnore {
+    OpenInventory,
+    UsingItem,
+    HoldingConsumable,
+}
+
+fn ar_ignores_any(module: &Module, player: &ArPlayer, hooks: &ArHooks) -> bool {
+    let Some(ValueKind::MultiChoice(selected, _)) =
+        module.setting("Ignore").map(|v| &v.kind)
+    else {
+        return false;
+    };
+    selected.iter().any(|tag| match tag.as_str() {
+        "OpenInventory" => hooks.inventory_open || hooks.container_screen_open,
+        "UsingItem" => player.is_using_item,
+        "HoldingConsumable" => player.main_hand_is_consumable || player.offhand_is_consumable,
+        _ => false,
+    })
+}
+
+/// Upstream `requirementsMet`.
+pub fn ar_requirements_met(
+    module: &Module,
+    state: &AutoRodState,
+    player: &ArPlayer,
+    hooks: &mut ArHooks,
+    inputs: &KillAuraRequirementInputs,
+) -> bool {
+    killaura_requirements_met(module, inputs)
+        && !ar_ignores_any(module, player, hooks)
+        && player.health > ar_min_health(module)
+        && state.available_rod_slot.is_some()
+        && !ar_holding_ignored_item(module, player)
+        && !hooks.blink_running
+        && !hooks.scaffold_running
+        && !hooks.freeze_running
+        && (ar_max_enemies_nearby(module) == 0
+            || hooks.world.targets().len() <= ar_max_enemies_nearby(module) as usize)
+}
+
+fn ar_holding_ignored_item(module: &Module, player: &ArPlayer) -> bool {
+    match module.setting("HoldingItemsForIgnore").map(|v| &v.kind) {
+        Some(ValueKind::Items(list)) => list.iter().any(|it| *it == player.main_hand_item),
+        _ => false,
+    }
+}
+
+/// Per-tick `computedOn(FIRST_PRIORITY)` refreshes: the bobber recomputes
+/// every tick, the rod slot keeps its cache while it is still the selected
+/// rod slot, else falls back to `Slots.OffhandWithHotbar.findSlot`.
+pub fn ar_refresh_per_tick(module: &Module, state: &mut AutoRodState, hooks: &mut ArHooks) {
+    state.bobber = hooks.world.find_own_bobber();
+    let keep = state
+        .available_rod_slot
+        .take()
+        .filter(|s| s.is_selected && s.is_fishing_rod);
+    state.available_rod_slot = keep.or_else(|| hooks.world.find_rod_slot());
+}
+
+/// Upstream `tickConditional(hitTimeout) { ... }` condition, evaluated each
+/// tick while the sequence is open.
+fn ar_pull_condition(
+    module: &Module,
+    state: &AutoRodState,
+    hooks: &mut ArHooks,
+    target: &ArTarget,
+    min_range_sq: f64,
+    max_range_sq: f64,
+) -> bool {
+    let distance = hooks.world.distance_to_sqr(target);
+    state.bobber.map_or(false, |b| b.hooked_in)
+        || state.bobber.map_or(false, |b| b.known_movement == Vec3::ZERO)
+        || (ar_pull_on_out_of_range(module)
+            && !(distance >= min_range_sq && distance <= max_range_sq))
+}
+
+/// Upstream `handleAutoRod` (`tickHandler`), as a per-tick phase machine.
+/// `cooldown_pick` and `slot_reset_pick` stand in for `cooldown.random()` /
+/// `slotResetDelay.random()`; `scan_extra_pick` for `scanExtraRange.random()`.
+pub fn auto_rod_tick(
+    module: &Module,
+    state: &mut AutoRodState,
+    player: &ArPlayer,
+    hooks: &mut ArHooks,
+    inputs: &KillAuraRequirementInputs,
+    cooldown_pick: i64,
+    slot_reset_pick: i64,
+    scan_extra_pick: f64,
+) {
+    ar_refresh_per_tick(module, state, hooks);
+    hooks
+        .debug
+        .push(format!("fishingBobberEntity.hookedEntity={}", state.bobber.map_or("null".to_string(), |_| "hooked".to_string())));
+
+    // Suspended coroutine continues here: no requirements check re-runs.
+    if let Some(phase) = state.phase.take() {
+        match phase {
+            ArPhase::WaitPull {
+                slot,
+                target,
+                min_range_sq,
+                max_range_sq,
+                timeout_left,
+            } => {
+                if ar_pull_condition(module, state, hooks, &target, min_range_sq, max_range_sq)
+                    || timeout_left <= 1
+                {
+                    // 4. pull; 5. reset slot (overrides the previous action)
+                    hooks.hotbar.use_hotbar_slot_or_offhand(
+                        &slot,
+                        slot_reset_pick,
+                        &ar_swing_mode(module).to_string(),
+                    );
+                    state.phase = Some(ArPhase::WaitCooldown { left: cooldown_pick });
+                } else {
+                    state.phase = Some(ArPhase::WaitPull {
+                        slot,
+                        target,
+                        min_range_sq,
+                        max_range_sq,
+                        timeout_left: timeout_left - 1,
+                    });
+                }
+                return;
+            }
+            ArPhase::WaitCooldown { left } => {
+                if left > 1 {
+                    state.phase = Some(ArPhase::WaitCooldown { left: left - 1 });
+                }
+                return;
+            }
+        }
+    }
+
+    if !ar_requirements_met(module, state, player, hooks, inputs) {
+        return;
+    }
+
+    let Some(slot) = state.available_rod_slot else {
+        return;
+    };
+
+    // `targetTracker.target` standing target (tracker-maintained).
+    let Some(target) = hooks.world.targets().first().copied() else {
+        return;
+    };
+    state.target = Some(target);
+
+    let Some(rotation) = ar_gravity_apply(module, player, hooks.world, &target) else {
+        return;
+    };
+    let rotation_difference = hooks.server_rotation.direction_angle_to(rotation);
+    if rotation_difference > ar_aim_off_threshold(module) {
+        return;
+    }
+
+    // If the player used rod manually, skip use.
+    if state.bobber.is_none() {
+        // 1. select rod; 2. push. The player should hold the rod until pulling.
+        let ticks_until_reset = ar_slot_reset_delay(module).1 + ar_hit_timeout(module);
+        let swing = ar_swing_mode(module).to_string();
+        if !hooks
+            .hotbar
+            .use_hotbar_slot_or_offhand(&slot, ticks_until_reset, &swing)
+        {
+            // Action failed
+            return;
+        }
+        state.current_scan_extra_range = scan_extra_pick;
+    }
+
+    let range = ar_range(module);
+    let max_range_sq = sq(range.1 + state.current_scan_extra_range);
+    let min_range_sq = sq(range.0);
+
+    // 3. timeout / hit entity / no movement / out of range
+    state.phase = Some(ArPhase::WaitPull {
+        slot,
+        target,
+        min_range_sq,
+        max_range_sq,
+        timeout_left: ar_hit_timeout(module),
+    });
+}
+
+/// Upstream `rotationUpdateHandler`.
+pub fn auto_rod_rotation_update(
+    module: &Module,
+    state: &mut AutoRodState,
+    player: &ArPlayer,
+    hooks: &mut ArHooks,
+    inputs: &KillAuraRequirementInputs,
+) {
+    ar_refresh_per_tick(module, state, hooks);
+    if !ar_requirements_met(module, state, player, hooks, inputs) {
+        // targetTracker.reset()
+        state.target = None;
+        return;
+    }
+
+    let range = ar_range(module);
+    let max_range_sq = sq(range.1 + state.current_scan_extra_range);
+    let min_range_sq = sq(range.0);
+
+    // `targetTracker.selectFirst { ... }` — sets `.target` too.
+    let candidates = hooks.world.targets();
+    let target = candidates.iter().copied().find(|enemy| {
+        let distance = hooks.world.distance_to_sqr(enemy);
+        distance >= min_range_sq
+            && distance <= max_range_sq
+            && hooks.world.has_line_of_sight(enemy)
+            && enemy.health > ar_min_target_health(module)
+    });
+    let Some(target) = target else {
+        return;
+    };
+    state.target = Some(target);
+
+    let Some(rotation) = ar_gravity_apply(module, player, hooks.world, &target) else {
+        return;
+    };
+    hooks.rotation_targets.push(RotationTargetCall {
+        rotation,
+        consider_inventory: false,
+    });
+}
+
+/// Upstream `GravityType.apply(target)`.
+fn ar_gravity_apply(
+    module: &Module,
+    player: &ArPlayer,
+    world: &mut dyn ArWorld,
+    target: &ArTarget,
+) -> Option<Rotation> {
+    match ar_gravity_type(module) {
+        ArGravityType::Linear => {
+            let eyes = player.eye_position;
+            let point = world.find_point(eyes, target)?;
+            Some(Rotation::looking_at(point, eyes))
+        }
+        ArGravityType::Projectile => world.projectile_angle(target),
+    }
+}
+
+/// Upstream `onDisabled`.
+pub fn auto_rod_on_disabled(state: &mut AutoRodState, hooks: &mut ArHooks) {
+    state.target = None; // targetTracker.reset()
+    if hooks.world.find_own_bobber().is_some() {
+        hooks.hotbar.release_using_item_in_tick_loop();
+    }
+    state.bobber = None;
+    state.available_rod_slot = None;
+    hooks.hotbar.reset_slot(); // SilentHotbar.resetSlot(this)
+}
+
+/// Coroutine phase machine for the `tickHandler` sequence.
+#[derive(Clone, Copy, Debug)]
+pub enum ArPhase {
+    /// `tickConditional(hitTimeout) { ... }` while the rod is selected;
+    /// the range bounds are the captured `minRangeSq`/`maxRangeSq`.
+    WaitPull {
+        slot: ArRodSlot,
+        target: ArTarget,
+        min_range_sq: f64,
+        max_range_sq: f64,
+        timeout_left: i64,
+    },
+    /// `waitTicks(cooldown.random())` after the pull action.
+    WaitCooldown { left: i64 },
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct AutoRodState {
+    /// `currentScanExtraRange` (random pick of `ScanExtraRange`).
+    pub current_scan_extra_range: f64,
+    /// `fishingBobberEntity` (recomputed every tick).
+    pub bobber: Option<ArFishingBobber>,
+    /// `availableRodSlot` (cached while still the selected rod slot).
+    pub available_rod_slot: Option<ArRodSlot>,
+    /// `targetTracker.target`
+    pub target: Option<ArTarget>,
+    /// Suspended coroutine phase.
+    pub phase: Option<ArPhase>,
+}
+
+pub fn auto_rod_state(initial_scan_extra: f64) -> AutoRodState {
+    AutoRodState { current_scan_extra_range: initial_scan_extra, ..Default::default() }
+}
+
+pub fn auto_rod() -> Module {
+    Module::new(
+        "AutoRod",
+        COMBAT,
+        vec![
+            choice("GravityType", "Linear", &["Linear", "Projectile"]),
+            float_range("Range", 3.5, 5.0, 2.0, 10.0),
+            float_range("ScanExtraRange", 0.0, 0.0, 0.0, 5.0),
+            int("MaxEnemiesNearby", 1, 0, 10), // 0 = no limit
+            float("MinHealth", 10.0, 1.0, 20.0),
+            float("MinTargetHealth", 4.0, 1.0, 20.0),
+            // enumSetOf(EMPTY_HAND).complement()
+            multi_choice(
+                "Requires",
+                &["Click", "MouseMovement", "Weapon", "VanillaName", "NotBreaking"],
+                &["Click", "MouseMovement", "Weapon", "EmptyHand", "VanillaName", "NotBreaking"],
+            ),
+            multi_choice("Ignore", &[], &["OpenInventory", "UsingItem", "HoldingConsumable"]),
+            items(
+                "HoldingItemsForIgnore",
+                &[
+                    "minecraft:bow",
+                    "minecraft:crossbow",
+                    "minecraft:trident",
+                    "minecraft:fire_charge",
+                    "minecraft:ender_pearl",
+                ],
+            ),
+            float("AimOffThreshold", 5.0, 2.0, 10.0),
+            choice("SwingMode", "DoNotHide", &["DoNotHide", "HideForClient"]),
+            int("HitTimeout", 30, 5, 200),
+            boolean("PullOnOutOfRange", true),
+            int_range("SlotResetDelay", 0, 0, 0, 20),
+            int_range("Cooldown", 4, 8, 1, 50),
+        ],
+    )
+}
+
+fn ar_min_health(module: &Module) -> f64 {
+    match module.setting("MinHealth").map(|v| &v.kind) {
+        Some(ValueKind::Float(v, _, _)) => *v,
+        _ => 10.0,
+    }
+}
+
+fn ar_min_target_health(module: &Module) -> f64 {
+    match module.setting("MinTargetHealth").map(|v| &v.kind) {
+        Some(ValueKind::Float(v, _, _)) => *v,
+        _ => 4.0,
+    }
+}
+
+fn ar_max_enemies_nearby(module: &Module) -> i64 {
+    match module.setting("MaxEnemiesNearby").map(|v| &v.kind) {
+        Some(ValueKind::Int(v, _, _)) => *v,
+        _ => 1,
+    }
+}
+
+fn ar_aim_off_threshold(module: &Module) -> f32 {
+    match module.setting("AimOffThreshold").map(|v| &v.kind) {
+        Some(ValueKind::Float(v, _, _)) => *v as f32,
+        _ => 5.0,
+    }
+}
+
+fn ar_hit_timeout(module: &Module) -> i64 {
+    match module.setting("HitTimeout").map(|v| &v.kind) {
+        Some(ValueKind::Int(v, _, _)) => *v,
+        _ => 30,
+    }
+}
+
+fn ar_pull_on_out_of_range(module: &Module) -> bool {
+    match module.setting("PullOnOutOfRange").map(|v| &v.kind) {
+        Some(ValueKind::Bool(v)) => *v,
+        _ => true,
+    }
+}
+
+fn ar_range(module: &Module) -> (f64, f64) {
+    match module.setting("Range").map(|v| &v.kind) {
+        Some(ValueKind::FloatRange(a, b, _, _)) => (*a, *b),
+        _ => (3.5, 5.0),
+    }
+}
+
+fn ar_slot_reset_delay(module: &Module) -> (i64, i64) {
+    match module.setting("SlotResetDelay").map(|v| &v.kind) {
+        Some(ValueKind::IntRange(a, b, _, _)) => (*a, *b),
+        _ => (0, 0),
+    }
+}
+
+fn ar_swing_mode(module: &Module) -> ArSwingMode {
+    match module.setting("SwingMode").and_then(|v| v.kind.choice()) {
+        Some("HideForClient") => ArSwingMode::HideForClient,
+        _ => ArSwingMode::DoNotHide,
+    }
+}
+
+/// Upstream `SwingMode` (the module-facing slice: tag + serverSwing).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ArSwingMode {
+    DoNotHide,
+    HideForClient,
+    HideForBoth,
+    HideForServer,
+}
+
+impl ArSwingMode {
+    pub fn tag(self) -> &'static str {
+        match self {
+            ArSwingMode::DoNotHide => "DoNotHide",
+            ArSwingMode::HideForBoth => "HideForBoth",
+            ArSwingMode::HideForClient => "HideForClient",
+            ArSwingMode::HideForServer => "HideForServer",
+        }
+    }
+}
+
+impl std::fmt::Display for ArSwingMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.tag())
+    }
+}
+
+// ----- Seams + ModuleAutoWeapon.kt -----
+
+/// Upstream `ItemStack` slice AutoWeapon reads.
+#[derive(Clone, Debug)]
+pub struct AwItemStack {
+    /// Seam identity for the upstream `itemStack == bestItem` checks.
+    pub id: u64,
+    pub is_empty: bool,
+    /// WeaponType tags whose predicate tests true on this stack (e.g. ["Sword"]).
+    pub weapon_tags: Vec<String>,
+    /// `stack.attackDamage`
+    pub attack_damage: f64,
+    /// `stack.attackSpeed`
+    pub attack_speed: f64,
+    /// `stack.getEnchantment(Enchantments.KNOCKBACK)`
+    pub knockback_level: i64,
+    /// `stack.isAxe`
+    pub is_axe: bool,
+    /// `stack.item is MaceItem`
+    pub is_mace: bool,
+}
+
+impl AwItemStack {
+    /// Upstream `WeaponType.matchesAny(set, stack)`.
+    pub fn matches_any(&self, selected: &[String]) -> bool {
+        selected.iter().any(|t| self.weapon_tags.iter().any(|w| w == t))
+    }
+
+    /// `WeaponType.test(stack)` for one tag.
+    pub fn test(&self, tag: &str) -> bool {
+        self.weapon_tags.iter().any(|w| w == tag)
+    }
+}
+
+/// Upstream `HotbarItemSlot` slice AutoWeapon reads.
+#[derive(Clone, Debug)]
+pub struct AwSlot {
+    /// `slot.inventorySlot` (hotbar index).
+    pub inventory_slot: i64,
+    pub stack: AwItemStack,
+    /// Upstream `ItemCategorization.getItemFacets(slot)` weapon facets, the
+    /// `WeaponItemFacet.COMPARATOR` order collapsed to a rank. Smaller is
+    /// better: upstream `.maxOrNull()` picks the COMPARATOR's largest
+    /// element (the best weapon). `None` = no weapon facet on this slot.
+    pub facet_rank: Option<i64>,
+}
+
+pub trait AwInventory {
+    /// `Slots.Hotbar` slots with stacks and weapon facets.
+    fn hotbar(&mut self) -> Vec<AwSlot>;
+}
+
+/// Upstream `player` slice AutoWeapon reads.
+#[derive(Clone, Debug)]
+pub struct AwPlayer {
+    /// `player.mainHandItem` (the willShieldBreak/willMaceSmash checks).
+    pub main_hand: AwItemStack,
+    /// `MaceItem.canSmashAttack(player)` (false on <=1.8)
+    pub can_smash_attack: bool,
+    /// `player.hasCooldown`
+    pub has_cooldown: bool,
+    /// `player.isUsingItem && player.usingItemHand == MAIN_HAND && player.useItem.isConsumable`
+    pub using_consumable_main_hand: bool,
+    /// `SilentHotbar.isSlotModifiedBy(ModuleAutoBuff)`
+    pub slot_modified_by_auto_buff: bool,
+}
+
+pub struct AwHooks<'a> {
+    pub inventory: &'a mut dyn AwInventory,
+    /// `ModuleMaceKill.enabled`
+    pub mace_kill_enabled: bool,
+    /// `isOlderThanOrEqual1_8`
+    pub is_older_or_equal_1_8: bool,
+    /// `SilentHotbar.selectSlotSilently(this, slot, switchBack)` calls, in order.
+    pub selections: &'a mut Vec<(i64, i64)>,
+    /// `interaction.ensureHasSentCarriedItem()` call count.
+    pub ensure_sent_carried_item_calls: &'a mut usize,
+    /// `SilentHotbar.resetSlot(this)` call count (`onDisabled`).
+    pub reset_slot_calls: &'a mut usize,
+}
+
+/// Upstream `AttackEntityEvent` flattened to the attacked entity.
+pub struct AwAttackTarget {
+    /// `event.entity as? LivingEntity ?: return`
+    pub is_living_entity: bool,
+    /// `target.wouldBlockHit`
+    pub would_block_hit: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AwPriority {
+    Default,
+    Knockback,
+    Damage,
+    AttackSpeed,
+}
+
+fn aw_priority(module: &Module) -> AwPriority {
+    match module.setting("Priority").and_then(|v| v.kind.choice()) {
+        Some("Knockback") => AwPriority::Knockback,
+        Some("Damage") => AwPriority::Damage,
+        Some("AttackSpeed") => AwPriority::AttackSpeed,
+        _ => AwPriority::Default,
+    }
+}
+
+fn aw_preferred(module: &Module) -> Vec<String> {
+    match module.setting("Preferred").map(|v| &v.kind) {
+        Some(ValueKind::MultiChoice(sel, _)) => sel.clone(),
+        _ => Vec::new(),
+    }
+}
+
+fn aw_change_on_has(module: &Module, tag: &str) -> bool {
+    match module.setting("ChangeOn").map(|v| &v.kind) {
+        Some(ValueKind::MultiChoice(sel, _)) => sel.iter().any(|t| t == tag),
+        _ => false,
+    }
+}
+
+fn aw_auto_shield_break(module: &Module) -> bool {
+    match module.setting("AutoShieldBreak").map(|v| &v.kind) {
+        Some(ValueKind::Bool(v)) => *v,
+        _ => true,
+    }
+}
+
+fn aw_auto_mace(module: &Module) -> bool {
+    match module.setting("AutoMace").map(|v| &v.kind) {
+        Some(ValueKind::Bool(v)) => *v,
+        _ => true,
+    }
+}
+
+fn aw_switch_back(module: &Module) -> i64 {
+    match module.setting("SwitchBack").map(|v| &v.kind) {
+        Some(ValueKind::Int(v, _, _)) => *v,
+        _ => 20,
+    }
+}
+
+/// Upstream `isBusy`: prioritize Auto Buff or consuming an item over Auto Weapon.
+fn aw_is_busy(player: &AwPlayer) -> bool {
+    player.slot_modified_by_auto_buff || player.using_consumable_main_hand
+}
+
+/// Upstream `canMaceSmash`.
+fn aw_can_mace_smash(player: &AwPlayer, hooks: &AwHooks) -> bool {
+    (!hooks.is_older_or_equal_1_8 && player.can_smash_attack) || hooks.mace_kill_enabled
+}
+
+/// Upstream `getBest*Item`: hotbar stacks filtered by the preferred weapon
+/// types, `maxByOrNull` the metric (first element kept on ties).
+fn aw_best_by(module: &Module, hooks: &mut AwHooks, pick: fn(&AwItemStack) -> f64) -> Option<u64> {
+    let slots = hooks.inventory.hotbar();
+    let preferred = aw_preferred(module);
+    let mut best: Option<(f64, u64)> = None;
+    for s in &slots {
+        if s.stack.is_empty || !s.stack.matches_any(&preferred) {
+            continue;
+        }
+        let v = pick(&s.stack);
+        match best {
+            None => best = Some((v, s.stack.id)),
+            Some((bv, _)) if v > bv => best = Some((v, s.stack.id)),
+            _ => {}
+        }
+    }
+    best.map(|(_, id)| id)
+}
+
+/// Upstream `determineWeaponSlot(target, enforceShield)`; returns the
+/// chosen hotbar slot's `inventorySlot`.
+pub fn aw_determine_weapon_slot(
+    module: &Module,
+    player: &AwPlayer,
+    hooks: &mut AwHooks,
+    target: Option<&AwAttackTarget>,
+    enforce_shield: bool,
+) -> Option<i64> {
+    let requires_shield =
+        aw_auto_shield_break(module) && (enforce_shield || target.map(|t| t.would_block_hit).unwrap_or(false));
+    let requires_mace = aw_auto_mace(module) && aw_can_mace_smash(player, hooks);
+    let preferred = aw_preferred(module);
+    let priority = aw_priority(module);
+
+    // getBest* over `Slots.Hotbar.stacks` (evaluated before the facet filter,
+    // same as upstream's `when` arms).
+    let best_knockback = aw_best_by(module, hooks, |s| s.knockback_level as f64);
+    let best_damage = aw_best_by(module, hooks, |s| s.attack_damage);
+    let best_speed = aw_best_by(module, hooks, |s| s.attack_speed);
+
+    // `Slots.Hotbar.flatMap { itemCategorization.getItemFacets(it)
+    //     .filterIsInstance<WeaponItemFacet>() }.filter { ... }.maxOrNull()`
+    let slots = hooks.inventory.hotbar();
+    let mut best: Option<(i64, i64)> = None; // (inventory_slot, facet_rank)
+    for slot in &slots {
+        let Some(rank) = slot.facet_rank else {
+            continue;
+        };
+        let stack = &slot.stack;
+        let ok = if requires_mace {
+            // A mace's smash attack cannot be blocked by a shield
+            stack.test("Mace")
+        } else if requires_shield {
+            // An axe will stun the target if it is blocking with a shield
+            stack.test("Axe")
+        } else if priority == AwPriority::Knockback {
+            Some(stack.id) == best_knockback
+        } else if priority == AwPriority::Damage {
+            Some(stack.id) == best_damage
+        } else if priority == AwPriority::AttackSpeed {
+            Some(stack.id) == best_speed
+        } else {
+            // Fall back to a preferred weapon when no special case applies
+            stack.matches_any(&preferred)
+        };
+        if !ok {
+            continue;
+        }
+        // `maxOrNull()`: the best COMPARATOR element; rank is smaller-is-better.
+        if best.map_or(true, |(_, r)| rank < r) {
+            best = Some((slot.inventory_slot, rank));
+        }
+    }
+    best.map(|(slot, _)| slot)
+}
+
+/// Upstream `attackHandler`.
+pub fn auto_weapon_attack_handler(
+    module: &Module,
+    player: &AwPlayer,
+    hooks: &mut AwHooks,
+    target: &AwAttackTarget,
+) {
+    if !target.is_living_entity {
+        return;
+    }
+    let Some(weapon_slot) =
+        aw_determine_weapon_slot(module, player, hooks, Some(target), false)
+    else {
+        return;
+    };
+
+    if aw_is_busy(player) || !aw_change_on_has(module, "OnAttack") {
+        return;
+    }
+
+    hooks.selections.push((weapon_slot, aw_switch_back(module)));
+    // [ClientPlayerInteractionManager.attackEntity] will sync the selected
+    // slot, so we can do that here already.
+    *hooks.ensure_sent_carried_item_calls += 1;
+}
+
+/// Upstream `onTarget(entity)`: prepare AutoWeapon for the given entity.
+pub fn auto_weapon_on_target(
+    module: &Module,
+    player: &AwPlayer,
+    hooks: &mut AwHooks,
+    target: Option<&AwAttackTarget>,
+) {
+    if !module.running
+        || !target.map(|t| t.is_living_entity).unwrap_or(false)
+        || aw_is_busy(player)
+        || !aw_change_on_has(module, "OnTarget")
+    {
+        return;
+    }
+
+    if let Some(slot) = aw_determine_weapon_slot(module, player, hooks, target, false) {
+        hooks.selections.push((slot, aw_switch_back(module)));
+    }
+}
+
+/// Upstream `onDisabled`.
+pub fn auto_weapon_on_disabled(hooks: &mut AwHooks) {
+    *hooks.reset_slot_calls += 1; // SilentHotbar.resetSlot(this)
+}
+
+/// Upstream `willShieldBreak`.
+pub fn auto_weapon_will_shield_break(
+    module: &Module,
+    player: &AwPlayer,
+    hooks: &mut AwHooks,
+) -> bool {
+    if hooks.is_older_or_equal_1_8 {
+        return false;
+    }
+
+    // If we have an axe in our main hand, we will break the shield
+    if player.main_hand.is_axe {
+        return true;
+    }
+
+    // If we are not going to switch to an axe, we will not break the shield
+    aw_determine_weapon_slot(module, player, hooks, None, true).map_or(false, |slot| {
+        hooks
+            .inventory
+            .hotbar()
+            .into_iter()
+            .find(|s| s.inventory_slot == slot)
+            .map_or(false, |s| s.stack.is_axe)
+    })
+}
+
+/// Upstream `willMaceSmash`.
+pub fn auto_weapon_will_mace_smash(
+    module: &Module,
+    player: &AwPlayer,
+    hooks: &mut AwHooks,
+) -> bool {
+    if !aw_can_mace_smash(player, hooks) {
+        return false;
+    }
+
+    if player.main_hand.is_mace {
+        return true;
+    }
+
+    aw_determine_weapon_slot(module, player, hooks, None, false).map_or(false, |slot| {
+        hooks
+            .inventory
+            .hotbar()
+            .into_iter()
+            .find(|s| s.inventory_slot == slot)
+            .map_or(false, |s| s.stack.is_mace)
+    })
+}
+
+/// Upstream `getAttackSpeed(original)`: the attack speed of the determined
+/// weapon, or `original` if no weapon is selected or ChangeOn lacks OnAttack.
+pub fn auto_weapon_get_attack_speed(
+    module: &Module,
+    player: &AwPlayer,
+    hooks: &mut AwHooks,
+    original: f64,
+) -> f64 {
+    if !module.running || !aw_change_on_has(module, "OnAttack") || !player.has_cooldown {
+        return original;
+    }
+
+    let Some(slot) = aw_determine_weapon_slot(module, player, hooks, None, false) else {
+        return original;
+    };
+    hooks
+        .inventory
+        .hotbar()
+        .into_iter()
+        .find(|s| s.inventory_slot == slot)
+        .map_or(original, |s| s.stack.attack_speed)
+}
+
+pub fn auto_weapon() -> Module {
+    Module::new(
+        "AutoWeapon",
+        COMBAT,
+        vec![
+            multi_choice(
+                "Preferred",
+                &["Sword"],
+                &[
+                    "Any", "Sword", "Axe", "Mace", "Spear", "Pickaxe", "Shovel", "Hoe",
+                    "Knockback", "FireAspect",
+                ],
+            ),
+            choice("Priority", "Default", &["Default", "Knockback", "Damage", "AttackSpeed"]),
+            boolean("AutoShieldBreak", true),
+            boolean("AutoMace", true),
+            int("SwitchBack", 20, 1, 300),
+            multi_choice("ChangeOn", &["OnAttack"], &["OnAttack", "OnTarget"]),
+        ],
+    )
+}
+
+// ----- Seams + ModuleAimbot.kt -----
+
+/// Upstream `Entity` slice Aimbot reads.
+#[derive(Clone, Debug)]
+pub struct AbEntity {
+    pub is_end_crystal: bool,
+    pub is_living_entity: bool,
+    /// `RotationUtil.crosshairCosToEntity(entity)`, the crystals sort key.
+    pub crosshair_cos: f64,
+}
+
+/// Upstream `PointTracker.findPoint` result slice (pos + box).
+#[derive(Clone, Copy, Debug)]
+pub struct AbPoint {
+    pub pos: Vec3,
+    pub box_min: Vec3,
+    pub box_max: Vec3,
+}
+
+/// Upstream `RotationWithVector` (rotation + hit location).
+#[derive(Clone, Copy, Debug)]
+pub struct AbRotationWithVector {
+    pub rotation: Rotation,
+    pub location: Vec3,
+}
+
+/// Engine seams Aimbot needs. `targets()` returns the tracker's entries in
+/// its standing priority order (DIRECTION, range-bounded by `Range`).
+pub trait AbWorld {
+    /// `targetTracker.targets()`
+    fn targets(&mut self) -> Vec<AbEntity>;
+    /// `world.getEntitiesBoxInRange(player.eyePosition, maxRange) { it is EndCrystal && targetTracker.isInFov(it) }`
+    fn crystals_in_range(&mut self, eyes: Vec3, max_range: f64) -> Vec<AbEntity>;
+    /// `isLookingAtEntity(fromEntity, toEntity, rotation, range, throughWallsRange)`
+    fn look_at_hit(
+        &mut self,
+        entity: &AbEntity,
+        rotation: Rotation,
+        range: f64,
+        through_walls_range: f64,
+    ) -> Option<Vec3>;
+    /// `PointTracker.findPoint(eyes, entity)`
+    fn find_point(&mut self, eyes: Vec3, entity: &AbEntity) -> Option<AbPoint>;
+    /// `raytraceBox(eyes, point.box, range, wallsRange, rotationPreference)`
+    /// with `LeastDifferencePreference.leastDifferenceToLastPoint` folded in.
+    fn raytrace_box(
+        &mut self,
+        eyes: Vec3,
+        point: &AbPoint,
+        range: f64,
+        walls_range: f64,
+    ) -> Option<AbRotationWithVector>;
+}
+
+/// Upstream angle-smooth processors (`angleSmooth.activeMode.process(...)`),
+/// one seam call per rotation update.
+pub trait AbAngleSmooth {
+    fn process(
+        &mut self,
+        mode: &str,
+        player_rotation: Rotation,
+        target_rotation: Rotation,
+    ) -> Option<Rotation>;
+}
+
+/// Upstream `RotationUtil.applyMouseTurnDelta(rotation, cursorDeltaX, cursorDeltaY)`.
+pub trait AbMouseDelta {
+    fn apply(&mut self, rotation: Rotation, delta_x: f64, delta_y: f64) -> Rotation;
+}
+
+pub struct AbHooks<'a> {
+    pub world: &'a mut dyn AbWorld,
+    pub angle_smooth: &'a mut dyn AbAngleSmooth,
+    pub mouse_delta: &'a mut dyn AbMouseDelta,
+    /// `mc.gui.screen()`
+    pub screen_open: bool,
+    /// `InventoryManager.isInventoryOpen`
+    pub inventory_open: bool,
+    /// `mc.gui.screen() is AbstractContainerScreen<*>`
+    pub container_screen_open: bool,
+    /// `mc.options.keyUse.isPressedOnAny`
+    pub use_key_pressed: bool,
+    /// `Timer.timerSpeed`
+    pub timer_speed: f32,
+    /// `player.rotation`
+    pub player_rotation_raw: Rotation,
+    /// `player.eyePosition`
+    pub eye_position: Vec3,
+    /// `ModuleAutoWeapon.onTarget(entity)` calls with a living target set.
+    pub on_target_calls: &'a mut usize,
+    /// `player.setRotation(...)` calls, in order.
+    pub set_rotations: &'a mut Vec<Rotation>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct AimbotState {
+    pub target_rotation: Option<Rotation>,
+    pub player_rotation: Option<Rotation>,
+    /// `targetTracker.target` standing target (tracker-maintained).
+    pub target_set: bool,
+}
+
+pub fn aimbot_state() -> AimbotState {
+    AimbotState::default()
+}
+
+fn ab_range(module: &Module) -> f64 {
+    match module.setting("Range").map(|v| &v.kind) {
+        Some(ValueKind::Float(v, _, _)) => *v,
+        _ => 4.2,
+    }
+}
+
+/// Upstream `WallRange` with its `onChange { minOf(range.get(), it) }` clamp.
+fn ab_wall_range(module: &Module) -> f64 {
+    let wall = match module.setting("WallRange").map(|v| &v.kind) {
+        Some(ValueKind::Float(v, _, _)) => *v,
+        _ => 0.0,
+    };
+    wall.min(ab_range(module))
+}
+
+fn ab_lazy_rotation(module: &Module) -> bool {
+    match module.setting("LazyRotation").map(|v| &v.kind) {
+        Some(ValueKind::Bool(v)) => *v,
+        _ => false,
+    }
+}
+
+fn ab_crystals_enabled(module: &Module) -> bool {
+    match module.setting("Crystals").map(|v| &v.kind) {
+        Some(ValueKind::Bool(v)) => *v,
+        _ => false,
+    }
+}
+
+fn ab_crystals_only(module: &Module) -> bool {
+    match module.setting("CrystalsOnly").map(|v| &v.kind) {
+        Some(ValueKind::Bool(v)) => *v,
+        _ => false,
+    }
+}
+
+fn ab_crystals_only_while_using(module: &Module) -> bool {
+    match module.setting("CrystalsOnlyWhileUsing").map(|v| &v.kind) {
+        Some(ValueKind::Bool(v)) => *v,
+        _ => false,
+    }
+}
+
+fn ab_axis_has(module: &Module, tag: &str) -> bool {
+    match module.setting("Axis").map(|v| &v.kind) {
+        Some(ValueKind::MultiChoice(sel, _)) => sel.iter().any(|t| t == tag),
+        _ => false,
+    }
+}
+
+fn ab_ignore_has(module: &Module, tag: &str) -> bool {
+    match module.setting("Ignore").map(|v| &v.kind) {
+        Some(ValueKind::MultiChoice(sel, _)) => sel.iter().any(|t| t == tag),
+        _ => false,
+    }
+}
+
+fn ab_angle_smooth(module: &Module) -> String {
+    match module.setting("AngleSmooth").and_then(|v| v.kind.choice()) {
+        Some(s) => s.to_string(),
+        None => "InterpolationAngleSmooth".to_string(),
+    }
+}
+
+/// Upstream `requirementsMet`.
+fn ab_requirements_met(module: &Module, hooks: &AbHooks, inputs: &KillAuraRequirementInputs) -> bool {
+    !hooks.screen_open && killaura_requirements_met(module, inputs)
+}
+
+/// Upstream `Crystals.targets()`.
+fn ab_crystal_targets(module: &Module, hooks: &mut AbHooks) -> Vec<AbEntity> {
+    if ab_crystals_only_while_using(module) && !hooks.use_key_pressed {
+        return Vec::new();
+    }
+
+    let mut crystals = hooks
+        .world
+        .crystals_in_range(hooks.eye_position, ab_range(module));
+    // `crystals.sortByDescending(RotationUtil::crosshairCosToEntity)`
+    crystals.sort_by(|a, b| {
+        b.crosshair_cos
+            .partial_cmp(&a.crosshair_cos)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    crystals
+}
+
+/// Upstream `targets()`.
+fn ab_targets(module: &Module, hooks: &mut AbHooks) -> Vec<AbEntity> {
+    if !ab_crystals_enabled(module) {
+        return hooks.world.targets();
+    }
+
+    let mut targets = ab_crystal_targets(module, hooks);
+    if !ab_crystals_only(module) {
+        targets.extend(hooks.world.targets());
+    }
+    targets
+}
+
+/// Upstream `findNextTargetRotation()`.
+pub fn ab_find_next_target_rotation(
+    module: &Module,
+    state: &mut AimbotState,
+    hooks: &mut AbHooks,
+) -> Option<(AbEntity, AbRotationWithVector)> {
+    for entity in ab_targets(module, hooks) {
+        if ab_lazy_rotation(module) {
+            let current_rotation = hooks.player_rotation_raw;
+            let current_hit = hooks.world.look_at_hit(
+                &entity,
+                current_rotation,
+                ab_range(module),
+                ab_wall_range(module),
+            );
+
+            if let Some(location) = current_hit {
+                state.target_set = true; // targetTracker.target = entity
+                return Some((
+                    entity,
+                    AbRotationWithVector { rotation: current_rotation, location },
+                ));
+            }
+        }
+
+        let eyes = hooks.eye_position;
+        let Some(point) = hooks.world.find_point(eyes, &entity) else {
+            continue;
+        };
+
+        let Some(rotation) = hooks
+            .world
+            .raytrace_box(eyes, &point, ab_range(module), ab_wall_range(module))
+        else {
+            continue;
+        };
+
+        state.target_set = true; // targetTracker.target = entity
+        return Some((entity, rotation));
+    }
+
+    state.target_set = false; // targetTracker.reset()
+    None
+}
+
+/// Upstream `tickHandler` (`RotationUpdateEvent`).
+pub fn aimbot_rotation_update(
+    module: &Module,
+    state: &mut AimbotState,
+    hooks: &mut AbHooks,
+    inputs: &KillAuraRequirementInputs,
+) {
+    state.player_rotation = Some(hooks.player_rotation_raw);
+
+    if !ab_requirements_met(module, hooks, inputs) {
+        state.target_set = false; // targetTracker.reset()
+        state.target_rotation = None;
+        return;
+    }
+
+    state.target_rotation = ab_find_next_target_rotation(module, state, hooks).and_then(
+        |(_target, rotation)| {
+            hooks
+                .angle_smooth
+                .process(&ab_angle_smooth(module), hooks.player_rotation_raw, rotation.rotation)
+        },
+    );
+
+    // Update Auto Weapon
+    if state.target_set {
+        *hooks.on_target_calls += 1;
+    }
+}
+
+/// Upstream `renderHandler` (`WorldRenderEvent`).
+pub fn aimbot_render(
+    module: &Module,
+    state: &AimbotState,
+    partial_ticks: f32,
+    hooks: &mut AbHooks,
+) {
+    if !ab_ignore_has(module, "Screen") && hooks.screen_open {
+        return;
+    }
+
+    if !ab_ignore_has(module, "Container")
+        && (hooks.inventory_open || hooks.container_screen_open)
+    {
+        return;
+    }
+
+    aimbot_look_at(module, state, partial_ticks, hooks);
+}
+
+/// Upstream `lookAt(partialTicks)`: looks at the target rotation with
+/// interpolation based on the timer speed and partial ticks.
+pub fn aimbot_look_at(
+    module: &Module,
+    state: &AimbotState,
+    partial_ticks: f32,
+    hooks: &mut AbHooks,
+) {
+    let (Some(player_rotation), Some(target_rotation)) =
+        (state.player_rotation, state.target_rotation)
+    else {
+        return;
+    };
+    let timer_speed = hooks.timer_speed;
+    let interpolated = player_rotation.interpolate_to(target_rotation, timer_speed * partial_ticks);
+
+    let yaw = if ab_axis_has(module, "Horizontal") {
+        interpolated.yaw
+    } else {
+        player_rotation.yaw
+    };
+    let pitch = if ab_axis_has(module, "Vertical") {
+        interpolated.pitch
+    } else {
+        player_rotation.pitch
+    };
+    hooks.set_rotations.push(Rotation { yaw, pitch });
+}
+
+/// Upstream `mouseMovement` (`MouseRotationEvent`).
+pub fn aimbot_mouse_movement(
+    state: &mut AimbotState,
+    cursor_delta_x: f64,
+    cursor_delta_y: f64,
+    hooks: &mut AbHooks,
+) {
+    if let Some(rotation) = state.player_rotation {
+        state.player_rotation = Some(hooks.mouse_delta.apply(rotation, cursor_delta_x, cursor_delta_y));
+    }
+
+    if let Some(rotation) = state.target_rotation {
+        state.target_rotation = Some(hooks.mouse_delta.apply(rotation, cursor_delta_x, cursor_delta_y));
+    }
+}
+
+/// Upstream `onDisabled`.
+pub fn aimbot_on_disabled(state: &mut AimbotState) {
+    state.target_set = false; // targetTracker.reset()
+    state.target_rotation = None;
+}
+
+pub fn aimbot() -> Module {
+    Module::new(
+        "Aimbot", // aliases AimAssist / AutoAim
+        COMBAT,
+        vec![
+            float("Range", 4.2, 1.0, 8.0),
+            float("WallRange", 0.0, 0.0, 8.0),
+            boolean("LazyRotation", false),
+            // ToggleableValueGroup `Crystals` flattened to booleans.
+            boolean("Crystals", false),
+            boolean("CrystalsOnly", false),
+            boolean("CrystalsOnlyWhileUsing", false),
+            multi_choice(
+                "Requires",
+                &[],
+                &["Click", "MouseMovement", "Weapon", "EmptyHand", "VanillaName", "NotBreaking"],
+            ),
+            choice(
+                "AngleSmooth",
+                "InterpolationAngleSmooth",
+                &["InterpolationAngleSmooth", "SigmoidAngleSmooth", "LinearAngleSmooth"],
+            ),
+            multi_choice("Axis", &["Horizontal", "Vertical"], &["Horizontal", "Vertical"]),
+            multi_choice("Ignore", &[], &["Screen", "Container"]),
+        ],
+    )
+}
+
+// ----- Seams + ModuleAutoShoot.kt -----
+
+/// Upstream `LivingEntity` target slice AutoShoot reads.
+#[derive(Clone, Copy, Debug)]
+pub struct AsTarget;
+
+/// Upstream `HotbarItemSlot` slice AutoShoot reads.
+#[derive(Clone, Debug)]
+pub struct AsSlot {
+    /// `slot.hotbarIndex` (null for offhand slots).
+    pub hotbar_index: Option<i64>,
+    /// `SilentHotbar.serversideSlot`
+    pub serverside_slot: i64,
+    /// The held item's registry id, e.g. "minecraft:egg".
+    pub item: String,
+    /// `it.itemStack.isEmpty`
+    pub is_empty: bool,
+    /// `slot.useHand` ("Main" / "Off").
+    pub use_hand: String,
+}
+
+impl AsSlot {
+    /// Upstream `HotbarItemSlot.isSelectionNeeded`.
+    fn is_selection_needed(&self) -> bool {
+        self.hotbar_index.map_or(false, |idx| idx != self.serverside_slot)
+    }
+}
+
+/// The `findClosestSlot` predicate of the `ThrowableType` mode, serialized.
+#[derive(Clone, Debug)]
+pub enum AsThrowableMode {
+    /// `Slots.OffhandWithHotbar.findClosestSlot { it.item is EggItem || it.item is SnowballItem }`
+    EggAndSnowball,
+    /// `Slots.OffhandWithHotbar.findClosestSlot { !it.isEmpty && filter(it.item, items) }`
+    /// with the mode's `Filter`/`Items` settings.
+    Custom { filter: String, items: Vec<String> },
+}
+
+impl AsThrowableMode {
+    /// Upstream `Filter(item, items)`: Whitelist = contained, Blacklist = not.
+    fn matches(&self, slot: &AsSlot) -> bool {
+        match self {
+            AsThrowableMode::EggAndSnowball => {
+                slot.item == "minecraft:egg" || slot.item == "minecraft:snowball"
+            }
+            AsThrowableMode::Custom { filter, items } => {
+                let contains = items.iter().any(|it| *it == slot.item);
+                match filter.as_str() {
+                    "Blacklist" => !slot.is_empty && !contains,
+                    _ => !slot.is_empty && contains,
+                }
+            }
+        }
+    }
+}
+
+pub trait AsInventory {
+    /// `Slots.OffhandWithHotbar.findClosestSlot { predicate }`; the engine owns
+    /// the scan order and slot identity.
+    fn find_closest_slot(&mut self, mode: &AsThrowableMode) -> Option<AsSlot>;
+}
+
+/// Engine seams AutoShoot needs.
+pub trait AsWorld {
+    /// `targetTracker.selectFirst(player::hasLineOfSight)`: the first target
+    /// with line of sight; the tracker's `.target` follows the selection.
+    fn select_first_with_los(&mut self) -> Option<AsTarget>;
+    /// `player.eyePosition`
+    fn eye_position(&mut self) -> Vec3;
+    /// `PointTracker.findPoint(eyes, target, 1)`
+    fn find_point(&mut self, eyes: Vec3, target: &AsTarget) -> Option<Vec3>;
+    /// `SituationalProjectileAngleCalculator.calculateAngleForEntity(TrajectoryInfo.GENERIC, target)`
+    fn projectile_angle(&mut self, target: &AsTarget) -> Option<Rotation>;
+}
+
+/// Upstream `SilentHotbar` + `Clicker` + `useItem` seams.
+pub trait AsHotbar {
+    /// `SilentHotbar.selectSlotSilently(this, slot, tickUntilReset)`; returns
+    /// the post-select re-check of `isSelectionNeeded` (true = still not held).
+    fn select_slot_silently(&mut self, slot: &AsSlot, tick_until_reset: i64) -> bool;
+    /// `SilentHotbar.resetSlot(ModuleAutoShoot)`
+    fn reset_slot(&mut self);
+    /// `useItem(slot.useHand, swingMode).consumesAction()`
+    fn use_item(&mut self, slot: &AsSlot, swing_mode: &str) -> bool;
+    /// `Clicker.click`: whether the clicker allowed a click this tick.
+    fn click_allowed(&mut self) -> bool;
+}
+
+pub struct AsHooks<'a> {
+    pub world: &'a mut dyn AsWorld,
+    pub hotbar: &'a mut dyn AsHotbar,
+    pub inventory: &'a mut dyn AsInventory,
+    /// `RotationManager.serverRotation`
+    pub server_rotation: Rotation,
+    /// `RotationManager.setRotationTarget` calls, in order.
+    pub rotation_targets: &'a mut Vec<RotationTargetCall>,
+    /// `CombatManager.isInCombat`
+    pub in_combat: bool,
+    /// `player.isUsingItem`
+    pub player_is_using_item: bool,
+    /// `InventoryManager.isInventoryOpen`
+    pub inventory_open: bool,
+    /// `ModuleKillAura.running`
+    pub kill_aura_running: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct AutoShootState {
+    /// `targetTracker.target` standing target (tracker-maintained).
+    pub target: Option<AsTarget>,
+}
+
+pub fn auto_shoot_state() -> AutoShootState {
+    AutoShootState::default()
+}
+
+fn as_select_slot_automatically(module: &Module) -> bool {
+    match module.setting("SelectSlotAutomatically").map(|v| &v.kind) {
+        Some(ValueKind::Bool(v)) => *v,
+        _ => true,
+    }
+}
+
+fn as_tick_until_reset(module: &Module) -> i64 {
+    match module.setting("TicksUntilSlotReset").map(|v| &v.kind) {
+        Some(ValueKind::Int(v, _, _)) => *v,
+        _ => 1,
+    }
+}
+
+fn as_consider_inventory(module: &Module) -> bool {
+    match module.setting("ConsiderInventory").map(|v| &v.kind) {
+        Some(ValueKind::Bool(v)) => *v,
+        _ => true,
+    }
+}
+
+fn as_requires_kill_aura(module: &Module) -> bool {
+    match module.setting("RequiresKillAura").map(|v| &v.kind) {
+        Some(ValueKind::Bool(v)) => *v,
+        _ => false,
+    }
+}
+
+fn as_not_during_combat(module: &Module) -> bool {
+    match module.setting("NotDuringCombat").map(|v| &v.kind) {
+        Some(ValueKind::Bool(v)) => *v,
+        _ => false,
+    }
+}
+
+fn as_aim_off_threshold(module: &Module) -> f32 {
+    match module.setting("AimOffThreshold").map(|v| &v.kind) {
+        Some(ValueKind::Float(v, _, _)) => *v as f32,
+        _ => 2.0,
+    }
+}
+
+fn as_swing_mode(module: &Module) -> ArSwingMode {
+    match module.setting("SwingMode").and_then(|v| v.kind.choice()) {
+        Some("HideForClient") => ArSwingMode::HideForClient,
+        _ => ArSwingMode::DoNotHide,
+    }
+}
+
+/// Upstream `HotbarItemSlot.trySelect`.
+fn as_try_select(module: &Module, slot: &AsSlot, hooks: &mut AsHooks) -> bool {
+    if slot.is_selection_needed() {
+        // Select the slot if we are not holding it.
+        if !as_select_slot_automatically(module) {
+            return false;
+        }
+        // If we are not holding the slot, we can't shoot.
+        let still_needed =
+            hooks.hotbar.select_slot_silently(slot, as_tick_until_reset(module));
+        if still_needed {
+            return false;
+        }
+    }
+    true
+}
+
+/// Upstream `shouldPauseForKillAura`.
+fn as_should_pause_for_kill_aura(module: &Module, state: &mut AutoShootState, hooks: &AsHooks) -> bool {
+    if as_requires_kill_aura(module) && !hooks.kill_aura_running {
+        state.target = None; // targetTracker.reset()
+        return true;
+    }
+    false
+}
+
+/// Upstream `getThrowableSlot`.
+fn as_throwable_slot(module: &Module, hooks: &mut AsHooks) -> Option<AsSlot> {
+    let mode = as_throwable_mode(module);
+    let slot = hooks.inventory.find_closest_slot(&mode)?;
+    if as_try_select(module, &slot, hooks) {
+        Some(slot)
+    } else {
+        None
+    }
+}
+
+/// Upstream `throwableType.activeMode` (Custom mode carries its settings).
+fn as_throwable_mode(module: &Module) -> AsThrowableMode {
+    let kind = module.setting("ThrowableType").and_then(|v| v.kind.choice());
+    if kind == Some("Custom") {
+        let filter = module
+            .setting("Filter")
+            .and_then(|v| v.kind.choice())
+            .unwrap_or("Whitelist")
+            .to_string();
+        let items = module
+            .setting("Items")
+            .map(|v| &v.kind)
+            .and_then(ValueKind::items)
+            .cloned()
+            .unwrap_or_default();
+        AsThrowableMode::Custom { filter, items }
+    } else {
+        AsThrowableMode::EggAndSnowball
+    }
+}
+
+/// Upstream `GravityType.from(slot)`: Auto resolves by the held item
+/// (egg/snowball → Projectile, else Linear), other tags pass through.
+fn as_rotation_for(
+    module: &Module,
+    hooks: &mut AsHooks,
+    target: &AsTarget,
+    slot: &AsSlot,
+) -> Option<Rotation> {
+    let setting = module
+        .setting("GravityType")
+        .and_then(|v| v.kind.choice())
+        .unwrap_or("Auto");
+    let gravity: String = match setting {
+        "Auto" => {
+            if slot.item == "minecraft:egg" || slot.item == "minecraft:snowball" {
+                "Projectile".to_string()
+            } else {
+                "Linear".to_string()
+            }
+        }
+        other => other.to_string(),
+    };
+    match gravity.as_str() {
+        "Projectile" => hooks.world.projectile_angle(target),
+        "Linear" => {
+            // On linear we likely don't need to care about gravity, but
+            // instead aim exactly at the hitbox of the target.
+            let eyes = hooks.world.eye_position();
+            let point = hooks.world.find_point(eyes, target)?;
+            Some(Rotation::looking_at(point, eyes))
+        }
+        _ => None,
+    }
+}
+
+/// Upstream `simulatedTickHandler` (`RotationUpdateEvent`).
+pub fn auto_shoot_rotation_update(module: &Module, state: &mut AutoShootState, hooks: &mut AsHooks) {
+    if as_should_pause_for_kill_aura(module, state, hooks) {
+        return;
+    }
+
+    // Find the recommended target. Check if we can see the enemy.
+    state.target = hooks.world.select_first_with_los();
+    let Some(target) = state.target else {
+        return;
+    };
+
+    if as_not_during_combat(module) && hooks.in_combat {
+        return;
+    }
+
+    // Check if we have a throwable, if not we can't shoot.
+    let Some(slot) = as_throwable_slot(module, hooks) else {
+        return;
+    };
+    let Some(rotation) = as_rotation_for(module, hooks, &target, &slot) else {
+        return;
+    };
+
+    // Set the rotation with the usage priority of 2.
+    hooks.rotation_targets.push(RotationTargetCall {
+        rotation,
+        consider_inventory: as_consider_inventory(module),
+    });
+}
+
+/// Upstream `handleAutoShoot` (`tickHandler`).
+pub fn auto_shoot_tick(module: &Module, state: &mut AutoShootState, hooks: &mut AsHooks) {
+    if as_should_pause_for_kill_aura(module, state, hooks) {
+        return;
+    }
+
+    let Some(target) = state.target else {
+        return;
+    };
+
+    if as_not_during_combat(module) && hooks.in_combat {
+        return;
+    }
+
+    // Check if we have a throwable, if not we can't shoot.
+    let Some(slot) = as_throwable_slot(module, hooks) else {
+        return;
+    };
+    let Some(rotation) = as_rotation_for(module, hooks, &target, &slot) else {
+        return;
+    };
+
+    // Check the difference between server and client rotation.
+    let rotation_difference = hooks.server_rotation.direction_angle_to(rotation);
+
+    // Check if we are not aiming at the target yet.
+    if rotation_difference > as_aim_off_threshold(module) {
+        return;
+    }
+
+    // Check if we are still aiming at the target.
+    if hooks.hotbar.click_allowed() {
+        if hooks.player_is_using_item || (as_consider_inventory(module) && hooks.inventory_open) {
+            return;
+        }
+        hooks
+            .hotbar
+            .use_item(&slot, &as_swing_mode(module).to_string());
+    }
+}
+
+/// Upstream `onDisabled`.
+pub fn auto_shoot_on_disabled(state: &mut AutoShootState, hooks: &mut AsHooks) {
+    state.target = None; // targetTracker.reset()
+    hooks.hotbar.reset_slot(); // SilentHotbar.resetSlot(ModuleAutoShoot)
+}
+
+pub fn auto_shoot() -> Module {
+    Module::new(
+        "AutoShoot",
+        COMBAT,
+        vec![
+            choice("ThrowableType", "EggAndSnowball", &["EggAndSnowball", "Custom"]),
+            choice("GravityType", "Auto", &["Auto", "Linear", "Projectile"]),
+            // Clicker(this, mc.options.keyUse, itemCooldown = null) group.
+            boolean("Clicker", true),
+            choice("Technique", "Human", &["Human", "Constant"]),
+            int_range("CPS", 11, 14, 1, 20),
+            int("MaxPerTick", 2, 1, 5),
+            float_range("Range", 3.0, 6.0, 1.0, 256.0),
+            float("AimOffThreshold", 2.0, 0.5, 10.0),
+            choice("SwingMode", "DoNotHide", &["DoNotHide", "HideForClient"]),
+            boolean("SelectSlotAutomatically", true),
+            int("TicksUntilSlotReset", 1, 0, 20),
+            boolean("ConsiderInventory", true),
+            boolean("RequiresKillAura", false),
+            boolean("NotDuringCombat", false),
+            boolean("ConstantLag", false),
+            // Custom mode's settings.
+            choice("Filter", "Whitelist", &["Whitelist", "Blacklist"]),
+            items("Items", &["minecraft:egg", "minecraft:snowball"]),
+        ],
+    )
+}
+
+#[cfg(test)]
+mod tests6 {
+    use super::*;
+
+    fn json_str(s: &str) -> Json {
+        Json::Str(s.to_string())
+    }
+
+    fn json_items(entries: &[&str]) -> Json {
+        Json::Arr(entries.iter().map(|s| Json::Str(s.to_string())).collect())
+    }
+
+    fn req_inputs(click: bool, mouse: bool, weapon: bool, empty: bool, custom: bool, not_breaking: bool) -> KillAuraRequirementInputs {
+        KillAuraRequirementInputs {
+            click_pressed: click,
+            mouse_moved_recently: mouse,
+            main_hand_is_weapon: weapon,
+            main_hand_is_empty: empty,
+            main_hand_has_custom_name: custom,
+            not_breaking,
+        }
+    }
+
+    fn all_req_inputs() -> KillAuraRequirementInputs {
+        req_inputs(true, true, true, false, false, true)
+    }
+
+    // ----- Rotation math -----
+
+    #[test]
+    fn wrap_degrees_wraps_into_180() {
+        assert_eq!(wrap_degrees(0.0), 0.0);
+        assert_eq!(wrap_degrees(360.0), 0.0);
+        assert_eq!(wrap_degrees(190.0), -170.0);
+        assert_eq!(wrap_degrees(-190.0), 170.0);
+    }
+
+    #[test]
+    fn rotation_from_vec_matches_upstream() {
+        // diff = (+X): yaw = atan2(0,1)*deg - 90 = -90, pitch = -atan2(0, 1) = 0
+        let r = rotation_from_vec(1.0, 0.0, 0.0);
+        assert_eq!(r.yaw, -90.0);
+        assert_eq!(r.pitch, 0.0);
+
+        // diff = (+Z): yaw = atan2(1,0)*deg - 90 = 0, pitch = -atan2(0,1) = 0
+        let r = rotation_from_vec(0.0, 0.0, 1.0);
+        assert_eq!(r.yaw, 0.0);
+        assert_eq!(r.pitch, 0.0);
+
+        // diff = straight up: pitch = -atan2(1, 0) = -90
+        let r = rotation_from_vec(0.0, 1.0, 0.0);
+        assert_eq!(r.pitch, -90.0);
+    }
+
+    #[test]
+    fn looking_at_matches_from_rotation_vec() {
+        let from = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+        let point = Vec3 { x: 3.0, y: 1.0, z: 4.0 };
+        assert_eq!(Rotation::looking_at(point, from), rotation_from_vec(3.0, 1.0, 4.0));
+    }
+
+    #[test]
+    fn direction_vector_faces_plus_x_for_yaw_270() {
+        // yaw = -90 (== 270) faces +X at pitch 0
+        let d = Rotation { yaw: -90.0, pitch: 0.0 }.direction_vector();
+        assert!((d.x - 1.0).abs() < 1e-6, "x = {}", d.x);
+        assert!(d.y.abs() < 1e-6);
+        assert!(d.z.abs() < 1e-6);
+    }
+
+    #[test]
+    fn direction_angle_to_measures_the_yaw_gap() {
+        let facing_plus_x = Rotation { yaw: -90.0, pitch: 0.0 };
+        let facing_plus_z = Rotation { yaw: 0.0, pitch: 0.0 };
+        let angle = facing_plus_x.direction_angle_to(facing_plus_z);
+        assert!((angle - 90.0).abs() < 1e-4, "angle = {}", angle);
+    }
+
+    #[test]
+    fn interpolate_to_is_fma() {
+        let a = Rotation { yaw: 10.0, pitch: 0.0 };
+        let b = Rotation { yaw: 20.0, pitch: -10.0 };
+        let half = a.interpolate_to(b, 0.5);
+        assert_eq!(half.yaw, 15.0);
+        assert_eq!(half.pitch, -5.0);
+    }
+
+    // ----- KillAuraRequirements -----
+
+    #[test]
+    fn killaura_tags_roundtrip() {
+        for req in [
+            KillAuraRequirement::Click,
+            KillAuraRequirement::MouseMovement,
+            KillAuraRequirement::Weapon,
+            KillAuraRequirement::EmptyHand,
+            KillAuraRequirement::VanillaName,
+            KillAuraRequirement::NotBreaking,
+        ] {
+            assert_eq!(KillAuraRequirement::from_tag(req.tag()), Some(req));
+        }
+        assert_eq!(KillAuraRequirement::from_tag("Nope"), None);
+    }
+
+    #[test]
+    fn killaura_as_boolean_matches_upstream_predicates() {
+        let inputs = req_inputs(true, true, true, true, true, false);
+        assert!(killaura_requirement_as_boolean(KillAuraRequirement::Click, &inputs));
+        assert!(killaura_requirement_as_boolean(KillAuraRequirement::EmptyHand, &inputs));
+        // VanillaName = customName == null
+        assert!(!killaura_requirement_as_boolean(KillAuraRequirement::VanillaName, &inputs));
+        // NotBreaking = isDestroying == false
+        assert!(!killaura_requirement_as_boolean(KillAuraRequirement::NotBreaking, &inputs));
+    }
+
+    #[test]
+    fn killaura_requirements_met_needs_every_selected_tag() {
+        let module = auto_rod();
+        // Defaults: all tags except EmptyHand.
+        let inputs = all_req_inputs();
+        assert!(killaura_requirements_met(&module, &inputs));
+
+        let inputs = req_inputs(false, true, true, false, false, true);
+        assert!(!killaura_requirements_met(&module, &inputs));
+    }
+
+    // ----- value.rs items() -----
+
+    #[test]
+    fn items_setting_defaults_and_json() {
+        let mut module = auto_rod();
+        let v = module.setting_mut("HoldingItemsForIgnore").unwrap();
+        assert!(matches!(v.kind, ValueKind::Items(_)));
+        let items = v.kind.items().unwrap();
+        assert_eq!(items.len(), 5);
+        assert!(items.contains(&"minecraft:ender_pearl".to_string()));
+
+        v.set_from_json(&json_items(&["minecraft:bow", "minecraft:bow", "minecraft:trident"])).unwrap();
+        let items = v.kind.items().unwrap();
+        assert_eq!(items.len(), 2);
+        assert!(items.contains(&"minecraft:trident".to_string()));
+        assert!(v.set_from_json(&Json::Arr(vec![Json::Num(1.0), Json::Num(2.0)])).is_err());
+    }
+
+    // ----- AutoRod -----
+
+    struct ArMock {
+        targets: Vec<ArTarget>,
+        distances: Vec<f64>,
+        los: Vec<bool>,
+        bobber: Option<ArFishingBobber>,
+        rod_slot: Option<ArRodSlot>,
+        point: Option<Vec3>,
+        angle: Option<Rotation>,
+    }
+
+    impl ArWorld for ArMock {
+        fn targets(&mut self) -> Vec<ArTarget> {
+            self.targets.clone()
+        }
+        fn distance_to_sqr(&mut self, target: &ArTarget) -> f64 {
+            self.distances[self.targets.iter().position(|t| t == target).unwrap()]
+        }
+        fn find_own_bobber(&mut self) -> Option<ArFishingBobber> {
+            self.bobber
+        }
+        fn find_rod_slot(&mut self) -> Option<ArRodSlot> {
+            self.rod_slot
+        }
+        fn has_line_of_sight(&mut self, target: &ArTarget) -> bool {
+            self.los[self.targets.iter().position(|t| t == target).unwrap()]
+        }
+        fn find_point(&mut self, _eyes: Vec3, _target: &ArTarget) -> Option<Vec3> {
+            self.point
+        }
+        fn projectile_angle(&mut self, _target: &ArTarget) -> Option<Rotation> {
+            self.angle
+        }
+    }
+
+    #[derive(Default)]
+    struct ArHotbarMock {
+        use_calls: Vec<(i64, String)>,
+        releases: usize,
+        resets: usize,
+    }
+
+    impl ArHotbar for ArHotbarMock {
+        fn use_hotbar_slot_or_offhand(
+            &mut self,
+            _slot: &ArRodSlot,
+            ticks_until_reset: i64,
+            swing_mode: &str,
+        ) -> bool {
+            self.use_calls.push((ticks_until_reset, swing_mode.to_string()));
+            true
+        }
+        fn release_using_item_in_tick_loop(&mut self) {
+            self.releases += 1;
+        }
+        fn reset_slot(&mut self) {
+            self.resets += 1;
+        }
+    }
+
+    fn ar_setup() -> (ArMock, ArHotbarMock) {
+        (
+            ArMock {
+                targets: vec![ArTarget { health: 8.0 }],
+                distances: vec![16.0], // in 3.5..5 range? -> 4.0
+                los: vec![true],
+                bobber: None,
+                rod_slot: Some(ArRodSlot { is_selected: false, is_fishing_rod: true, inventory_slot: 3 }),
+                point: Some(Vec3 { x: 2.0, y: 0.0, z: 0.0 }),
+                angle: None,
+            },
+            ArHotbarMock::default(),
+        )
+    }
+
+    fn ar_player() -> ArPlayer {
+        ArPlayer {
+            eye_position: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            health: 20.0,
+            main_hand_item: "minecraft:sword".to_string(),
+            is_using_item: false,
+            main_hand_is_consumable: false,
+            offhand_is_consumable: false,
+        }
+    }
+
+    fn ar_hooks<'a>(
+        mock: &'a mut ArMock,
+        hotbar: &'a mut ArHotbarMock,
+        targets_out: &'a mut Vec<RotationTargetCall>,
+        debug: &'a mut Vec<String>,
+    ) -> ArHooks<'a> {
+        ArHooks {
+            world: mock,
+            hotbar,
+            server_rotation: Rotation { yaw: 0.0, pitch: 0.0 },
+            rotation_targets: targets_out,
+            blink_running: false,
+            scaffold_running: false,
+            freeze_running: false,
+            inventory_open: false,
+            container_screen_open: false,
+            debug,
+        }
+    }
+
+    #[test]
+    fn auto_rod_rotation_update_selects_first_in_range_target() {
+        let module = auto_rod();
+        let mut state = auto_rod_state(0.0);
+        let (mut mock, mut hotbar) = ar_setup();
+        let mut targets_out = Vec::new();
+        let mut debug = Vec::new();
+        {
+            let mut hooks = ar_hooks(&mut mock, &mut hotbar, &mut targets_out, &mut debug);
+            auto_rod_rotation_update(&module, &mut state, &ar_player(), &mut hooks, &all_req_inputs());
+        }
+        assert_eq!(state.target, Some(ArTarget { health: 8.0 }));
+        assert_eq!(targets_out.len(), 1);
+        assert!(!targets_out[0].consider_inventory);
+        // eyes at origin, point (2,0,0): yaw -90, pitch 0
+        assert_eq!(targets_out[0].rotation.yaw, -90.0);
+    }
+
+    #[test]
+    fn auto_rod_requirements_gate_blocks_the_tick() {
+        let module = auto_rod();
+        let mut state = auto_rod_state(0.0);
+        let (mut mock, mut hotbar) = ar_setup();
+        let mut targets_out = Vec::new();
+        let mut debug = Vec::new();
+        let inputs = all_req_inputs();
+        {
+            let mut hooks = ar_hooks(&mut mock, &mut hotbar, &mut targets_out, &mut debug);
+            hooks.blink_running = true; // requirementsMet requires !Blink.running
+            auto_rod_tick(&module, &mut state, &ar_player(), &mut hooks, &inputs, 4, 0, 0.0);
+        }
+        assert!(hotbar.use_calls.is_empty());
+        assert!(state.phase.is_none());
+    }
+
+    #[test]
+    fn auto_rod_tick_full_sequence_select_pull_cooldown() {
+        let module = auto_rod();
+        let mut state = auto_rod_state(0.0);
+        let (mut mock, mut hotbar) = ar_setup();
+        let mut targets_out = Vec::new();
+        let mut debug = Vec::new();
+
+        // Tick 1: select rod (bobber == null), open the pull sequence.
+        {
+            let mut hooks = ar_hooks(&mut mock, &mut hotbar, &mut targets_out, &mut debug);
+            // the player already looks at the target (yaw -90 from looking_at)
+            hooks.server_rotation = Rotation { yaw: -90.0, pitch: 0.0 };
+            auto_rod_tick(&module, &mut state, &ar_player(), &mut hooks, &all_req_inputs(), 4, 0, 0.5);
+        }
+        assert_eq!(hotbar.use_calls.len(), 1);
+        // ticksUntilReset = slotResetDelay.last + hitTimeout = 0 + 30
+        assert_eq!(hotbar.use_calls[0].0, 30);
+        assert_eq!(hotbar.use_calls[0].1, "DoNotHide");
+        let Some(ArPhase::WaitPull { timeout_left, .. }) = state.phase else {
+            panic!("expected WaitPull phase");
+        };
+        assert_eq!(timeout_left, 30);
+
+        // Tick 2..: hook the bobber → pull with slotResetDelay pick (0), then cooldown.
+        mock.bobber = Some(ArFishingBobber { hooked_in: true, known_movement: Vec3::ZERO });
+        {
+            let mut hooks = ar_hooks(&mut mock, &mut hotbar, &mut targets_out, &mut debug);
+            auto_rod_tick(&module, &mut state, &ar_player(), &mut hooks, &all_req_inputs(), 4, 0, 0.5);
+        }
+        // 4. pull; 5. reset slot with the random pick
+        assert_eq!(hotbar.use_calls.len(), 2);
+        assert_eq!(hotbar.use_calls[1].0, 0);
+        let Some(ArPhase::WaitCooldown { left }) = state.phase else {
+            panic!("expected WaitCooldown phase");
+        };
+        assert_eq!(left, 4);
+
+        // Two more ticks: cooldown counts down, nothing else fires.
+        for _ in 0..2 {
+            let mut hooks = ar_hooks(&mut mock, &mut hotbar, &mut targets_out, &mut debug);
+            auto_rod_tick(&module, &mut state, &ar_player(), &mut hooks, &all_req_inputs(), 4, 0, 0.5);
+        }
+        assert_eq!(hotbar.use_calls.len(), 2);
+        let Some(ArPhase::WaitCooldown { left }) = state.phase else {
+            panic!("cooldown should still be open");
+        };
+        assert_eq!(left, 2);
+
+        // Two more cooldown ticks close it (4→3→2 above, then 2→1, then closed).
+        for _ in 0..2 {
+            let mut hooks = ar_hooks(&mut mock, &mut hotbar, &mut targets_out, &mut debug);
+            auto_rod_tick(&module, &mut state, &ar_player(), &mut hooks, &all_req_inputs(), 4, 0, 0.5);
+        }
+        assert!(state.phase.is_none());
+        // Restarted the sequence: the bobber is hooked, so no second select.
+        assert_eq!(hotbar.use_calls.len(), 2);
+    }
+
+    #[test]
+    fn auto_rod_on_disabled_releases_the_bobber() {
+        let module = auto_rod();
+        let mut state = auto_rod_state(0.0);
+        let (mut mock, mut hotbar) = ar_setup();
+        let mut targets_out = Vec::new();
+        let mut debug = Vec::new();
+        mock.bobber = Some(ArFishingBobber { hooked_in: false, known_movement: Vec3::ZERO });
+        let mut hooks = ar_hooks(&mut mock, &mut hotbar, &mut targets_out, &mut debug);
+        auto_rod_on_disabled(&mut state, &mut hooks);
+        assert_eq!(hotbar.releases, 1);
+        assert_eq!(hotbar.resets, 1);
+        assert!(state.bobber.is_none());
+        assert!(state.available_rod_slot.is_none());
+        assert!(state.target.is_none());
+    }
+
+    // ----- AutoWeapon -----
+
+    fn aw_stack(id: u64, tags: &[&str], damage: f64, speed: f64, kb: i64) -> AwItemStack {
+        AwItemStack {
+            id,
+            is_empty: false,
+            weapon_tags: tags.iter().map(|t| t.to_string()).collect(),
+            attack_damage: damage,
+            attack_speed: speed,
+            knockback_level: kb,
+            is_axe: tags.contains(&"Axe"),
+            is_mace: tags.contains(&"Mace"),
+        }
+    }
+
+    #[derive(Default)]
+    struct AwInvMock {
+        slots: Vec<AwSlot>,
+    }
+
+    impl AwInventory for AwInvMock {
+        fn hotbar(&mut self) -> Vec<AwSlot> {
+            self.slots.clone()
+        }
+    }
+
+    fn aw_slots() -> Vec<AwSlot> {
+        vec![
+            AwSlot { inventory_slot: 0, stack: aw_stack(1, &["Sword"], 7.0, 1.6, 0), facet_rank: Some(10) },
+            AwSlot { inventory_slot: 1, stack: aw_stack(2, &["Sword"], 7.0, 1.6, 2), facet_rank: Some(8) },
+            AwSlot { inventory_slot: 2, stack: aw_stack(3, &["Axe"], 9.0, 1.0, 0), facet_rank: Some(20) },
+            AwSlot { inventory_slot: 3, stack: aw_stack(4, &["Pickaxe"], 5.0, 1.2, 0), facet_rank: None },
+        ]
+    }
+
+    fn aw_player(main_hand: AwItemStack) -> AwPlayer {
+        AwPlayer {
+            main_hand,
+            can_smash_attack: false,
+            has_cooldown: true,
+            using_consumable_main_hand: false,
+            slot_modified_by_auto_buff: false,
+        }
+    }
+
+    fn aw_hooks<'a>(inv: &'a mut AwInvMock, selections: &'a mut Vec<(i64, i64)>) -> AwHooks<'a> {
+        AwHooks {
+            inventory: inv,
+            mace_kill_enabled: false,
+            is_older_or_equal_1_8: false,
+            selections,
+            ensure_sent_carried_item_calls: Box::leak(Box::new(0usize)),
+            reset_slot_calls: Box::leak(Box::new(0usize)),
+        }
+    }
+
+    #[test]
+    fn auto_weapon_default_prefers_the_preferred_weapon() {
+        let module = auto_weapon();
+        let mut slots = aw_slots();
+        slots[0].facet_rank = Some(5); // the best rank among swords
+        let mut inv = AwInvMock { slots };
+        let mut selections = Vec::new();
+        let mut hooks = aw_hooks(&mut inv, &mut selections);
+        let player = aw_player(aw_stack(99, &[], 1.0, 1.0, 0));
+        let slot = aw_determine_weapon_slot(&module, &player, &mut hooks, None, false);
+        assert_eq!(slot, Some(0));
+    }
+
+    #[test]
+    fn auto_weapon_knockback_priority_picks_the_best_knockback_stack() {
+        let mut module = auto_weapon();
+        // Priority = Knockback
+        let value = module.setting_mut("Priority").unwrap();
+        value.set_from_json(&json_str("Knockback")).unwrap();
+
+        let mut inv = AwInvMock { slots: aw_slots() };
+        let mut selections = Vec::new();
+        let mut hooks = aw_hooks(&mut inv, &mut selections);
+        let player = aw_player(aw_stack(99, &[], 1.0, 1.0, 0));
+        // Knockback 2 lives on stack id 2 (slot 1); the priority filter ignores ranks
+        assert_eq!(aw_determine_weapon_slot(&module, &player, &mut hooks, None, false), Some(1));
+    }
+
+    #[test]
+    fn auto_weapon_attack_handler_selects_when_on_attack() {
+        let module = auto_weapon();
+        let mut inv = AwInvMock { slots: aw_slots() };
+        let mut selections = Vec::new();
+        let mut hooks = aw_hooks(&mut inv, &mut selections);
+        let player = aw_player(aw_stack(99, &[], 1.0, 1.0, 0));
+        let target = AwAttackTarget { is_living_entity: true, would_block_hit: false };
+        auto_weapon_attack_handler(&module, &player, &mut hooks, &target);
+        // slot 1 holds the better WeaponItemFacet rank (8 < 10)
+        assert_eq!(*hooks.selections, vec![(1i64, 20i64)]);
+        assert_eq!(*hooks.ensure_sent_carried_item_calls, 1);
+
+        // Busy: Auto Buff holds the slot → no new selection.
+        let player = AwPlayer { slot_modified_by_auto_buff: true, ..aw_player(aw_stack(99, &[], 1.0, 1.0, 0)) };
+        auto_weapon_attack_handler(&module, &player, &mut hooks, &target);
+        assert_eq!(*hooks.selections, vec![(1i64, 20i64)]);
+    }
+
+    #[test]
+    fn auto_weapon_shield_break_wants_an_axe() {
+        let module = auto_weapon();
+        let mut inv = AwInvMock { slots: aw_slots() };
+        let mut selections = Vec::new();
+        let mut hooks = aw_hooks(&mut inv, &mut selections);
+
+        // On 1.8 there is no shield.
+        hooks.is_older_or_equal_1_8 = true;
+        let player = aw_player(aw_stack(99, &[], 1.0, 1.0, 0));
+        assert!(!auto_weapon_will_shield_break(&module, &player, &mut hooks));
+        hooks.is_older_or_equal_1_8 = false;
+
+        // An axe in the main hand already breaks it.
+        let player = aw_player(aw_stack(99, &["Axe"], 9.0, 1.0, 0));
+        assert!(auto_weapon_will_shield_break(&module, &player, &mut hooks));
+
+        // Otherwise the determined slot decides (AutoShieldBreak → AXE filter).
+        let player = aw_player(aw_stack(99, &[], 1.0, 1.0, 0));
+        assert!(auto_weapon_will_shield_break(&module, &player, &mut hooks));
+    }
+
+    #[test]
+    fn auto_weapon_get_attack_speed_uses_the_determined_weapon() {
+        let mut module = auto_weapon();
+        module.running = true;
+        let mut inv = AwInvMock { slots: aw_slots() };
+        let mut selections = Vec::new();
+        let mut hooks = aw_hooks(&mut inv, &mut selections);
+        let player = aw_player(aw_stack(99, &[], 1.0, 1.0, 0));
+        assert_eq!(auto_weapon_get_attack_speed(&module, &player, &mut hooks, 4.0), 1.6);
+
+        // No cooldown → original.
+        let player = AwPlayer { has_cooldown: false, ..aw_player(aw_stack(99, &[], 1.0, 1.0, 0)) };
+        assert_eq!(auto_weapon_get_attack_speed(&module, &player, &mut hooks, 4.0), 4.0);
+    }
+
+    // ----- Aimbot -----
+
+    #[derive(Default)]
+    struct AbMock {
+        targets: Vec<AbEntity>,
+        crystals: Vec<AbEntity>,
+        lazy_hit: Option<Vec3>,
+        point: Option<AbPoint>,
+        ray: Option<AbRotationWithVector>,
+    }
+
+    impl AbWorld for AbMock {
+        fn targets(&mut self) -> Vec<AbEntity> {
+            self.targets.clone()
+        }
+        fn crystals_in_range(&mut self, _eyes: Vec3, _max_range: f64) -> Vec<AbEntity> {
+            self.crystals.clone()
+        }
+        fn look_at_hit(&mut self, _e: &AbEntity, _r: Rotation, _range: f64, _walls: f64) -> Option<Vec3> {
+            self.lazy_hit
+        }
+        fn find_point(&mut self, _eyes: Vec3, _e: &AbEntity) -> Option<AbPoint> {
+            self.point
+        }
+        fn raytrace_box(&mut self, _eyes: Vec3, _p: &AbPoint, _range: f64, _walls: f64) -> Option<AbRotationWithVector> {
+            self.ray
+        }
+    }
+
+    #[derive(Default)]
+    struct AbAngleSmoothMock;
+    impl AbAngleSmooth for AbAngleSmoothMock {
+        fn process(&mut self, mode: &str, _player: Rotation, target: Rotation) -> Option<Rotation> {
+            Some(Rotation { yaw: target.yaw, pitch: target.pitch * (if mode == "Linear" { 2.0 } else { 1.0 }) })
+        }
+    }
+
+    #[derive(Default)]
+    struct AbMouseMock {
+        applied: usize,
+    }
+    impl AbMouseDelta for AbMouseMock {
+        fn apply(&mut self, mut r: Rotation, _dx: f64, _dy: f64) -> Rotation {
+            self.applied += 1;
+            r.yaw += 10.0;
+            r
+        }
+    }
+
+    fn ab_entity(id: usize, cos: f64) -> AbEntity {
+        AbEntity { is_end_crystal: false, is_living_entity: true, crosshair_cos: cos, ..AbEntity { is_end_crystal: false, is_living_entity: true, crosshair_cos: cos } }
+    }
+
+    #[test]
+    fn aimbot_crystals_only_returns_crystal_targets() {
+        let mut module = aimbot();
+        module.setting_mut("Crystals").unwrap().set_from_json(&Json::Bool(true)).unwrap();
+        module.setting_mut("CrystalsOnly").unwrap().set_from_json(&Json::Bool(true)).unwrap();
+
+        let mut mock = AbMock {
+            crystals: vec![ab_entity(1, 0.9), ab_entity(2, 0.5)],
+            ..Default::default()
+        };
+        let mut smooth = AbAngleSmoothMock;
+        let mut mouse = AbMouseMock::default();
+        let mut set_rotations = Vec::new();
+        let mut on_target = 0usize;
+        let mut hooks = AbHooks {
+            world: &mut mock,
+            angle_smooth: &mut smooth,
+            mouse_delta: &mut mouse,
+            screen_open: false,
+            inventory_open: false,
+            container_screen_open: false,
+            use_key_pressed: true,
+            timer_speed: 1.0,
+            player_rotation_raw: Rotation { yaw: 0.0, pitch: 0.0 },
+            eye_position: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            on_target_calls: &mut on_target,
+            set_rotations: &mut set_rotations,
+        };
+        let targets = ab_targets(&module, &mut hooks);
+        assert_eq!(targets.len(), 2);
+        // sorted by descending crosshair cos
+        assert!(targets[0].crosshair_cos > targets[1].crosshair_cos);
+    }
+
+    #[test]
+    fn aimbot_rotation_update_requires_no_screen() {
+        let module = aimbot();
+        let mut state = aimbot_state();
+        let mut mock = AbMock { targets: vec![ab_entity(1, 0.9)], point: Some(AbPoint { pos: Vec3 { x: 1.0, y: 0.0, z: 0.0 }, box_min: Vec3::ZERO, box_max: Vec3::ZERO }), ray: Some(AbRotationWithVector { rotation: Rotation { yaw: -90.0, pitch: 0.0 }, location: Vec3::ZERO }), ..Default::default() };
+        let mut smooth = AbAngleSmoothMock;
+        let mut mouse = AbMouseMock::default();
+        let mut set_rotations = Vec::new();
+        let mut on_target = 0usize;
+        let mut hooks = AbHooks {
+            world: &mut mock,
+            angle_smooth: &mut smooth,
+            mouse_delta: &mut mouse,
+            screen_open: true,
+            inventory_open: false,
+            container_screen_open: false,
+            use_key_pressed: true,
+            timer_speed: 1.0,
+            player_rotation_raw: Rotation { yaw: 0.0, pitch: 0.0 },
+            eye_position: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            on_target_calls: &mut on_target,
+            set_rotations: &mut set_rotations,
+        };
+        let inputs = all_req_inputs();
+        {
+            aimbot_rotation_update(&module, &mut state, &mut hooks, &inputs);
+            assert!(state.target_rotation.is_none());
+            assert!(!state.target_set);
+            assert_eq!(*hooks.on_target_calls, 0);
+
+            hooks.screen_open = false;
+            aimbot_rotation_update(&module, &mut state, &mut hooks, &inputs);
+            assert_eq!(state.target_rotation, Some(Rotation { yaw: -90.0, pitch: 0.0 }));
+            assert!(state.target_set);
+            assert_eq!(*hooks.on_target_calls, 1);
+        }
+    }
+
+    #[test]
+    fn aimbot_look_at_interpolates_with_axis_gates() {
+        let module = aimbot();
+        let mut state = aimbot_state();
+        state.player_rotation = Some(Rotation { yaw: 0.0, pitch: 0.0 });
+        state.target_rotation = Some(Rotation { yaw: 10.0, pitch: 10.0 });
+        let mut mock = AbMock::default();
+        let mut smooth = AbAngleSmoothMock;
+        let mut mouse = AbMouseMock::default();
+        let mut set_rotations = Vec::new();
+        let mut on_target = 0usize;
+        let mut hooks = AbHooks {
+            world: &mut mock,
+            angle_smooth: &mut smooth,
+            mouse_delta: &mut mouse,
+            screen_open: false,
+            inventory_open: false,
+            container_screen_open: false,
+            use_key_pressed: true,
+            timer_speed: 1.0,
+            player_rotation_raw: Rotation { yaw: 0.0, pitch: 0.0 },
+            eye_position: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            on_target_calls: &mut on_target,
+            set_rotations: &mut set_rotations,
+        };
+        aimbot_look_at(&module, &state, 0.5, &mut hooks);
+        // Axis defaults to Horizontal+Vertical → both interpolated at factor 0.5
+        assert_eq!(*hooks.set_rotations, vec![Rotation { yaw: 5.0, pitch: 5.0 }]);
+    }
+
+    // ----- AutoShoot -----
+
+    #[derive(Default)]
+    struct AsMock {
+        los_target: Option<AsTarget>,
+        point: Option<Vec3>,
+        angle: Option<Rotation>,
+        eye: Vec3,
+    }
+
+    impl AsWorld for AsMock {
+        fn select_first_with_los(&mut self) -> Option<AsTarget> {
+            self.los_target
+        }
+        fn eye_position(&mut self) -> Vec3 {
+            self.eye
+        }
+        fn find_point(&mut self, _eyes: Vec3, _t: &AsTarget) -> Option<Vec3> {
+            self.point
+        }
+        fn projectile_angle(&mut self, _t: &AsTarget) -> Option<Rotation> {
+            self.angle
+        }
+    }
+
+    #[derive(Default)]
+    struct AsInvMock {
+        slot: Option<AsSlot>,
+    }
+
+    impl AsInventory for AsInvMock {
+        fn find_closest_slot(&mut self, mode: &AsThrowableMode) -> Option<AsSlot> {
+            let slot = self.slot.clone()?;
+            mode.matches(&slot).then_some(slot)
+        }
+    }
+
+    #[derive(Default)]
+    struct AsHotbarMock {
+        select_calls: Vec<i64>,
+        still_needed: bool,
+        use_calls: usize,
+        click_allowed: bool,
+    }
+
+    impl AsHotbar for AsHotbarMock {
+        fn select_slot_silently(&mut self, _slot: &AsSlot, ticks: i64) -> bool {
+            self.select_calls.push(ticks);
+            self.still_needed
+        }
+        fn reset_slot(&mut self) {}
+        fn use_item(&mut self, _slot: &AsSlot, _swing: &str) -> bool {
+            self.use_calls += 1;
+            true
+        }
+        fn click_allowed(&mut self) -> bool {
+            self.click_allowed
+        }
+    }
+
+    fn as_slot(item: &str) -> AsSlot {
+        AsSlot {
+            hotbar_index: Some(2),
+            serverside_slot: 0,
+            item: item.to_string(),
+            is_empty: false,
+            use_hand: "Main".to_string(),
+        }
+    }
+
+    #[test]
+    fn auto_shoot_try_select_selects_the_slot() {
+        let module = auto_shoot();
+        let mut mock = AsMock::default();
+        let mut inv = AsInvMock { slot: Some(as_slot("minecraft:egg")) };
+        let mut hotbar = AsHotbarMock { click_allowed: true, ..Default::default() };
+        let mut targets_out = Vec::new();
+        let mut hooks = AsHooks {
+            world: &mut mock,
+            hotbar: &mut hotbar,
+            inventory: &mut inv,
+            server_rotation: Rotation { yaw: 0.0, pitch: 0.0 },
+            rotation_targets: &mut targets_out,
+            in_combat: false,
+            player_is_using_item: false,
+            inventory_open: false,
+            kill_aura_running: false,
+        };
+        let slot = as_throwable_slot(&module, &mut hooks).unwrap();
+        assert_eq!(slot.item, "minecraft:egg");
+        assert_eq!(hotbar.select_calls, vec![1i64]); // TicksUntilSlotReset default
+    }
+
+    #[test]
+    fn auto_shoot_rotation_update_requires_line_of_sight() {
+        let module = auto_shoot();
+        let mut state = auto_shoot_state();
+        let mut mock = AsMock { angle: Some(Rotation { yaw: 5.0, pitch: 0.0 }), ..Default::default() };
+        let mut inv = AsInvMock { slot: Some(as_slot("minecraft:egg")) };
+        let mut hotbar = AsHotbarMock { click_allowed: true, ..Default::default() };
+        let mut targets_out = Vec::new();
+        let mut hooks = AsHooks {
+            world: &mut mock,
+            hotbar: &mut hotbar,
+            inventory: &mut inv,
+            server_rotation: Rotation { yaw: 0.0, pitch: 0.0 },
+            rotation_targets: &mut targets_out,
+            in_combat: false,
+            player_is_using_item: false,
+            inventory_open: false,
+            kill_aura_running: false,
+        };
+        {
+            auto_shoot_rotation_update(&module, &mut state, &mut hooks);
+            assert!(state.target.is_none()); // no LOS
+        }
+        mock.los_target = Some(AsTarget);
+        {
+            let mut hooks = AsHooks {
+                world: &mut mock,
+                hotbar: &mut hotbar,
+                inventory: &mut inv,
+                server_rotation: Rotation { yaw: 0.0, pitch: 0.0 },
+                rotation_targets: &mut targets_out,
+                in_combat: false,
+                player_is_using_item: false,
+                inventory_open: false,
+                kill_aura_running: false,
+            };
+            auto_shoot_rotation_update(&module, &mut state, &mut hooks);
+        }
+        assert!(state.target.is_some());
+        // GravityType Auto + egg → Projectile; angle seam answered
+        assert_eq!(targets_out.len(), 1);
+        assert!(targets_out[0].consider_inventory);
+    }
+
+    #[test]
+    fn auto_shoot_tick_clicks_when_aimed() {
+        let module = auto_shoot();
+        let mut state = auto_shoot_state();
+        state.target = Some(AsTarget);
+        let mut mock = AsMock { angle: Some(Rotation { yaw: 1.0, pitch: 0.0 }), ..Default::default() };
+        let mut inv = AsInvMock { slot: Some(as_slot("minecraft:egg")) };
+        let mut hotbar = AsHotbarMock { click_allowed: true, ..Default::default() };
+        let mut targets_out = Vec::new();
+        let mut hooks = AsHooks {
+            world: &mut mock,
+            hotbar: &mut hotbar,
+            inventory: &mut inv,
+            server_rotation: Rotation { yaw: 0.0, pitch: 0.0 },
+            rotation_targets: &mut targets_out,
+            in_combat: false,
+            player_is_using_item: false,
+            inventory_open: false,
+            kill_aura_running: false,
+        };
+        {
+            auto_shoot_tick(&module, &mut state, &mut hooks);
+        }
+        assert_eq!(hotbar.use_calls, 1);
+
+        // Aim off → no click.
+        hotbar.use_calls = 0;
+        mock.angle = Some(Rotation { yaw: 45.0, pitch: 0.0 });
+        {
+            let mut hooks = AsHooks {
+                world: &mut mock,
+                hotbar: &mut hotbar,
+                inventory: &mut inv,
+                server_rotation: Rotation { yaw: 0.0, pitch: 0.0 },
+                rotation_targets: &mut targets_out,
+                in_combat: false,
+                player_is_using_item: false,
+                inventory_open: false,
+                kill_aura_running: false,
+            };
+            auto_shoot_tick(&module, &mut state, &mut hooks);
+        }
+        assert_eq!(hotbar.use_calls, 0);
+    }
+
+    #[test]
+    fn auto_shoot_requires_kill_aura_resets_the_target() {
+        let mut module = auto_shoot();
+        module.setting_mut("RequiresKillAura").unwrap().set_from_json(&Json::Bool(true)).unwrap();
+        let mut state = auto_shoot_state();
+        state.target = Some(AsTarget);
+        let mut mock = AsMock::default();
+        let mut inv = AsInvMock::default();
+        let mut hotbar = AsHotbarMock::default();
+        let mut targets_out = Vec::new();
+        let mut hooks = AsHooks {
+            world: &mut mock,
+            hotbar: &mut hotbar,
+            inventory: &mut inv,
+            server_rotation: Rotation { yaw: 0.0, pitch: 0.0 },
+            rotation_targets: &mut targets_out,
+            in_combat: false,
+            player_is_using_item: false,
+            inventory_open: false,
+            kill_aura_running: false,
+        };
+        assert!(as_should_pause_for_kill_aura(&module, &mut state, &hooks));
+        assert!(state.target.is_none());
     }
 }

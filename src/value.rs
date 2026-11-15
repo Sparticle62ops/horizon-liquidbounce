@@ -38,6 +38,7 @@ pub enum ValueKind {
     FloatRange(f64, f64, f64, f64), // from..to within min..max
     IntRange(i64, i64, i64, i64),   // from..to within min..max
     MultiChoice(Vec<String>, Vec<String>), // selected tags, all options
+    Items(Vec<String>),          // upstream `items(...)`: item id list
 }
 
 #[derive(Clone)]
@@ -62,6 +63,7 @@ impl Value {
             ValueKind::MultiChoice(sel, _) => {
                 Json::Arr(sel.iter().map(|t| Json::Str(t.clone())).collect())
             }
+            ValueKind::Items(list) => Json::Arr(list.iter().map(|t| Json::Str(t.clone())).collect()),
         }
     }
 
@@ -105,6 +107,16 @@ impl Value {
                     }
                 }
                 *sel = next;
+            }
+            (ValueKind::Items(list), Json::Arr(entries)) => {
+                let mut next: Vec<String> = Vec::with_capacity(entries.len());
+                for it in entries {
+                    let item = it.as_str().ok_or("items needs string entries")?;
+                    if !next.iter().any(|x| x == item) {
+                        next.push(item.to_string());
+                    }
+                }
+                *list = next;
             }
             _ => return Err("wrong type for setting"),
         }
@@ -211,6 +223,20 @@ mod tests {
 // and deserialize clamped into the declared outer range.
 
 impl ValueKind {
+    pub fn choice(&self) -> Option<&str> {
+        match self {
+            ValueKind::Choice(sel, _) => Some(sel.as_str()),
+            _ => None,
+        }
+    }
+
+    pub fn items(&self) -> Option<&Vec<String>> {
+        match self {
+            ValueKind::Items(list) => Some(list),
+            _ => None,
+        }
+    }
+
     pub fn float_range(&self) -> Option<(f64, f64)> {
         match self { ValueKind::FloatRange(a, b, _, _) => Some((*a, *b)), _ => None }
     }
@@ -224,4 +250,9 @@ pub fn float_range(name: &str, from: f64, to: f64, lo: f64, hi: f64) -> Value {
 }
 pub fn int_range(name: &str, from: i64, to: i64, lo: i64, hi: i64) -> Value {
     Value { name: name.into(), kind: ValueKind::IntRange(from, to, lo, hi), visible: |_| true, is_enabled_toggle: false }
+}
+
+/// Upstream `items("Name", itemSortedSetOf(...))`: a list of item ids.
+pub fn items(name: &str, defaults: &[&str]) -> Value {
+    Value { name: name.into(), kind: ValueKind::Items(defaults.iter().map(|s| s.to_string()).collect()), visible: |_| true, is_enabled_toggle: false }
 }

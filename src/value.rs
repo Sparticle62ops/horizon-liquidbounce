@@ -34,6 +34,8 @@ pub enum ValueKind {
     Float(f64, f64, f64),     // value, min, max
     Choice(String, Vec<String>), // selected, all options
     Bind(String),             // serialized input bind ("keyboard:key.code:action")
+    FloatRange(f64, f64, f64, f64), // from..to within min..max
+    IntRange(i64, i64, i64, i64),   // from..to within min..max
 }
 
 #[derive(Clone)]
@@ -53,6 +55,8 @@ impl Value {
             ValueKind::Float(v, _, _) => Json::Num(*v),
             ValueKind::Choice(s, _) => Json::Str(s.clone()),
             ValueKind::Bind(b) => Json::Str(b.clone()),
+            ValueKind::FloatRange(a, b, _, _) => range_json(*a, *b),
+            ValueKind::IntRange(a, b, _, _) => range_json(*a as f64, *b as f64),
         }
     }
 
@@ -72,10 +76,36 @@ impl Value {
                 *sel = s.clone();
             }
             (ValueKind::Bind(_), Json::Str(s)) => self.kind = ValueKind::Bind(s.clone()),
+            (ValueKind::FloatRange(a, b, lo, hi), Json::Obj(m)) => {
+                let (f, t2) = range_parts(m)?;
+                *a = clamp(f, *lo, *hi);
+                *b = clamp(t2, *lo, *hi);
+                if *b < *a { std::mem::swap(a, b); }
+            }
+            (ValueKind::IntRange(a, b, lo, hi), Json::Obj(m)) => {
+                let (f, t2) = range_parts(m)?;
+                *a = clamp(f, *lo as f64, *hi as f64) as i64;
+                *b = clamp(t2, *lo as f64, *hi as f64) as i64;
+                if *b < *a { std::mem::swap(a, b); }
+            }
             _ => return Err("wrong type for setting"),
         }
         Ok(())
     }
+}
+
+/// RangeAdapter.serialize: {"from": start, "to": endInclusive}.
+pub fn range_json(a: f64, b: f64) -> Json {
+    let mut m = BTreeMap::new();
+    m.insert("from".into(), Json::Num(a));
+    m.insert("to".into(), Json::Num(b));
+    Json::Obj(m)
+}
+
+fn range_parts(m: &BTreeMap<String, Json>) -> Result<(f64, f64), &'static str> {
+    let f = m.get("from").and_then(Json::as_f64).ok_or("range needs a number 'from'")?;
+    let t2 = m.get("to").and_then(Json::as_f64).ok_or("range needs a number 'to'")?;
+    Ok((f, t2))
 }
 
 fn clamp(n: f64, lo: f64, hi: f64) -> f64 {
@@ -144,4 +174,24 @@ mod tests {
         let mut v = float("Speed", 1.0, 0.0, 5.0);
         assert!(v.set_from_json(&Json::Str("fast".into())).is_err());
     }
+}
+
+// ----- RangedValue: upstream `config/types/RangedValue.kt` + RangeAdapter -----
+// Ranges serialize as {"from": x, "to": y} (config/gson/adapter/RangeAdapter.kt)
+// and deserialize clamped into the declared outer range.
+
+impl ValueKind {
+    pub fn float_range(&self) -> Option<(f64, f64)> {
+        match self { ValueKind::FloatRange(a, b, _, _) => Some((*a, *b)), _ => None }
+    }
+    pub fn int_range(&self) -> Option<(i64, i64)> {
+        match self { ValueKind::IntRange(a, b, _, _) => Some((*a, *b)), _ => None }
+    }
+}
+
+pub fn float_range(name: &str, from: f64, to: f64, lo: f64, hi: f64) -> Value {
+    Value { name: name.into(), kind: ValueKind::FloatRange(from, to, lo, hi), visible: |_| true, is_enabled_toggle: false }
+}
+pub fn int_range(name: &str, from: i64, to: i64, lo: i64, hi: i64) -> Value {
+    Value { name: name.into(), kind: ValueKind::IntRange(from, to, lo, hi), visible: |_| true, is_enabled_toggle: false }
 }

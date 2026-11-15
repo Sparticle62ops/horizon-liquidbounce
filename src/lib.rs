@@ -8,3 +8,4 @@ pub mod category;
 pub mod module;
 pub mod module_manager;
 pub mod value;
+pub mod combat;

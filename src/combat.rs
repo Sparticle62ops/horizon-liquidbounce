@@ -5267,3 +5267,652 @@ mod tests6 {
         assert!(state.target.is_none());
     }
 }
+
+// ----- ModuleTickBase.kt -----
+
+/// Upstream `ModuleTickBase` ("TickBase", aliases "TimerRange"): saves up timer
+/// balance near an enemy and spends it to reach the enemy earlier, by speeding
+/// up the timer or by bursting ticks. Part 1 this slice: the settings, the
+/// `Requirement` gates, `chargingSpeed`, the `GameTickEvent` speed handler and
+/// the `TimerBoost` mode. `Advantage.paysOff` and the `BurstMode` tick machine
+/// are carried as seams until their part lands.
+///
+/// Upstream `Requirement` tags.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TbRequirement {
+    KillAura,
+    LookingAt,
+    Click,
+    OnGround,
+}
+
+impl TbRequirement {
+    fn from_tag(tag: &str) -> Option<Self> {
+        match tag {
+            "KillAura" => Some(Self::KillAura),
+            "LookingAt" => Some(Self::LookingAt),
+            "Click" => Some(Self::Click),
+            "OnGround" => Some(Self::OnGround),
+            _ => None,
+        }
+    }
+}
+
+/// Upstream `SimulatedPlayerSnapshot` fields TickBase reads, from the
+/// simulation seam.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TbSnapshot {
+    pub pos: [f64; 3],
+    pub on_ground: bool,
+    pub fall_distance: f64,
+}
+
+impl TbSnapshot {
+    /// Upstream `SimulatedPlayerSnapshot.eyes()`.
+    pub fn eyes(&self, eye_height: f64) -> [f64; 3] {
+        [self.pos[0], self.pos[1] + eye_height, self.pos[2]]
+    }
+
+    /// Upstream `SimulatedPlayerSnapshot.falling`.
+    pub fn falling(&self) -> bool {
+        !self.on_ground && self.fall_distance > 0.0
+    }
+}
+
+/// Upstream `Hit`: a hit on `entity`, landing on `point`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TbHit {
+    pub entity: u64,
+    pub point: [f64; 3],
+}
+
+/// The seams TickBase reads each tick, documented against the upstream names
+/// they carry.
+pub struct TbHooks<'a> {
+    /// Upstream `Timer.requestTimerSpeed(speed)`: called with this tick's
+    /// speed, only when a mode or charging produces one.
+    pub request_timer_speed: Box<dyn FnMut(f64) + 'a>,
+    /// Upstream `Timer.balance`.
+    pub timer_balance: f64,
+    /// Upstream `Timer.spendableTicks(0..maxBalance)`: takes `MaxBalance`.
+    pub timer_spendable_ticks: Box<dyn Fn(i64) -> f64 + 'a>,
+    /// Upstream `snapshotsFromNow()`: the coming ticks, starting with now.
+    pub snapshots_from_now: Box<dyn Fn() -> Vec<TbSnapshot> + 'a>,
+    /// Upstream `hitPointFrom()` bound: where a hit from the given eyes lands,
+    /// `None` when it misses. Uses where the server has the enemies.
+    pub hit_at: Box<dyn Fn([f64; 3]) -> Option<TbHit> + 'a>,
+    /// Upstream `world.findEnemy(0f, ChargeRange) != null`.
+    pub enemy_in_charge_range: Box<dyn Fn() -> bool + 'a>,
+    /// Upstream `enemyUnderCrosshair(eyes, direction, range)`.
+    pub enemy_under_crosshair: Box<dyn Fn([f64; 3], [f64; 3], f64) -> Option<TbHit> + 'a>,
+    /// Upstream `ModuleKillAura.running && ModuleKillAura.targetTracker.target != null`.
+    pub killaura_engaged: bool,
+    /// Upstream `ModuleKillAura.clicker.itemCooldown?.nextCooldown`, already
+    /// carrying the `takeIf { KillAura.running && target != null }`.
+    pub killaura_next_cooldown: Option<f64>,
+    /// Upstream `CombatManager.attackCooldownProgress(landingDelay)`.
+    pub attack_cooldown_progress: Box<dyn Fn(i64) -> f64 + 'a>,
+    /// Upstream `player.hasCooldown` (the server has an attack cooldown).
+    pub has_cooldown: bool,
+    /// Upstream `player.isUsingItem`.
+    pub using_item: bool,
+    /// Upstream `player.onGround()`.
+    pub on_ground: bool,
+    /// Upstream `player.vehicle != null` (TickBase stays off while driving).
+    pub in_vehicle: bool,
+    /// Upstream `ModuleBlink.running`.
+    pub blink_running: bool,
+    /// Upstream `player.eyePosition`.
+    pub eye_position: [f64; 3],
+    /// Upstream `player.eyeHeight`.
+    pub eye_height: f64,
+    /// Upstream `player.lookAngle`.
+    pub look_angle: [f64; 3],
+    /// Upstream `mc.options.keyAttack.isPressedOnAny`.
+    pub attack_pressed: bool,
+    /// Upstream `mc.options.keyAttack.wasPressedRecently(250)`.
+    pub attack_recently_pressed: bool,
+    /// Upstream `Advantage.paysOff(hit, path, landing, landingDelay)`, ported
+    /// with the Advantage group in the next part.
+    pub advantage_pays_off: Box<dyn Fn(&TbHit, &[TbSnapshot], usize, i64) -> bool + 'a>,
+    /// Upstream `TickBaseVisuals.show(path, ticks, point)`.
+    pub visuals_show: Box<dyn FnMut(&[[f64; 3]], Option<usize>, Option<[f64; 3]>) + 'a>,
+    /// Upstream `TickBaseVisuals.clear()`.
+    pub visuals_clear: Box<dyn FnMut() + 'a>,
+}
+
+fn tb_setting_f64(module: &Module, name: &str, default: f64) -> f64 {
+    match module.setting(name).map(|v| &v.kind) {
+        Some(ValueKind::Float(f, _, _)) => *f,
+        _ => default,
+    }
+}
+
+fn tb_setting_i64(module: &Module, name: &str, default: i64) -> i64 {
+    match module.setting(name).map(|v| &v.kind) {
+        Some(ValueKind::Int(i, _, _)) => *i,
+        _ => default,
+    }
+}
+
+fn tb_setting_bool(module: &Module, name: &str, default: bool) -> bool {
+    match module.setting(name).map(|v| &v.kind) {
+        Some(ValueKind::Bool(b)) => *b,
+        _ => default,
+    }
+}
+
+fn tb_mode(module: &Module) -> &str {
+    match module.setting("Mode").map(|v| &v.kind) {
+        Some(kind) => kind.choice().unwrap_or("Timer"),
+        None => "Timer",
+    }
+}
+
+fn tb_requires(module: &Module) -> Vec<TbRequirement> {
+    match module.setting("Requires").map(|v| &v.kind) {
+        Some(ValueKind::MultiChoice(sel, _)) => sel
+            .iter()
+            .filter_map(|t| TbRequirement::from_tag(t))
+            .collect(),
+        _ => vec![TbRequirement::KillAura],
+    }
+}
+
+/// Upstream `cooldown.random()`: a uniform int of the `Cooldown` range, from a
+/// roll in [0, 1).
+fn tb_cooldown_random(module: &Module, roll: f64) -> i64 {
+    let (from, to) = match module.setting("Cooldown").map(|v| &v.kind) {
+        Some(kind) => kind.int_range().unwrap_or((0, 0)),
+        None => (0, 0),
+    };
+    from + (roll * ((to - from + 1) as f64)).floor() as i64
+}
+
+/// Upstream `Requirement.meets(hit)`.
+fn tb_requirement_meets(req: TbRequirement, hooks: &TbHooks, hit: [f64; 3]) -> bool {
+    match req {
+        TbRequirement::KillAura => hooks.killaura_engaged,
+        TbRequirement::LookingAt => {
+            // Past the hit, as it lands on the surface of the hitbox
+            let eyes = hooks.eye_position;
+            let dist = ((eyes[0] - hit[0]).powi(2)
+                + (eyes[1] - hit[1]).powi(2)
+                + (eyes[2] - hit[2]).powi(2))
+            .sqrt();
+            (hooks.enemy_under_crosshair)(eyes, hooks.look_angle, dist + 1.0).is_some()
+        }
+        TbRequirement::Click => hooks.attack_pressed || hooks.attack_recently_pressed,
+        TbRequirement::OnGround => hooks.on_ground,
+    }
+}
+
+/// Upstream `requirementsMet(hit)`: every selected `Requirement` met.
+fn tb_requirements_met(module: &Module, hooks: &TbHooks, hit: [f64; 3]) -> bool {
+    tb_requires(module)
+        .iter()
+        .all(|req| tb_requirement_meets(*req, hooks, hit))
+}
+
+/// Upstream `percentageChance("Chance").asBoolean`, shared with SuperKnockback.
+fn tb_chance_as_boolean(module: &Module, roll: f64) -> bool {
+    sk_chance_as_boolean(module, roll)
+}
+
+/// Upstream `rollChance()`: the chance is rolled once until the chance is gone.
+fn tb_roll_chance(module: &Module, rolled: &mut Option<bool>, roll: f64) -> bool {
+    if let Some(v) = *rolled {
+        return v;
+    }
+    let v = tb_chance_as_boolean(module, roll);
+    *rolled = Some(v);
+    v
+}
+
+/// Upstream `chargingSpeed()`: charges while an enemy is near but out of
+/// reach. Plain `Timer.requestTimerSpeed`, since clamping the balance would
+/// drop what BurstFirst still has to pay back.
+fn tick_base_charging_speed(module: &Module, hooks: &TbHooks) -> Option<f64> {
+    let charge_speed = tb_setting_f64(module, "ChargeSpeed", 0.9);
+    if charge_speed < 1.0
+        && hooks.timer_balance < tb_setting_i64(module, "MaxBalance", 3) as f64
+        && (tb_setting_bool(module, "ChargeWhileUsingItem", false) || !hooks.using_item)
+        && (hooks.enemy_in_charge_range)()
+        && (hooks.hit_at)(hooks.eye_position).is_none()
+    {
+        Some(charge_speed)
+    } else {
+        None
+    }
+}
+
+/// Upstream `BoostMode.cooldownReady(landingDelay)`: whether the server has the
+/// attack cooldown full enough for a hit landing `landingDelay` ticks of real
+/// time from now. KillAura's own minimum applies on top.
+fn tb_cooldown_ready(module: &Module, hooks: &TbHooks, landing_delay: i64) -> bool {
+    if !hooks.has_cooldown {
+        return true;
+    }
+
+    let required = tb_setting_f64(module, "AttackCooldown", 1.0)
+        .max(hooks.killaura_next_cooldown.unwrap_or(0.0));
+    let progress = (hooks.attack_cooldown_progress)(landing_delay);
+    progress >= required
+}
+
+/// Upstream `TimerBoost` state: `boosting`, `cooldownTicks` (reset on enable).
+#[derive(Default)]
+pub struct TbTimerBoostState {
+    pub boosting: bool,
+    pub cooldown_ticks: i64,
+}
+
+/// Upstream `TimerBoost.boostTicks()`: ticks the balance lets run at
+/// `boostSpeed`. Each takes 1 / speed ticks of real time and spends the rest of
+/// a tick of balance.
+fn tb_boost_ticks(module: &Module, hooks: &TbHooks, boost_speed: f64) -> usize {
+    if boost_speed <= 1.0 {
+        return 0;
+    }
+
+    let ticks =
+        (hooks.timer_spendable_ticks)(tb_setting_i64(module, "MaxBalance", 3)) / (1.0 - 1.0 / boost_speed);
+    // Longer boosts are not worth simulating every tick
+    (ticks as i64).clamp(0, 100) as usize
+}
+
+/// Upstream `TimerBoost.planBoost()`: the snapshots of the boost the balance
+/// pays for, up to the hit landing on the last, and that hit.
+fn tb_plan_boost(
+    module: &Module,
+    hooks: &TbHooks,
+    boost_speed: f64,
+) -> (Vec<TbSnapshot>, Option<TbHit>) {
+    let mut path: Vec<TbSnapshot> = Vec::new();
+
+    for snapshot in (hooks.snapshots_from_now)()
+        .into_iter()
+        .take(tb_boost_ticks(module, hooks, boost_speed) + 1)
+    {
+        path.push(snapshot);
+        let hit = (hooks.hit_at)(snapshot.eyes(hooks.eye_height));
+        if hit.is_some() {
+            return (path, hit);
+        }
+    }
+
+    (path, None)
+}
+
+/// Upstream `TimerBoost.timerSpeed()`: speeds the game up once the balance
+/// reaches a hit. Returns the speed the game should run at this tick, `None` to
+/// leave it to charging.
+pub fn tick_base_timer_boost_timer_speed(
+    module: &Module,
+    state: &mut TbTimerBoostState,
+    hooks: &mut TbHooks,
+    rolled: &mut Option<bool>,
+    roll: f64,
+) -> Option<f64> {
+    let boost_speed = tb_setting_f64(module, "BoostSpeed", 5.0);
+    if state.cooldown_ticks > 0 {
+        state.cooldown_ticks -= 1;
+    }
+
+    let (path, hit) = tb_plan_boost(module, hooks, boost_speed);
+    let ticks = hit.map(|_| path.len() - 1);
+    // Each boosted tick takes 1 / speed ticks of real time
+    let landing_delay = ((ticks.unwrap_or(0) as f64) / boost_speed).ceil() as i64;
+    let target = hit.filter(|hit| {
+        let after: Vec<TbSnapshot> = (hooks.snapshots_from_now)()
+            .into_iter()
+            .skip(path.len())
+            .take(tb_setting_i64(module, "KnockbackTicks", 2) as usize)
+            .collect();
+        let mut path_after = path.clone();
+        path_after.extend(after);
+        tb_requirements_met(module, hooks, hit.point)
+            && tb_cooldown_ready(module, hooks, landing_delay)
+            && (hooks.advantage_pays_off)(hit, path_after.as_slice(), path.len() - 1, landing_delay)
+    });
+    (hooks.visuals_show)(
+        &path.iter().map(|s| s.pos).collect::<Vec<_>>(),
+        if target.is_some() { ticks } else { None },
+        target.map(|h| h.point),
+    );
+
+    let boost = ticks.is_some()
+        && ticks.unwrap_or(0) > 0
+        && target.is_some()
+        && state.cooldown_ticks <= 0
+        && tb_roll_chance(module, rolled, roll);
+    if state.boosting && !boost {
+        state.cooldown_ticks = tb_cooldown_random(module, roll);
+    }
+    state.boosting = boost;
+
+    if ticks.is_none() || ticks == Some(0) {
+        *rolled = None;
+    }
+
+    if boost {
+        Some(boost_speed)
+    } else if ticks == Some(0) {
+        // A boost ending in reach goes back to the normal speed right away
+        Some(1.0)
+    } else {
+        None
+    }
+}
+
+/// Upstream `speedHandler` (`GameTickEvent`): the active mode's speed, else
+/// charging, else nothing.
+pub fn tick_base_speed_handler(
+    module: &Module,
+    boost_state: &mut TbTimerBoostState,
+    hooks: &mut TbHooks,
+    rolled: &mut Option<bool>,
+    roll: f64,
+) {
+    // HoldFirst / BurstFirst: their tickHandler and its `busy` pin are ported
+    // in the next part; until then their `timerSpeed()` sees busy == false.
+    let speed = match tb_mode(module) {
+        "Timer" => tick_base_timer_boost_timer_speed(module, boost_state, hooks, rolled, roll),
+        _ => None,
+    }
+    .or_else(|| tick_base_charging_speed(module, hooks));
+    if let Some(speed) = speed {
+        (hooks.request_timer_speed)(speed);
+    }
+}
+
+/// Upstream `onDisabled()`.
+pub fn tick_base_on_disabled(hooks: &mut TbHooks, rolled: &mut Option<bool>) {
+    *rolled = None;
+    (hooks.visuals_clear)();
+}
+
+pub fn tick_base() -> Module {
+    Module::new(
+        "TickBase",
+        COMBAT,
+        vec![
+            choice("Mode", "Timer", &["Timer", "HoldFirst", "BurstFirst"]), // tagBy(this)
+            multi_choice(
+                "Requires",
+                &["KillAura"],
+                &["KillAura", "LookingAt", "Click", "OnGround"],
+            ),
+            float("Chance", 100.0, 0.0, 100.0), // percentageChance
+            int_range("Cooldown", 0, 0, 0, 100),
+            float("AttackCooldown", 1.0, 0.0, 1.0),
+            int("MaxBalance", 3, 0, 40),
+            float("ChargeRange", 50.0, 0.0, 500.0),
+            float("ChargeSpeed", 0.9, 0.1, 1.0),
+            boolean("ChargeWhileUsingItem", false),
+            // tree(Advantage): ToggleableValueGroup("Advantage", enabled) with
+            // its children carried flat
+            boolean("Advantage", true),
+            float("EnemyRange", 3.0, 0.0, 8.0),
+            int("KnockbackTicks", 2, 0, 10),
+            float("KnockbackMultiplier", 1.0, 0.0, 3.0),
+            boolean("SkipInvulnerable", true),
+            boolean("EnemyCooldown", true),
+            boolean("Criticals", true),
+            // TimerBoost.boostSpeed
+            float("BoostSpeed", 5.0, 1.0, 10.0),
+            // BurstMode: maxTicks + delay (ported with the mode in part 2)
+            int("MaxTicks", 4, 1, 20),
+            int_range("Delay", 0, 0, 0, 20),
+        ],
+    )
+}
+
+#[cfg(test)]
+mod tick_base_tests {
+    use super::*;
+
+    fn tb_snap(pos_x: f64) -> TbSnapshot {
+        TbSnapshot { pos: [pos_x, 0.0, 0.0], on_ground: true, fall_distance: 0.0 }
+    }
+
+    fn tb_hooks<'a>(
+        snapshots: &'a [TbSnapshot],
+        hit: Option<TbHit>,
+        hit_from: f64,
+        speeds: &'a mut Vec<f64>,
+        visuals: &'a mut Vec<(Vec<[f64; 3]>, Option<usize>, Option<[f64; 3]>)>,
+    ) -> TbHooks<'a> {
+        TbHooks {
+            request_timer_speed: Box::new(move |s: f64| speeds.push(s)),
+            timer_balance: 1.0,
+            timer_spendable_ticks: Box::new(|max: i64| 10.0 * max as f64),
+            snapshots_from_now: Box::new(move || snapshots.to_vec()),
+            hit_at: Box::new(move |eyes: [f64; 3]| {
+                if hit.is_some() && eyes[0] >= hit_from {
+                    hit
+                } else {
+                    None
+                }
+            }),
+            enemy_in_charge_range: Box::new(|| true),
+            enemy_under_crosshair: Box::new(|_: [f64; 3], _: [f64; 3], range: f64| {
+                if range > 0.0 {
+                    Some(TbHit { entity: 1, point: [1.0, 1.62, 0.0] })
+                } else {
+                    None
+                }
+            }),
+            killaura_engaged: true,
+            killaura_next_cooldown: None,
+            attack_cooldown_progress: Box::new(|_: i64| 1.0),
+            has_cooldown: false,
+            using_item: false,
+            on_ground: true,
+            in_vehicle: false,
+            blink_running: false,
+            eye_position: [0.0, 1.62, 0.0],
+            eye_height: 1.62,
+            look_angle: [1.0, 0.0, 0.0],
+            attack_pressed: false,
+            attack_recently_pressed: false,
+            advantage_pays_off: Box::new(|_: &TbHit, _: &[TbSnapshot], _: usize, _: i64| true),
+            visuals_show: Box::new(move |p: &[[f64; 3]], t: Option<usize>, pt: Option<[f64; 3]>| {
+                visuals.push((p.to_vec(), t, pt));
+            }),
+            visuals_clear: Box::new(|| {}),
+        }
+    }
+
+    #[test]
+    fn tick_base_timer_boost_boosts_when_the_hit_pays_off() {
+        let module = tick_base();
+        let snaps =
+            vec![tb_snap(0.0), tb_snap(1.0), tb_snap(2.0), tb_snap(3.0)];
+        let hit = TbHit { entity: 7, point: [2.0, 1.62, 0.0] };
+        let mut state = TbTimerBoostState::default();
+        let mut rolled: Option<bool> = None;
+
+        let (speed, visuals) = {
+            let mut speeds = Vec::new();
+            let mut visuals = Vec::new();
+            let mut hooks = tb_hooks(&snaps, Some(hit), 2.0, &mut speeds, &mut visuals);
+            let speed =
+                tick_base_timer_boost_timer_speed(&module, &mut state, &mut hooks, &mut rolled, 0.5);
+            drop(hooks);
+            (speed, visuals)
+        };
+        assert_eq!(speed, Some(5.0));
+        assert!(state.boosting);
+        assert_eq!(rolled, Some(true));
+        // The path up to the hit (3 snapshots), 2 ticks to it, the hit point.
+        assert_eq!(visuals.len(), 1);
+        assert_eq!(
+            visuals[0].0,
+            vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]]
+        );
+        assert_eq!(visuals[0].1, Some(2));
+        assert_eq!(visuals[0].2, Some(hit.point));
+    }
+
+    #[test]
+    fn tick_base_timer_boost_ends_into_cooldown_before_boosting_again() {
+        let mut module = tick_base();
+        module.setting_mut("Cooldown").unwrap().kind = ValueKind::IntRange(2, 2, 0, 100);
+        let snaps = vec![tb_snap(0.0), tb_snap(1.0), tb_snap(2.0)];
+        let hit = TbHit { entity: 7, point: [2.0, 1.62, 0.0] };
+        let mut state = TbTimerBoostState::default();
+        let mut rolled: Option<bool> = None;
+
+        // Tick 1: boosts.
+        {
+            let mut speeds = Vec::new();
+            let mut visuals = Vec::new();
+            let mut hooks = tb_hooks(&snaps, Some(hit), 2.0, &mut speeds, &mut visuals);
+            assert_eq!(
+                tick_base_timer_boost_timer_speed(&module, &mut state, &mut hooks, &mut rolled, 0.5),
+                Some(5.0)
+            );
+        }
+
+        // Tick 2: the hit is gone, so the boost ends and the cooldown opens.
+        {
+            let snaps = vec![tb_snap(0.0)];
+            let mut speeds = Vec::new();
+            let mut visuals = Vec::new();
+            let mut hooks = tb_hooks(&snaps, None, 0.0, &mut speeds, &mut visuals);
+            assert_eq!(
+                tick_base_timer_boost_timer_speed(&module, &mut state, &mut hooks, &mut rolled, 0.5),
+                None
+            );
+            assert_eq!(state.cooldown_ticks, 2);
+            assert!(rolled.is_none());
+        }
+
+        // Tick 3: still cooling down (the falling edge opened it).
+        {
+            let mut speeds = Vec::new();
+            let mut visuals = Vec::new();
+            let mut hooks = tb_hooks(&snaps, Some(hit), 2.0, &mut speeds, &mut visuals);
+            assert_eq!(
+                tick_base_timer_boost_timer_speed(&module, &mut state, &mut hooks, &mut rolled, 0.5),
+                None
+            );
+            assert_eq!(state.cooldown_ticks, 1);
+        }
+
+        // Tick 4: the cooldown is spent, it boosts again.
+        {
+            let mut speeds = Vec::new();
+            let mut visuals = Vec::new();
+            let mut hooks = tb_hooks(&snaps, Some(hit), 2.0, &mut speeds, &mut visuals);
+            assert_eq!(
+                tick_base_timer_boost_timer_speed(&module, &mut state, &mut hooks, &mut rolled, 0.5),
+                Some(5.0)
+            );
+            assert_eq!(state.cooldown_ticks, 0);
+        }
+    }
+
+    #[test]
+    fn tick_base_charges_while_an_enemy_is_near_but_out_of_reach() {
+        let module = tick_base();
+        let snaps = vec![tb_snap(0.0)];
+
+        // Enemy near, no reachable hit, balance below MaxBalance.
+        let mut speeds = Vec::new();
+        let mut visuals = Vec::new();
+        let hooks = tb_hooks(&snaps, None, 0.0, &mut speeds, &mut visuals);
+        assert_eq!(tick_base_charging_speed(&module, &hooks), Some(0.9));
+
+        // A reachable hit means it is not just charging.
+        let hit = TbHit { entity: 7, point: [2.0, 1.62, 0.0] };
+        let mut speeds = Vec::new();
+        let mut visuals = Vec::new();
+        let hooks = tb_hooks(&snaps, Some(hit), 0.0, &mut speeds, &mut visuals);
+        assert_eq!(tick_base_charging_speed(&module, &hooks), None);
+    }
+
+    #[test]
+    fn tick_base_speed_handler_requests_boost_then_charging() {
+        let module = tick_base();
+        let snaps = vec![tb_snap(0.0), tb_snap(1.0), tb_snap(2.0), tb_snap(3.0)];
+        let hit = TbHit { entity: 7, point: [2.0, 1.62, 0.0] };
+        let mut state = TbTimerBoostState::default();
+        let mut rolled: Option<bool> = None;
+
+        // Timer mode with a payable hit: the boost speed.
+        let first = {
+            let mut speeds = Vec::new();
+            let mut visuals = Vec::new();
+            let mut hooks = tb_hooks(&snaps, Some(hit), 2.0, &mut speeds, &mut visuals);
+            tick_base_speed_handler(&module, &mut state, &mut hooks, &mut rolled, 0.5);
+            drop(hooks);
+            speeds
+        };
+        assert_eq!(first, vec![5.0]);
+
+        // HoldFirst has no pin while not busy (part 2), so charging takes over
+        // while the hit is out of reach.
+        let mut module = tick_base();
+        module.setting_mut("Mode").unwrap().kind = ValueKind::Choice("HoldFirst".into(), Vec::new());
+        let second = {
+            let mut speeds = Vec::new();
+            let mut visuals = Vec::new();
+            let mut hooks = tb_hooks(&snaps, None, 0.0, &mut speeds, &mut visuals);
+            tick_base_speed_handler(&module, &mut state, &mut hooks, &mut rolled, 0.5);
+            drop(hooks);
+            speeds
+        };
+        assert_eq!(second, vec![0.9]);
+    }
+
+    #[test]
+    fn tick_base_requirement_and_chance_gates() {
+        let mut module = tick_base();
+        let snaps = vec![tb_snap(0.0)];
+        let hit = TbHit { entity: 7, point: [2.0, 1.62, 0.0] };
+
+        // KillAura off → the default Requirement fails.
+        let mut speeds = Vec::new();
+        let mut visuals = Vec::new();
+        let mut hooks = tb_hooks(&snaps, Some(hit), 2.0, &mut speeds, &mut visuals);
+        hooks.killaura_engaged = false;
+        assert!(!tb_requirements_met(&module, &hooks, hit.point));
+
+        // LookingAt met through the crosshair seam; Click and OnGround met.
+        module.setting_mut("Requires").unwrap().kind =
+            ValueKind::MultiChoice(vec!["LookingAt".to_string()], Vec::new());
+        assert!(tb_requirements_met(&module, &hooks, hit.point));
+        module.setting_mut("Requires").unwrap().kind =
+            ValueKind::MultiChoice(vec!["Click".to_string()], Vec::new());
+        assert!(!tb_requirements_met(&module, &hooks, hit.point));
+        hooks.attack_pressed = true;
+        assert!(tb_requirements_met(&module, &hooks, hit.point));
+        module.setting_mut("Requires").unwrap().kind =
+            ValueKind::MultiChoice(vec!["OnGround".to_string()], Vec::new());
+        assert!(tb_requirements_met(&module, &hooks, hit.point));
+        hooks.on_ground = false;
+        assert!(!tb_requirements_met(&module, &hooks, hit.point));
+
+        // A 0% chance never rolls a boost, and the roll is carried.
+        module.setting_mut("Chance").unwrap().kind = ValueKind::Float(0.0, 0.0, 100.0);
+        let mut rolled: Option<bool> = None;
+        assert!(!tb_roll_chance(&module, &mut rolled, 0.5));
+        assert_eq!(rolled, Some(false));
+        assert!(!tb_roll_chance(&module, &mut rolled, 1.0));
+    }
+
+    #[test]
+    fn tick_base_on_disabled_resets_the_roll_and_visuals() {
+        let mut rolled: Option<bool> = Some(true);
+        {
+            let mut speeds = Vec::new();
+            let mut visuals = Vec::new();
+            let snaps: Vec<TbSnapshot> = Vec::new();
+            let mut hooks = tb_hooks(&snaps, None, 0.0, &mut speeds, &mut visuals);
+            tick_base_on_disabled(&mut hooks, &mut rolled);
+        }
+        assert!(rolled.is_none());
+    }
+}

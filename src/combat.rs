@@ -11705,3 +11705,227 @@ mod velocity_aac442_blocksmc_tests {
         );
     }
 }
+
+// ----- velocity/mode/VelocityDexland20241001.kt (GPL-3.0, (c) 2015-2026 CCBlueX) -----
+
+// Deprecated upstream: will be removed with the release of 0.43.0 and
+// ported to LiquidBounce Legacy Add-on.
+
+/// Upstream `VelocityMode("Dexland")`.
+pub const VELOCITY_DEXLAND_NAME: &str = "Dexland";
+
+pub fn velocity_dexland() -> Module {
+    Module::new(
+        "Dexland",
+        COMBAT,
+        vec![
+            float("HReduce", 0.3, 0.0, 1.0),
+            int("AttacksToWork", 4, 1, 10),
+        ],
+    )
+}
+
+/// Upstream `VelocityDexland20241001.lastAttackTime` and `count` (count is a
+/// public var upstream).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct VelocityDexlandState {
+    pub last_attack_time: u64,
+    pub count: i64,
+}
+
+/// What the attack handler did on an `AttackEntityEvent`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum VelocityDexlandAttackOutcome {
+    /// The delta movement is untouched.
+    Untouched,
+    /// `player.deltaMovement.multiply(factorX = hReduce, factorZ = hReduce)`.
+    DeltaReduced { x: f64, z: f64 },
+}
+
+/// Upstream `attackHandler`, a `handler` on `AttackEntityEvent`. The count
+/// increments on every attack before the modulo check.
+pub fn velocity_dexland_attack_handler(
+    module: &Module,
+    state: &mut VelocityDexlandState,
+    now_ms: u64,
+    hurt_time: i32,
+    delta_x: f64,
+    delta_y: f64,
+    delta_z: f64,
+) -> VelocityDexlandAttackOutcome {
+    let _ = delta_y;
+    state.count += 1;
+
+    let mut outcome = VelocityDexlandAttackOutcome::Untouched;
+    if hurt_time > 0
+        && state.count % tb_setting_i64(module, "AttacksToWork", 4) == 0
+        && now_ms.saturating_sub(state.last_attack_time) <= 8000
+    {
+        let reduce = tb_setting_f64(module, "HReduce", 0.3);
+        outcome = VelocityDexlandAttackOutcome::DeltaReduced {
+            x: delta_x * reduce,
+            z: delta_z * reduce,
+        };
+    }
+
+    state.last_attack_time = now_ms;
+    outcome
+}
+
+// ----- velocity/mode/VelocityHylex20241117.kt (GPL-3.0, (c) 2015-2026 CCBlueX) -----
+//
+// Hylex Velocity
+//
+// Works because of a silly exemption from Hylex
+// @author @liquidsquid1
+
+// Deprecated upstream: will be removed with the release of 0.43.0 and
+// ported to LiquidBounce Legacy Add-on.
+
+/// Upstream `VelocityMode("Hylex")`.
+pub const VELOCITY_HYLEX_NAME: &str = "Hylex";
+
+pub fn velocity_hylex() -> Module {
+    Module::new("Hylex", COMBAT, vec![])
+}
+
+/// What the attack handler did on an `AttackEntityEvent`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum VelocityHylexAttackOutcome {
+    /// The delta movement is untouched (not moving, not sprinting, or a
+    /// hurtTime with no entry in the factor table).
+    Untouched,
+    /// The hurtTime-specific x/z factor applied to the delta.
+    DeltaReduced { x: f64, z: f64 },
+}
+
+/// Upstream `attackHandler`, a `handler` on `AttackEntityEvent`: a
+/// hurtTime-keyed factor table (9 -> 0.8, 8 -> 0.11, 7 -> 0.4, 4 -> 0.37)
+/// applied to x and z only.
+pub fn velocity_hylex_attack_handler(
+    is_moving: bool,
+    is_sprinting: bool,
+    hurt_time: i32,
+    delta_x: f64,
+    delta_y: f64,
+    delta_z: f64,
+) -> VelocityHylexAttackOutcome {
+    if !is_moving || !is_sprinting {
+        return VelocityHylexAttackOutcome::Untouched;
+    }
+
+    let factor: f64 = match hurt_time {
+        9 => 0.8,
+        8 => 0.11,
+        7 => 0.4,
+        4 => 0.37,
+        _ => return VelocityHylexAttackOutcome::Untouched,
+    };
+
+    VelocityHylexAttackOutcome::DeltaReduced {
+        x: delta_x * factor,
+        z: delta_z * factor,
+    }
+}
+
+/// Upstream `repeatable`, a `handler` on `GameTickEvent`: jump from the
+/// ground while the hurt time is above 5. Returns whether
+/// `player.jumpFromGround()` ran.
+pub fn velocity_hylex_game_tick_handler(hurt_time: i32, on_ground: bool) -> bool {
+    let should_jump = hurt_time > 5;
+    let can_jump = on_ground;
+
+    should_jump && can_jump
+}
+
+#[cfg(test)]
+mod velocity_dexland_hylex_tests {
+    use super::*;
+
+    #[test]
+    fn velocity_dexland_reduces_every_n_th_attack_in_the_hurt_and_time_windows() {
+        let module = velocity_dexland();
+        let mut state = VelocityDexlandState::default();
+
+        // Attacks 1..3 (hurt or not): untouched, count still counts up
+        for _ in 0..3 {
+            assert_eq!(
+                velocity_dexland_attack_handler(&module, &mut state, 1000, 6, 1.0, 0.1, 0.9),
+                VelocityDexlandAttackOutcome::Untouched
+            );
+        }
+
+        // Attack 4 (count % 4 == 0), hurt, within 8000 ms of the first:
+        // reduced by the 0.3 factor
+        assert_eq!(
+            velocity_dexland_attack_handler(&module, &mut state, 1000, 6, 1.0, 0.1, 0.9),
+            VelocityDexlandAttackOutcome::DeltaReduced { x: 0.3, z: 0.27 }
+        );
+        assert_eq!(state.count, 4);
+
+        // Attack 5 without hurt time: untouched, window re-arms
+        assert_eq!(
+            velocity_dexland_attack_handler(&module, &mut state, 1500, 0, 1.0, 0.1, 0.9),
+            VelocityDexlandAttackOutcome::Untouched
+        );
+
+        // Attack 6 beyond the 8000 ms window: untouched
+        assert_eq!(
+            velocity_dexland_attack_handler(&module, &mut state, 20000, 6, 1.0, 0.1, 0.9),
+            VelocityDexlandAttackOutcome::Untouched
+        );
+        assert_eq!(state.count, 6);
+        assert_eq!(state.last_attack_time, 20000);
+    }
+
+    #[test]
+    fn velocity_hylex_reduces_by_the_hurt_time_factor_table() {
+        // Not moving or not sprinting short-circuits every hurt time
+        assert_eq!(
+            velocity_hylex_attack_handler(false, true, 9, 1.0, 0.1, 1.0),
+            VelocityHylexAttackOutcome::Untouched
+        );
+        assert_eq!(
+            velocity_hylex_attack_handler(true, false, 9, 1.0, 0.1, 1.0),
+            VelocityHylexAttackOutcome::Untouched
+        );
+
+        // The hurtTime-keyed factors apply to x and z only
+        assert_eq!(
+            velocity_hylex_attack_handler(true, true, 9, 1.0, 0.1, 1.0),
+            VelocityHylexAttackOutcome::DeltaReduced { x: 0.8, z: 0.8 }
+        );
+        assert_eq!(
+            velocity_hylex_attack_handler(true, true, 8, 1.0, 0.1, 1.0),
+            VelocityHylexAttackOutcome::DeltaReduced { x: 0.11, z: 0.11 }
+        );
+        assert_eq!(
+            velocity_hylex_attack_handler(true, true, 7, 1.0, 0.1, 1.0),
+            VelocityHylexAttackOutcome::DeltaReduced { x: 0.4, z: 0.4 }
+        );
+        assert_eq!(
+            velocity_hylex_attack_handler(true, true, 4, 1.0, 0.1, 1.0),
+            VelocityHylexAttackOutcome::DeltaReduced { x: 0.37, z: 0.37 }
+        );
+
+        // Hurt times without a table entry leave the delta alone
+        assert_eq!(
+            velocity_hylex_attack_handler(true, true, 5, 1.0, 0.1, 1.0),
+            VelocityHylexAttackOutcome::Untouched
+        );
+    }
+
+    #[test]
+    fn velocity_hylex_jumps_on_the_ground_above_hurt_time_five() {
+        // hurtTime 6+ on the ground: jumpFromGround
+        assert!(velocity_hylex_game_tick_handler(6, true));
+        assert!(velocity_hylex_game_tick_handler(9, true));
+
+        // hurtTime 5 or below: no jump
+        assert!(!velocity_hylex_game_tick_handler(5, true));
+        assert!(!velocity_hylex_game_tick_handler(0, true));
+
+        // In the air: no jump
+        assert!(!velocity_hylex_game_tick_handler(9, false));
+    }
+}

@@ -7686,7 +7686,16 @@ pub enum VelocityModifyOutcome {
 /// Upstream `PercentageChance.getAsBoolean`: 0% is always false, 100% always
 /// true, otherwise a uniform roll in 0..100 is under the percentage.
 fn velocity_chance_as_boolean(module: &Module, roll: f64) -> bool {
-    let percentage = tb_setting_i64(module, "Chance", 100) as f64;
+    // Int percentage (VelocityModify) or Float percentage (VelocityJumpReset)
+    let percentage = module
+        .setting("Chance")
+        .map(|value| &value.kind)
+        .and_then(|kind| match kind {
+            ValueKind::Int(v, _, _) => Some(*v as f64),
+            ValueKind::Float(v, _, _) => Some(*v),
+            _ => None,
+        })
+        .unwrap_or(100.0);
     if percentage <= 0.0 {
         false
     } else if percentage >= 100.0 {
@@ -8342,5 +8351,472 @@ mod velocity_mode_tests {
         let outcome =
             velocity_strafe_move_handler(&module, &mut state, &world, Vec3 { x: 1.0, y: 0.0, z: 0.0 });
         assert_eq!(outcome, VelocityStrafeMoveOutcome::Untouched);
+    }
+}
+
+// ----- velocity/mode/VelocityReversal.kt + VelocityJumpReset.kt
+// (GPL-3.0, (c) 2015-2026 CCBlueX) -----
+
+/// Upstream `VelocityWorld` gains the hurt/sprint surface the two modes read.
+pub trait VelocityWorldExtended: VelocityWorld {
+    /// `player.hurtTime` (9 = the tick the hit landed)
+    fn hurt_time(&self) -> i64;
+    /// `player.isSprinting`
+    fn is_sprinting(&self) -> bool;
+    /// `LocalPlayerFallDamageTracker.isCurrentFallDamage`
+    fn is_current_fall_damage(&self) -> bool;
+}
+
+/// Upstream `Vec3.multiply(factorX, factorY = 1.0, factorZ)`.
+fn vec3_multiply(vec: Vec3, factor_x: f64, factor_y: f64, factor_z: f64) -> Vec3 {
+    Vec3 {
+        x: vec.x * factor_x,
+        y: vec.y * factor_y,
+        z: vec.z * factor_z,
+    }
+}
+
+/// Upstream `Vec3.lengthSqr()`.
+fn vec3_length_sqr(vec: Vec3) -> f64 {
+    vec.x * vec.x + vec.y * vec.y + vec.z * vec.z
+}
+
+// ----- VelocityReversal.kt -----
+//
+// A velocity mode that reverses your velocity after a set amount of ticks.
+// Default values bypass Vulcan (3/9/25) ~ anticheat-test.com
+
+pub fn velocity_reversal() -> Module {
+    Module::new(
+        "Reversal",
+        COMBAT,
+        vec![
+            int("Delay", 2, 1, 5), // "ticks" suffix
+            float("XModifier", 0.5, 0.0, 1.0),
+            float("ZModifier", 0.5, 0.0, 1.0),
+            boolean("OnlyMoving", false),
+        ],
+    )
+}
+
+/// Upstream `VelocityReversal.handlingVelocity` + `velocityTicks`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct VelocityReversalState {
+    pub handling_velocity: bool,
+    pub velocity_ticks: i64,
+}
+
+fn velocity_reversal_reset(state: &mut VelocityReversalState) {
+    state.velocity_ticks = 0;
+    state.handling_velocity = false;
+}
+
+/// Upstream `VelocityReversal.packetEventHandler`, a `handler` on
+/// `PacketEvent`.
+pub fn velocity_reversal_packet_handler(
+    module: &Module,
+    state: &mut VelocityReversalState,
+    world: &dyn VelocityWorldExtended,
+    local_player_velocity: bool,
+) {
+    if !local_player_velocity {
+        return;
+    }
+
+    // `player.moving`
+    if tb_setting_bool(module, "OnlyMoving", false) && !world.input_is_moving() {
+        return;
+    }
+
+    velocity_reversal_reset(state);
+    state.handling_velocity = true;
+}
+
+/// What the reversal tick handler did.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum VelocityReversalTickOutcome {
+    /// Nothing ran or the state only reset.
+    Untouched,
+    /// Upstream `player.deltaMovement = player.deltaMovement.multiply(
+    /// factorX = -xModifier, factorZ = -zModifier)`; carries the new
+    /// movement.
+    Applied(Vec3),
+}
+
+/// Upstream `VelocityReversal.playerTickHandler`, a `handler` on
+/// `PlayerTickEvent`.
+pub fn velocity_reversal_tick_handler(
+    module: &Module,
+    state: &mut VelocityReversalState,
+    world: &dyn VelocityWorldExtended,
+) -> VelocityReversalTickOutcome {
+    if !state.handling_velocity {
+        return VelocityReversalTickOutcome::Untouched;
+    }
+
+    if vec3_length_sqr(world.delta_movement()) == 0.0 {
+        velocity_reversal_reset(state);
+        return VelocityReversalTickOutcome::Untouched;
+    }
+
+    state.velocity_ticks += 1;
+    if state.velocity_ticks >= tb_setting_i64(module, "Delay", 2) {
+        let new_movement = vec3_multiply(
+            world.delta_movement(),
+            -tb_setting_f64(module, "XModifier", 0.5),
+            1.0,
+            -tb_setting_f64(module, "ZModifier", 0.5),
+        );
+        velocity_reversal_reset(state);
+        return VelocityReversalTickOutcome::Applied(new_movement);
+    }
+
+    VelocityReversalTickOutcome::Untouched
+}
+
+// ----- VelocityJumpReset.kt -----
+//
+// Jump Reset mode. A technique most players use to minimize the amount of
+// knockback they get.
+
+/// The upstream `JumpByReceivedHits` tags, verbatim.
+pub const VELOCITY_JUMP_HITS_TAGS: [&str; 1] = ["HitsUntilJump"];
+/// The upstream `JumpByDelay` tags, verbatim.
+pub const VELOCITY_JUMP_DELAY_TAGS: [&str; 1] = ["UntilJump"];
+
+pub fn velocity_jump_reset() -> Module {
+    Module::new(
+        "JumpReset",
+        COMBAT,
+        vec![
+            // percentageChance("Chance", 100f), a "%" float in 0..100
+            float("Chance", 100.0, 0.0, 100.0),
+            // JumpByReceivedHits: ToggleableValueGroup("JumpByReceivedHits", false)
+            boolean("JumpByReceivedHits", false),
+            // hitsUntilJump = intRange("HitsUntilJump", 2..2, 0..10)
+            int_range("HitsUntilJump", 2, 2, 0, 10),
+            // JumpByDelay: ToggleableValueGroup("JumpByDelay", true)
+            boolean("JumpByDelay", true),
+            // ticksUntilJump = intRange("UntilJump", 2..2, 0..20, "ticks")
+            int_range("UntilJump", 2, 2, 0, 20),
+        ],
+    )
+}
+
+/// Upstream `VelocityJumpReset.limitUntilJump`, `hitsUntilJump` and
+/// `ticksUntilJump` (the last two re-rolled from their ranges each jump).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VelocityJumpResetState {
+    pub limit_until_jump: i64,
+    pub hits_until_jump: i64,
+    pub ticks_until_jump: i64,
+}
+
+impl Default for VelocityJumpResetState {
+    fn default() -> Self {
+        VelocityJumpResetState {
+            limit_until_jump: 0,
+            hits_until_jump: 2, // JumpByReceivedHits.hitsUntilJump.random() over 2..2
+            ticks_until_jump: 2, // JumpByDelay.ticksUntilJump.random() over 2..2
+        }
+    }
+}
+
+/// Upstream `IntRange.random()` on a `ValueKind::IntRange` setting.
+fn velocity_jump_range_random(module: &Module, name: &str, default_from: i64, default_to: i64, roll: f64) -> i64 {
+    let (from, to) = module
+        .setting(name)
+        .map(|value| &value.kind)
+        .and_then(|kind| kind.int_range())
+        .unwrap_or((default_from, default_to));
+    from + (roll * ((to - from + 1) as f64)).floor() as i64
+}
+
+/// Upstream `VelocityJumpReset.isCooldownOver()`. The `debugParameter`
+/// calls are render-debug-only and not ported.
+fn velocity_jump_is_cooldown_over(module: &Module, state: &VelocityJumpResetState) -> bool {
+    let hits_enabled = tb_setting_bool(module, "JumpByReceivedHits", false);
+    let delay_enabled = tb_setting_bool(module, "JumpByDelay", true);
+
+    if hits_enabled {
+        state.limit_until_jump >= state.hits_until_jump
+    } else if delay_enabled {
+        state.limit_until_jump >= state.ticks_until_jump
+    } else {
+        // If none of the options are enabled, it will go automatic
+        true
+    }
+}
+
+/// Upstream `VelocityJumpReset.updateLimit()`.
+fn velocity_jump_update_limit(
+    module: &Module,
+    state: &mut VelocityJumpResetState,
+    world: &dyn VelocityWorldExtended,
+) {
+    if tb_setting_bool(module, "JumpByReceivedHits", false) {
+        if world.hurt_time() == 9 {
+            state.limit_until_jump += 1;
+        }
+        return;
+    }
+
+    state.limit_until_jump += 1;
+}
+
+/// Upstream `VelocityJumpReset.movementInputHandler`, a `handler` on
+/// `MovementInputEvent`. Returns whether `event.jump` was set true.
+/// `chance_roll` is the Chance roll, `hits_roll` and `ticks_roll` the
+/// re-rolls of `HitsUntilJump` / `UntilJump` after a jump.
+pub fn velocity_jump_reset_input_handler(
+    module: &Module,
+    state: &mut VelocityJumpResetState,
+    world: &dyn VelocityWorldExtended,
+    chance_roll: f64,
+    hits_roll: f64,
+    ticks_roll: f64,
+) -> bool {
+    // To be able to alter velocity when receiving knockback, player must be
+    // sprinting.
+    if world.hurt_time() != 9
+        || !world.player_on_ground()
+        || !world.is_sprinting()
+        || world.is_current_fall_damage()
+        || !velocity_jump_is_cooldown_over(module, state)
+        || !velocity_chance_as_boolean(module, chance_roll)
+    {
+        velocity_jump_update_limit(module, state, world);
+        return false;
+    }
+
+    // event.jump = true
+    state.limit_until_jump = 0;
+
+    state.hits_until_jump = velocity_jump_range_random(module, "HitsUntilJump", 2, 2, hits_roll);
+    state.ticks_until_jump = velocity_jump_range_random(module, "UntilJump", 2, 2, ticks_roll);
+    true
+}
+
+#[cfg(test)]
+mod velocity_reversal_jump_tests {
+    use super::*;
+
+    struct MockExtWorld {
+        on_ground: bool,
+        moving_input: bool,
+        delta: Vec3,
+        hurt_time: i64,
+        sprinting: bool,
+        fall_damage: bool,
+    }
+
+    impl Default for MockExtWorld {
+        fn default() -> Self {
+            MockExtWorld {
+                on_ground: true,
+                moving_input: true,
+                delta: Vec3 { x: 0.4, y: -0.078, z: 0.3 },
+                hurt_time: 9,
+                sprinting: true,
+                fall_damage: false,
+            }
+        }
+    }
+
+    impl VelocityWorld for MockExtWorld {
+        fn player_id(&self) -> i64 {
+            42
+        }
+        fn player_on_ground(&self) -> bool {
+            self.on_ground
+        }
+        fn any_horizontal_input(&self) -> bool {
+            self.moving_input
+        }
+        fn delta_movement(&self) -> Vec3 {
+            self.delta
+        }
+        fn horizontal_speed(&self) -> f64 {
+            (self.delta.x * self.delta.x + self.delta.z * self.delta.z).sqrt()
+        }
+        fn input_is_moving(&self) -> bool {
+            self.moving_input
+        }
+        fn movement_yaw(&self) -> f32 {
+            90.0
+        }
+        fn find_enemy(&self, _max_range: f64) -> Option<Vec3> {
+            None
+        }
+        fn is_looking_at_entity(
+            &self,
+            _target: Vec3,
+            _range: f64,
+            _rotation: (f32, f32),
+        ) -> Option<()> {
+            None
+        }
+        fn current_rotation(&self) -> Option<(f32, f32)> {
+            None
+        }
+        fn player_rotation(&self) -> (f32, f32) {
+            (10.0, 0.0)
+        }
+    }
+
+    impl VelocityWorldExtended for MockExtWorld {
+        fn hurt_time(&self) -> i64 {
+            self.hurt_time
+        }
+        fn is_sprinting(&self) -> bool {
+            self.sprinting
+        }
+        fn is_current_fall_damage(&self) -> bool {
+            self.fall_damage
+        }
+    }
+
+    #[test]
+    fn velocity_reversal_arms_on_a_local_velocity_packet() {
+        let module = velocity_reversal();
+        let world = MockExtWorld::default();
+        let mut state = VelocityReversalState::default();
+
+        // A non-velocity packet never arms it
+        velocity_reversal_packet_handler(&module, &mut state, &world, false);
+        assert!(!state.handling_velocity);
+
+        // A local velocity packet resets and arms
+        velocity_reversal_packet_handler(&module, &mut state, &world, true);
+        assert!(state.handling_velocity);
+        assert_eq!(state.velocity_ticks, 0);
+
+        // OnlyMoving without input leaves the state alone
+        let mut module = velocity_reversal();
+        module.setting_mut("OnlyMoving").unwrap().kind = ValueKind::Bool(true);
+        let mut world = MockExtWorld::default();
+        world.moving_input = false;
+        state.handling_velocity = false;
+        velocity_reversal_packet_handler(&module, &mut state, &world, true);
+        assert!(!state.handling_velocity);
+    }
+
+    #[test]
+    fn velocity_reversal_reverses_the_movement_after_the_delay() {
+        let module = velocity_reversal();
+        let mut world = MockExtWorld::default();
+        world.delta = Vec3 { x: 0.4, y: -0.078, z: 0.3 };
+        let mut state = VelocityReversalState {
+            handling_velocity: true,
+            velocity_ticks: 0,
+        };
+
+        // Ticks 1..delay-1 count without touching the movement
+        assert_eq!(
+            velocity_reversal_tick_handler(&module, &mut state, &world),
+            VelocityReversalTickOutcome::Untouched
+        );
+        assert_eq!(state.velocity_ticks, 1);
+
+        // On the delay tick the movement flips (x *= -0.5, z *= -0.5)
+        let outcome = velocity_reversal_tick_handler(&module, &mut state, &world);
+        assert_eq!(
+            outcome,
+            VelocityReversalTickOutcome::Applied(Vec3 { x: -0.2, y: -0.078, z: -0.15 })
+        );
+        // reset() ran
+        assert!(!state.handling_velocity);
+        assert_eq!(state.velocity_ticks, 0);
+
+        // A zero-length movement resets without applying
+        state.handling_velocity = true;
+        world.delta = Vec3::ZERO;
+        assert_eq!(
+            velocity_reversal_tick_handler(&module, &mut state, &world),
+            VelocityReversalTickOutcome::Untouched
+        );
+        assert!(!state.handling_velocity);
+    }
+
+    #[test]
+    fn velocity_jump_reset_jumps_on_the_ninth_hurt_tick() {
+        let module = velocity_jump_reset();
+        let world = MockExtWorld::default();
+        let mut state = VelocityJumpResetState::default();
+
+        // hurtTime 9, on ground, sprinting, no fall damage, JumpByDelay 2..2
+        // with limit 0: no jump yet, the limit counts up
+        assert!(!velocity_jump_reset_input_handler(&module, &mut state, &world, 0.5, 0.5, 0.5));
+        assert_eq!(state.limit_until_jump, 1);
+
+        // Second hurt tick: limit 1 is still under the cooldown (2)
+        assert!(!velocity_jump_reset_input_handler(&module, &mut state, &world, 0.5, 0.5, 0.5));
+        assert_eq!(state.limit_until_jump, 2);
+
+        // Third hurt tick: the UntilJump cooldown (2) is over, so it jumps
+        assert!(velocity_jump_reset_input_handler(&module, &mut state, &world, 0.5, 0.5, 0.5));
+        assert_eq!(state.limit_until_jump, 0);
+        // the ranges re-rolled over 2..2
+        assert_eq!(state.hits_until_jump, 2);
+        assert_eq!(state.ticks_until_jump, 2);
+    }
+
+    #[test]
+    fn velocity_jump_reset_gates_skip_the_jump_but_count_the_limit() {
+        let module = velocity_jump_reset();
+        let mut world = MockExtWorld::default();
+        let mut state = VelocityJumpResetState::default();
+
+        // hurtTime 8: no jump, limit counts
+        world.hurt_time = 8;
+        assert!(!velocity_jump_reset_input_handler(&module, &mut state, &world, 0.5, 0.5, 0.5));
+        assert_eq!(state.limit_until_jump, 1);
+
+        // Not sprinting: no jump, limit counts
+        world.hurt_time = 9;
+        world.sprinting = false;
+        assert!(!velocity_jump_reset_input_handler(&module, &mut state, &world, 0.5, 0.5, 0.5));
+        assert_eq!(state.limit_until_jump, 2);
+
+        // Current fall damage: no jump
+        world.sprinting = true;
+        world.fall_damage = true;
+        assert!(!velocity_jump_reset_input_handler(&module, &mut state, &world, 0.5, 0.5, 0.5));
+        assert_eq!(state.limit_until_jump, 3);
+
+        // Chance 0%: no jump
+        world.fall_damage = false;
+        let mut module = velocity_jump_reset();
+        module.setting_mut("Chance").unwrap().kind = ValueKind::Float(0.0, 0.0, 100.0);
+        assert!(!velocity_jump_reset_input_handler(&module, &mut state, &world, 0.5, 0.5, 0.5));
+        assert_eq!(state.limit_until_jump, 4);
+    }
+
+    #[test]
+    fn velocity_jump_reset_hits_mode_counts_only_on_hurt_ticks() {
+        let mut module = velocity_jump_reset();
+        module.setting_mut("JumpByDelay").unwrap().kind = ValueKind::Bool(false);
+        module.setting_mut("JumpByReceivedHits").unwrap().kind = ValueKind::Bool(true);
+        let mut world = MockExtWorld::default();
+        let mut state = VelocityJumpResetState::default();
+
+        // hurtTime 9 on hurt ticks, 0 between: only hurt ticks count toward
+        // HitsUntilJump (2)
+        world.hurt_time = 9;
+        assert!(!velocity_jump_reset_input_handler(&module, &mut state, &world, 0.5, 0.5, 0.5));
+        assert_eq!(state.limit_until_jump, 1);
+
+        world.hurt_time = 0;
+        assert!(!velocity_jump_reset_input_handler(&module, &mut state, &world, 0.5, 0.5, 0.5));
+        assert_eq!(state.limit_until_jump, 1);
+
+        world.hurt_time = 9;
+        assert!(!velocity_jump_reset_input_handler(&module, &mut state, &world, 0.5, 0.5, 0.5));
+        assert_eq!(state.limit_until_jump, 2);
+
+        // Fourth hurt tick: HitsUntilJump (2) is reached, so it jumps
+        world.hurt_time = 9;
+        assert!(velocity_jump_reset_input_handler(&module, &mut state, &world, 0.5, 0.5, 0.5));
+        assert_eq!(state.limit_until_jump, 0);
     }
 }

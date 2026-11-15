@@ -11929,3 +11929,761 @@ mod velocity_dexland_hylex_tests {
         assert!(!velocity_hylex_game_tick_handler(9, false));
     }
 }
+
+
+// ----- combat/spearkill/ModuleSpearKill.kt + SpearKillTargetFinder.kt (GPL-3.0, (c) 2015-2026 CCBlueX) -----
+//
+// Upstream `ModuleSpearKill("SpearKill", aliases = listOf("AutoSpear"))`.
+
+/// Upstream `Color4b.RED` / `Color4b.WHITE` and `Color4b.alpha(a)` for the
+/// Preview group's default colors.
+impl TbColor {
+    pub fn red() -> Self {
+        TbColor { r: 0xFF, g: 0x00, b: 0x00, a: 0xFF }
+    }
+
+    pub fn white() -> Self {
+        TbColor { r: 0xFF, g: 0xFF, b: 0xFF, a: 0xFF }
+    }
+
+    pub fn alpha(&self, a: u8) -> Self {
+        TbColor { r: self.r, g: self.g, b: self.b, a }
+    }
+}
+
+pub const SPEAR_KILL_NAME: &str = "SpearKill";
+
+pub fn spear_kill() -> Module {
+    Module::new(
+        "SpearKill",
+        COMBAT,
+        vec![
+            float("MaxTargetDistance", 50.0, 3.0, 200.0),
+            float("MaxSpeed", 7.0, 2.0, 10.0),
+            // tree(Preview): ToggleableValueGroup("Preview", true) with the two
+            // color children, flattened onto the module's settings.
+            boolean("Preview", true),
+            crate::value::color("PreviewFillColor", 0xFF, 0x00, 0x00, 67), // Color4b.RED.alpha(67)
+            crate::value::color("PreviewOutlineColor", 0xFF, 0xFF, 0xFF, 167), // Color4b.WHITE.alpha(167)
+        ],
+    )
+}
+
+/// Upstream `net.minecraft.world.item.component.KineticWeapon` as a seam: the
+/// two values the module reads off the held item's data component.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct KineticWeaponParams {
+    pub delay_ticks: i32,
+    pub damage_use_duration: i32,
+}
+
+/// Upstream `KineticWeapon.isChargeAttackActive`: the damage window opens at
+/// `delayTicks` and ends at `computeDamageUseDuration()`.
+pub fn kinetic_weapon_is_charge_attack_active(
+    weapon: &KineticWeaponParams,
+    ticks_using_item: i32,
+) -> bool {
+    ticks_using_item < weapon.damage_use_duration
+}
+
+/// Upstream `KineticWeapon.hasChargeStarted`.
+pub fn kinetic_weapon_has_charge_started(
+    weapon: &KineticWeaponParams,
+    ticks_using_item: i32,
+) -> bool {
+    ticks_using_item >= weapon.delay_ticks
+}
+
+/// Upstream `KineticWeapon.isChargeSpent`.
+pub fn kinetic_weapon_is_charge_spent(
+    weapon: &KineticWeaponParams,
+    ticks_using_item: i32,
+) -> bool {
+    ticks_using_item > weapon.damage_use_duration
+}
+
+fn sk_add3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+}
+
+fn sk_sub3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+fn sk_dot3(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn sk_scale3(a: [f64; 3], f: f64) -> [f64; 3] {
+    [a[0] * f, a[1] * f, a[2] * f]
+}
+
+fn sk_len_sqr3(a: [f64; 3]) -> f64 {
+    sk_dot3(a, a)
+}
+
+fn sk_dist3(a: [f64; 3], b: [f64; 3]) -> f64 {
+    sk_len_sqr3(sk_sub3(a, b)).sqrt()
+}
+
+/// Upstream `Vec3.normalize`: a zero-length vector stays zero.
+fn sk_norm3(a: [f64; 3]) -> [f64; 3] {
+    let len = sk_len_sqr3(a).sqrt();
+    if len == 0.0 {
+        [0.0; 3]
+    } else {
+        sk_scale3(a, 1.0 / len)
+    }
+}
+
+/// Upstream `Vec3.closerThan(other, max)`.
+fn sk_closer_than(a: [f64; 3], b: [f64; 3], max: f64) -> bool {
+    sk_dist3(a, b) < max
+}
+
+/// Upstream `AABB.clip(from, to)`: the first intersection of the segment with
+/// the box surface, `None` when the segment misses (`HitResult.MISS`).
+pub fn sk_aabb_clip(min: [f64; 3], max: [f64; 3], from: [f64; 3], to: [f64; 3]) -> Option<[f64; 3]> {
+    let d = sk_sub3(to, from);
+    let mut tmin = 0.0f64;
+    let mut tmax = 1.0f64;
+    for i in 0..3 {
+        if d[i].abs() < f64::EPSILON {
+            if from[i] < min[i] || from[i] > max[i] {
+                return None;
+            }
+        } else {
+            let (mut t1, mut t2) = ((min[i] - from[i]) / d[i], (max[i] - from[i]) / d[i]);
+            if t1 > t2 {
+                std::mem::swap(&mut t1, &mut t2);
+            }
+            tmin = tmin.max(t1);
+            tmax = tmax.min(t2);
+            if tmin > tmax {
+                return None;
+            }
+        }
+    }
+    Some([
+        from[0] + d[0] * tmin,
+        from[1] + d[1] * tmin,
+        from[2] + d[2] * tmin,
+    ])
+}
+
+/// Upstream `AABB.expandTowards(d)`: grows the box toward `d`.
+fn sk_expand_towards(min: [f64; 3], max: [f64; 3], d: [f64; 3]) -> ([f64; 3], [f64; 3]) {
+    let (mut nmin, mut nmax) = (min, max);
+    for i in 0..3 {
+        if d[i] > 0.0 {
+            nmax[i] += d[i];
+        } else if d[i] < 0.0 {
+            nmin[i] += d[i];
+        }
+    }
+    (nmin, nmax)
+}
+
+/// Upstream `AABB.inflate(amount)`: grows every side.
+fn sk_inflate_box(min: [f64; 3], max: [f64; 3], amount: f64) -> ([f64; 3], [f64; 3]) {
+    (
+        [min[0] - amount, min[1] - amount, min[2] - amount],
+        [max[0] + amount, max[1] + amount, max[2] + amount],
+    )
+}
+
+/// The slice of `player`/`mc` SpearKill reads.
+pub struct SpearKillPlayer {
+    /// `player.isUsingItem && player.useItem.isSpear` split at the seam.
+    pub is_using_item: bool,
+    pub use_item_is_spear: bool,
+    pub ticks_using_item: i32,
+    /// `player.usedItemHand`.
+    pub used_item_hand: i32,
+    pub eye_position: [f64; 3],
+    pub look_angle: [f64; 3],
+    pub delta_movement: [f64; 3],
+    /// `player.boundingBox`.
+    pub bounding_min: [f64; 3],
+    pub bounding_max: [f64; 3],
+    pub bb_width: f64,
+    /// `mc.options.keyUse.isDown`.
+    pub key_use_down: bool,
+    /// `mc.options.keyAttack.isDown`.
+    pub key_attack_down: bool,
+}
+
+/// One `LivingEntity` candidate as SpearKill reads it.
+#[derive(Clone)]
+pub struct SpearKillEntity {
+    /// Engine entity id; the port carries identity, never the entity object.
+    pub id: u64,
+    /// Upstream `it !== player`.
+    pub is_self: bool,
+    pub is_alive: bool,
+    /// Upstream `isWithinWorldBorder`.
+    pub within_world_border: bool,
+    /// Upstream `it.boundingBox`.
+    pub bounding_min: [f64; 3],
+    pub bounding_max: [f64; 3],
+    /// Upstream `PositionExtrapolation.getBestForEntity(target)` picks the
+    /// simulation variant for players.
+    pub is_player: bool,
+    /// Upstream `entity.position()` / `entity.lastPos`, the linear
+    /// extrapolation inputs.
+    pub position: [f64; 3],
+    pub last_pos: [f64; 3],
+    /// Upstream `PlayerSimulationExtrapolation`:
+    /// `simulation.getSnapshotAt(ticks).pos`, an engine seam.
+    pub simulation_snapshot_at: Option<std::sync::Arc<dyn Fn(i32) -> [f64; 3]>>,
+    /// Upstream `target is EnderDragon`: the sub-entity boxes the preview
+    /// draws instead of the main one.
+    pub dragon_sub_boxes: Vec<([f64; 3], [f64; 3])>,
+}
+
+/// Upstream `PositionExtrapolation` (utils/entity/PositionExtrapolation.kt):
+/// predicts a position n ticks ahead.
+pub enum SpearKillExtrapolation {
+    /// Upstream `LinearPositionExtrapolation`: assumes a constant per-tick
+    /// speed (`basePosition.fma(ticks, velocity)`).
+    Linear { base_position: [f64; 3], velocity: [f64; 3] },
+    /// Upstream `PlayerSimulationExtrapolation`: the SimulatedPlayerCache
+    /// lookup is an engine seam.
+    PlayerSimulation(std::sync::Arc<dyn Fn(i32) -> [f64; 3]>),
+}
+
+impl SpearKillExtrapolation {
+    pub fn position_in_ticks(&self, ticks: f64) -> [f64; 3] {
+        match self {
+            SpearKillExtrapolation::Linear { base_position, velocity } => {
+                sk_add3(*base_position, sk_scale3(*velocity, ticks))
+            }
+            SpearKillExtrapolation::PlayerSimulation(snapshot_at) => {
+                let ticks = ((ticks.min(30.0)).round() as i32).max(0);
+                snapshot_at(ticks)
+            }
+        }
+    }
+}
+
+/// Upstream `PositionExtrapolation.getBestForEntity(target)`.
+pub fn spear_kill_extrapolation_for_entity(entity: &SpearKillEntity) -> SpearKillExtrapolation {
+    if entity.is_player {
+        if let Some(snapshot_at) = &entity.simulation_snapshot_at {
+            return SpearKillExtrapolation::PlayerSimulation(std::sync::Arc::clone(snapshot_at));
+        }
+    }
+    SpearKillExtrapolation::Linear {
+        base_position: entity.position,
+        velocity: sk_sub3(entity.position, entity.last_pos),
+    }
+}
+
+/// The world seams the SpearKill target finder reads.
+pub struct SpearKillWorld<'a> {
+    /// Upstream `world.getEntitiesOfClass(LivingEntity, box)`: entities in the
+    /// search box the port computes.
+    pub entities: Box<dyn Fn([f64; 3], [f64; 3]) -> Vec<SpearKillEntity> + 'a>,
+    /// Upstream `hasLineOfSight(eye, hitPosition)`.
+    pub has_line_of_sight: Box<dyn Fn([f64; 3], [f64; 3]) -> bool + 'a>,
+    /// Upstream `traceFromPlayer(range, block = ClipContext.Block.COLLIDER)`:
+    /// `Some(hit location)` when the ray hits anything (`type != MISS`), None
+    /// on a miss.
+    pub trace_from_player: Box<dyn Fn(f64) -> Option<[f64; 3]> + 'a>,
+    /// Upstream `player.getAttackRangeWith(player.useItem)`: the AttackRange
+    /// component's effective (min, max) ranges, engine math.
+    pub effective_range: (f64, f64),
+}
+
+/// Upstream `SpearKillTargetFinder.lungeTarget()`: the distance from the eye a
+/// lunge should leave the target at, the middle of the spear's damage window.
+pub fn spear_kill_lunge_target(player: &SpearKillPlayer, effective_range: (f64, f64)) -> f64 {
+    let along = sk_dot3(player.delta_movement, player.look_angle).max(0.0);
+    let max = effective_range.1 + along;
+    (effective_range.0 + max) / 2.0
+}
+
+/// Upstream `SpearKillTargetFinder.findTarget(maxTargetDistance)`: the closest
+/// entity along the player's look ray that a lunge can bring into the spear's
+/// damage window and that is not occluded by terrain. Returns the entity and
+/// its distance to the damage window.
+pub fn spear_kill_find_target(
+    player: &SpearKillPlayer,
+    world: &SpearKillWorld,
+    max_target_distance: f64,
+) -> Option<(SpearKillEntity, f64)> {
+    let eye = player.eye_position;
+    // `eye.fma(maxTargetDistance, lookAngle)` = eye + distance * look.
+    let look_end = sk_add3(eye, sk_scale3(player.look_angle, max_target_distance));
+
+    let search_box = {
+        let (min, max) = sk_expand_towards(
+            player.bounding_min,
+            player.bounding_max,
+            sk_sub3(look_end, eye),
+        );
+        sk_inflate_box(min, max, player.bb_width / 2.0)
+    };
+    let lunge_target = spear_kill_lunge_target(player, world.effective_range);
+
+    let mut best: Option<(SpearKillEntity, f64, f64)> = None;
+    for entity in (world.entities)(search_box.0, search_box.1) {
+        if entity.is_self || !entity.is_alive || !entity.within_world_border {
+            continue;
+        }
+        let hit = match sk_aabb_clip(entity.bounding_min, entity.bounding_max, eye, look_end) {
+            Some(h) => h,
+            None => continue,
+        };
+
+        // scoreCandidate
+        if !(world.has_line_of_sight)(eye, hit) {
+            continue;
+        }
+
+        let distance_to_target = sk_dist3(hit, eye);
+        let distance_to_damage = (distance_to_target - lunge_target).max(0.0);
+        if distance_to_damage <= 0.0 {
+            continue;
+        }
+
+        let dist_sq = distance_to_damage * distance_to_damage;
+        if let Some((_, _, best_sq)) = best {
+            if dist_sq >= best_sq {
+                continue;
+            }
+        }
+
+        if let Some(hit_location) = (world.trace_from_player)(distance_to_damage) {
+            if sk_closer_than(hit_location, eye, distance_to_damage) {
+                continue;
+            }
+        }
+
+        best = Some((entity, distance_to_damage, dist_sq));
+    }
+    best.map(|(entity, distance_to_damage, _)| (entity, distance_to_damage))
+}
+
+/// What the world render pass draws for the Preview group.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SpearKillRenderOp {
+    /// Upstream `drawBox(box, Preview.fillColor, Preview.outlineColor)`.
+    DrawBox { min: [f64; 3], max: [f64; 3], fill: TbColor, outline: TbColor },
+}
+
+/// What a tick mutates in the engine.
+#[derive(Default, Debug, PartialEq)]
+pub struct SpearKillActions {
+    /// Upstream `player.deltaMovement = ...`.
+    pub set_delta_movement: Option<[f64; 3]>,
+    /// Upstream `interaction.releaseUsingItem(player)`.
+    pub released_using_item: bool,
+    /// Upstream `useItem(hand)` with `player.usedItemHand`.
+    pub reused_item_hand: Option<i32>,
+}
+
+/// Upstream `ModuleSpearKill` state: the queued lunge movements and the
+/// previewed target.
+pub struct SpearKill {
+    pub module: Module,
+    /// Upstream `attackMovements: ArrayDeque<Vec3>`.
+    pub attack_movements: std::collections::VecDeque<[f64; 3]>,
+    /// Upstream `previewTarget: LivingEntity?`, as the engine entity id.
+    pub preview_target: Option<u64>,
+}
+
+fn sk_setting_color(module: &Module, name: &str, default: TbColor) -> TbColor {
+    match module.setting(name).map(|v| &v.kind) {
+        Some(crate::value::ValueKind::Color(r, g, b, a)) => TbColor { r: *r, g: *g, b: *b, a: *a },
+        _ => default,
+    }
+}
+
+impl SpearKill {
+    fn preview_enabled(&self) -> bool {
+        tb_setting_bool(&self.module, "Preview", true)
+    }
+
+    fn max_target_distance(&self) -> f64 {
+        tb_setting_f64(&self.module, "MaxTargetDistance", 50.0)
+    }
+
+    fn max_allowed_speed(&self) -> f64 {
+        tb_setting_f64(&self.module, "MaxSpeed", 7.0)
+    }
+
+    fn preview_fill_color(&self) -> TbColor {
+        sk_setting_color(&self.module, "PreviewFillColor", TbColor::red().alpha(67))
+    }
+
+    fn preview_outline_color(&self) -> TbColor {
+        sk_setting_color(&self.module, "PreviewOutlineColor", TbColor::white().alpha(167))
+    }
+
+    /// Upstream `currentMovement`: the head of the queue or `Vec3.ZERO`.
+    pub fn current_movement(&self) -> [f64; 3] {
+        self.attack_movements.front().copied().unwrap_or([0.0; 3])
+    }
+
+    /// Upstream `currentChargeAttackMovement` (internal val).
+    pub fn current_charge_attack_movement(&self) -> Option<[f64; 3]> {
+        let movement = self.current_movement();
+        if sk_len_sqr3(movement) > 0.0 {
+            Some(movement)
+        } else {
+            None
+        }
+    }
+
+    /// Upstream `resetAttack()`.
+    fn reset_attack(&mut self, actions: &mut SpearKillActions) {
+        self.preview_target = None;
+        if !self.attack_movements.is_empty() {
+            actions.set_delta_movement = Some([0.0; 3]);
+        }
+        self.attack_movements.clear();
+    }
+
+    /// Upstream `createAttackMovement(target, distance)`.
+    fn create_attack_movement(
+        &mut self,
+        player: &SpearKillPlayer,
+        target: &SpearKillEntity,
+        distance: f64,
+    ) {
+        let ticks = (((distance / self.max_allowed_speed()).ceil()) as i64).max(1);
+        let velocity = distance / ticks as f64;
+
+        let extrapolation = spear_kill_extrapolation_for_entity(target);
+        let extrapolated = extrapolation.position_in_ticks(ticks as f64);
+        let mut direction = sk_norm3(sk_sub3(extrapolated, player.eye_position));
+        if sk_len_sqr3(direction) == 0.0 {
+            direction = sk_norm3(player.look_angle);
+        }
+
+        let movement = sk_scale3(direction, velocity);
+        let reverse = sk_scale3(movement, -1.0);
+
+        for _ in 0..ticks {
+            self.attack_movements.push_back(movement);
+        }
+        for _ in 0..ticks {
+            self.attack_movements.push_back(reverse);
+        }
+        self.attack_movements.push_back([0.0; 3]);
+    }
+
+    /// Upstream `tickHandler`, a `handler<GameTickEvent>` with
+    /// `EventPriorityConvention.FINAL_DECISION`. `weapon` is
+    /// `player.useItem.get(DataComponents.KINETIC_WEAPON)`.
+    pub fn on_tick(
+        &mut self,
+        player: &SpearKillPlayer,
+        weapon: Option<&KineticWeaponParams>,
+        world: &SpearKillWorld,
+        actions: &mut SpearKillActions,
+    ) {
+        let is_using_spear = player.is_using_item && player.use_item_is_spear;
+        if !is_using_spear {
+            self.reset_attack(actions);
+            return;
+        }
+
+        let target = if self.preview_enabled() {
+            spear_kill_find_target(player, world, self.max_target_distance())
+        } else {
+            None
+        };
+        self.preview_target = target.as_ref().map(|(entity, _)| entity.id);
+
+        let spear = match weapon {
+            Some(w) => *w,
+            None => {
+                self.reset_attack(actions);
+                return;
+            }
+        };
+
+        // Restarting while a lunge is in flight would reset the charge, clearing the lunge and dropping its
+        // return leg, so the player would be left where the lunge took them.
+        if player.key_use_down
+            && kinetic_weapon_is_charge_spent(&spear, player.ticks_using_item)
+            && self.attack_movements.is_empty()
+        {
+            actions.released_using_item = true;
+            actions.reused_item_hand = Some(player.used_item_hand);
+        }
+
+        if !kinetic_weapon_has_charge_started(&spear, player.ticks_using_item) {
+            self.attack_movements.clear();
+            return;
+        }
+
+        if let Some(next) = self.attack_movements.pop_front() {
+            actions.set_delta_movement = Some(next);
+            return;
+        }
+
+        if !kinetic_weapon_is_charge_attack_active(&spear, player.ticks_using_item)
+            || !player.key_attack_down
+        {
+            return;
+        }
+
+        let (entity, distance) = match target {
+            Some(found) => found,
+            None => match spear_kill_find_target(player, world, self.max_target_distance()) {
+                Some(found) => found,
+                None => return,
+            },
+        };
+        self.preview_target = Some(entity.id);
+        self.create_attack_movement(player, &entity, distance);
+    }
+}
+
+/// Upstream `renderHandler`, a `handler<WorldRenderEvent>`: draw the preview
+/// target's box (or an EnderDragon's sub-entity boxes) with the Preview
+/// colors. `entities` is the current world entity list.
+pub fn spear_kill_render_handler(
+    state: &SpearKill,
+    entities: &[SpearKillEntity],
+) -> Vec<SpearKillRenderOp> {
+    if !state.preview_enabled() {
+        return Vec::new();
+    }
+    let fill = state.preview_fill_color();
+    let outline = state.preview_outline_color();
+    let mut ops = Vec::new();
+    if let Some(id) = state.preview_target {
+        if let Some(target) = entities.iter().find(|e| e.id == id) {
+            if target.dragon_sub_boxes.is_empty() {
+                ops.push(SpearKillRenderOp::DrawBox {
+                    min: target.bounding_min,
+                    max: target.bounding_max,
+                    fill,
+                    outline,
+                });
+            } else {
+                for (min, max) in &target.dragon_sub_boxes {
+                    ops.push(SpearKillRenderOp::DrawBox { min: *min, max: *max, fill, outline });
+                }
+            }
+        }
+    }
+    ops
+}
+
+#[cfg(test)]
+mod spear_kill_tests {
+    use super::*;
+
+    fn entity(id: u64, min: [f64; 3], max: [f64; 3]) -> SpearKillEntity {
+        SpearKillEntity {
+            id,
+            is_self: false,
+            is_alive: true,
+            within_world_border: true,
+            bounding_min: min,
+            bounding_max: max,
+            is_player: false,
+            position: min,
+            last_pos: min,
+            simulation_snapshot_at: None,
+            dragon_sub_boxes: Vec::new(),
+        }
+    }
+
+    fn player_at(eye: [f64; 3]) -> SpearKillPlayer {
+        SpearKillPlayer {
+            is_using_item: true,
+            use_item_is_spear: true,
+            ticks_using_item: 3,
+            used_item_hand: 0,
+            eye_position: eye,
+            look_angle: [1.0, 0.0, 0.0],
+            delta_movement: [0.0; 3],
+            bounding_min: eye,
+            bounding_max: [eye[0] + 0.6, eye[1] + 1.8, eye[2] + 0.6],
+            bb_width: 0.6,
+            key_use_down: false,
+            key_attack_down: false,
+        }
+    }
+
+    fn plain_world(entities: Vec<SpearKillEntity>) -> SpearKillWorld<'static> {
+        SpearKillWorld {
+            entities: Box::new(move |_, _| entities.clone()),
+            has_line_of_sight: Box::new(|_, _| true),
+            trace_from_player: Box::new(|_| None),
+            effective_range: (1.0, 3.0),
+        }
+    }
+
+    #[test]
+    fn spear_kill_extrapolation_linear_and_simulation() {
+        let linear = SpearKillExtrapolation::Linear {
+            base_position: [1.0, 2.0, 3.0],
+            velocity: [0.5, 0.0, -0.5],
+        };
+        assert_eq!(linear.position_in_ticks(4.0), [3.0, 2.0, 1.0]);
+
+        let sim = SpearKillExtrapolation::PlayerSimulation(std::sync::Arc::new(|t: i32| {
+            assert!((0..=30).contains(&t));
+            [t as f64, 0.0, 0.0]
+        }));
+        // Clamped to 30 and rounded.
+        assert_eq!(sim.position_in_ticks(100.5), [30.0, 0.0, 0.0]);
+        assert_eq!(sim.position_in_ticks(2.4), [2.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn spear_kill_find_target_scores_along_the_look_ray() {
+        // Eye at the origin looking down +x. A near target, a far target, and
+        // one behind terrain cover that LOS rejects.
+        let player = player_at([0.0, 64.0, 0.0]);
+        let near = entity(1, [7.9, 63.9, -0.4], [8.9, 64.9, 0.4]);
+        let far = entity(2, [19.9, 63.9, -0.4], [20.9, 64.9, 0.4]);
+        let blocked = entity(3, [11.9, 63.9, -0.4], [12.9, 64.9, 0.4]);
+
+        let world = SpearKillWorld {
+            entities: Box::new(move |_, _| vec![near.clone(), far.clone(), blocked.clone()]),
+            has_line_of_sight: Box::new(|_, hit| !(11.0..=13.0).contains(&hit[0])),
+            trace_from_player: Box::new(|_| None),
+            effective_range: (1.0, 3.0),
+        };
+
+        // lungeTarget = (1 + (3 + 0)) / 2 = 2.0, so distanceToDamage = hit.x - 2.
+        let (found, distance) = spear_kill_find_target(&player, &world, 50.0).unwrap();
+        assert_eq!(found.id, 1);
+        assert!((distance - 5.9).abs() < 1e-9);
+    }
+
+    #[test]
+    fn spear_kill_find_target_skips_occluded_and_out_of_damage_window() {
+        let player = player_at([0.0, 64.0, 0.0]);
+        // Terrain blocks the lunge path closer than the damage distance.
+        let covered = entity(1, [7.9, 63.9, -0.4], [8.9, 64.9, 0.4]);
+        let world = SpearKillWorld {
+            entities: Box::new(move |_, _| vec![covered.clone()]),
+            has_line_of_sight: Box::new(|_, _| true),
+            trace_from_player: Box::new(|range| Some([range * 0.5, 64.0, 0.0])),
+            effective_range: (1.0, 3.0),
+        };
+        assert!(spear_kill_find_target(&player, &world, 50.0).is_none());
+    }
+
+    #[test]
+    fn spear_kill_tick_drains_the_lunge_legs_in_order() {
+        let mut state = SpearKill {
+            module: spear_kill(),
+            attack_movements: Default::default(),
+            preview_target: None,
+        };
+        let mut player = player_at([0.0, 64.0, 0.0]);
+        let world = plain_world(vec![entity(7, [7.9, 63.9, -0.4], [8.9, 64.9, 0.4])]);
+        let weapon = KineticWeaponParams { delay_ticks: 2, damage_use_duration: 20 };
+
+        // Charge active (3 < 20) and attack held: builds the lunge plan. The
+        // distance-to-damage is ~5.9, so ticks = ceil(5.9/7) = 1.
+        let mut actions = SpearKillActions::default();
+        player.key_attack_down = true;
+        state.on_tick(&player, Some(&weapon), &world, &mut actions);
+        assert!(actions.set_delta_movement.is_none());
+        assert_eq!(state.attack_movements.len(), 3);
+
+        // Drain: one forward leg, one reverse leg, then the zero terminator.
+        let forward = state.attack_movements[0];
+        let reverse = state.attack_movements[1];
+        // The return leg is exactly the negative of the forward leg.
+        for i in 0..3 {
+            assert!((reverse[i] + forward[i]).abs() < 1e-9);
+        }
+        assert!(forward[0] > 0.0);
+
+        let mut drained: Vec<[f64; 3]> = Vec::new();
+        for _ in 0..3 {
+            actions = SpearKillActions::default();
+            state.on_tick(&player, Some(&weapon), &world, &mut actions);
+            drained.push(actions.set_delta_movement.unwrap());
+        }
+        assert_eq!(drained[2], [0.0; 3]);
+
+        // Queue empty again and still attacking: a fresh lunge is planned.
+        actions = SpearKillActions::default();
+        state.on_tick(&player, Some(&weapon), &world, &mut actions);
+        assert_eq!(state.attack_movements.len(), 3);
+    }
+
+    #[test]
+    fn spear_kill_tick_resets_without_the_spear_and_restarts_a_spent_charge() {
+        let mut state = SpearKill {
+            module: spear_kill(),
+            attack_movements: Default::default(),
+            preview_target: None,
+        };
+        state.attack_movements.push_back([1.0, 0.0, 0.0]);
+        state.preview_target = Some(3);
+        let mut player = player_at([0.0, 64.0, 0.0]);
+        player.is_using_item = false;
+        let world = plain_world(Vec::new());
+        let mut actions = SpearKillActions::default();
+        state.on_tick(&player, None, &world, &mut actions);
+        assert!(state.attack_movements.is_empty());
+        assert_eq!(actions.set_delta_movement, Some([0.0; 3]));
+        assert_eq!(state.preview_target, None);
+
+        // Charge spent while keyUse is held and no lunge is in flight:
+        // release and re-use the item hand.
+        let mut player = player_at([0.0, 64.0, 0.0]);
+        player.ticks_using_item = 21;
+        player.key_use_down = true;
+        let weapon = KineticWeaponParams { delay_ticks: 2, damage_use_duration: 20 };
+        let mut actions = SpearKillActions::default();
+        state.on_tick(&player, Some(&weapon), &world, &mut actions);
+        assert!(actions.released_using_item);
+        assert_eq!(actions.reused_item_hand, Some(0));
+    }
+
+    #[test]
+    fn spear_kill_render_draws_the_preview_boxes() {
+        let mut state = SpearKill {
+            module: spear_kill(),
+            attack_movements: Default::default(),
+            preview_target: None,
+        };
+        let entities = vec![entity(7, [7.9, 63.9, -0.4], [8.9, 64.9, 0.4])];
+
+        // No preview target yet: nothing drawn.
+        assert!(spear_kill_render_handler(&state, &entities).is_empty());
+
+        state.preview_target = Some(7);
+        let ops = spear_kill_render_handler(&state, &entities);
+        assert_eq!(ops.len(), 1);
+        assert_eq!(
+            ops[0],
+            SpearKillRenderOp::DrawBox {
+                min: [7.9, 63.9, -0.4],
+                max: [8.9, 64.9, 0.4],
+                fill: TbColor { r: 0xFF, g: 0x00, b: 0x00, a: 67 },
+                outline: TbColor { r: 0xFF, g: 0xFF, b: 0xFF, a: 167 },
+            }
+        );
+
+        // A dragon draws its sub-entity boxes instead.
+        let mut dragon = entity(7, [7.9, 63.9, -0.4], [8.9, 64.9, 0.4]);
+        dragon.dragon_sub_boxes = vec![([0.0, 0.0, 0.0], [1.0, 1.0, 1.0])];
+        let dragon_entities = vec![dragon];
+        let ops = spear_kill_render_handler(&state, &dragon_entities);
+        assert_eq!(
+            ops,
+            vec![SpearKillRenderOp::DrawBox {
+                min: [0.0, 0.0, 0.0],
+                max: [1.0, 1.0, 1.0],
+                fill: TbColor { r: 0xFF, g: 0x00, b: 0x00, a: 67 },
+                outline: TbColor { r: 0xFF, g: 0xFF, b: 0xFF, a: 167 },
+            }]
+        );
+    }
+}

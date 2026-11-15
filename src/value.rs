@@ -39,6 +39,7 @@ pub enum ValueKind {
     IntRange(i64, i64, i64, i64),   // from..to within min..max
     MultiChoice(Vec<String>, Vec<String>), // selected tags, all options
     Items(Vec<String>),          // upstream `items(...)`: item id list
+    Color(u8, u8, u8, u8),       // upstream `color(...)`: red, green, blue, alpha
 }
 
 #[derive(Clone)]
@@ -64,6 +65,14 @@ impl Value {
                 Json::Arr(sel.iter().map(|t| Json::Str(t.clone())).collect())
             }
             ValueKind::Items(list) => Json::Arr(list.iter().map(|t| Json::Str(t.clone())).collect()),
+            ValueKind::Color(r, g, b, a) => {
+                let mut m = BTreeMap::new();
+                m.insert("red".to_string(), Json::Num(*r as f64));
+                m.insert("green".to_string(), Json::Num(*g as f64));
+                m.insert("blue".to_string(), Json::Num(*b as f64));
+                m.insert("alpha".to_string(), Json::Num(*a as f64));
+                Json::Obj(m)
+            }
         }
     }
 
@@ -107,6 +116,16 @@ impl Value {
                     }
                 }
                 *sel = next;
+            }
+            (ValueKind::Color(cur, cg, cb, ca), Json::Obj(m)) => {
+                let chan = |key: &str| -> Result<u8, &'static str> {
+                    m.get(key).and_then(Json::as_f64).map(|v| clamp(v, 0.0, 255.0) as u8)
+                        .ok_or("color needs number channels")
+                };
+                *cur = chan("red")?;
+                *cg = chan("green")?;
+                *cb = chan("blue")?;
+                *ca = chan("alpha")?;
             }
             (ValueKind::Items(list), Json::Arr(entries)) => {
                 let mut next: Vec<String> = Vec::with_capacity(entries.len());
@@ -253,6 +272,11 @@ pub fn int_range(name: &str, from: i64, to: i64, lo: i64, hi: i64) -> Value {
 }
 
 /// Upstream `items("Name", itemSortedSetOf(...))`: a list of item ids.
+/// Upstream `color(name, Color4b)`: an RGBA color setting.
+pub fn color(name: &str, r: u8, g: u8, b: u8, a: u8) -> Value {
+    Value { name: name.into(), kind: ValueKind::Color(r, g, b, a), visible: |_| true, is_enabled_toggle: false }
+}
+
 pub fn items(name: &str, defaults: &[&str]) -> Value {
     Value { name: name.into(), kind: ValueKind::Items(defaults.iter().map(|s| s.to_string()).collect()), visible: |_| true, is_enabled_toggle: false }
 }

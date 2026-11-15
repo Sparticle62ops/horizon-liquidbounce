@@ -22438,3 +22438,940 @@ mod crystal_destroy_tests {
         assert_eq!(crystal_destroyer_max_range(&settings), 6.0);
     }
 }
+
+// ----- PlacementPositionCandidate.kt + CrystalAuraPlaceTargetFactory.kt -----
+
+/// Upstream `BlockPos`.
+pub type CaBlockPos = (i32, i32, i32);
+
+/// Upstream `PlacementContext` (base place state, layers, expected crystal
+/// box, target).
+#[derive(Clone, Copy, Debug)]
+pub struct PlacementContext {
+    pub base_place: bool,
+    /// `SubmoduleBasePlace.getBasePlaceLayers(target.y)` (empty when not base
+    /// placing), carried as an inclusive range.
+    pub base_place_layers: (i32, i32),
+    /// `FULL_BOX` (or `FULL_BOX.setMaxY(2.0)` with `1_12_2`).
+    pub expected_crystal: (f64, f64, f64, f64, f64, f64),
+    pub target: CaBlockPos,
+}
+
+/// Upstream `PlacementPositionCandidate`.
+#[derive(Clone, Debug)]
+pub struct PlacementPositionCandidate {
+    /// the block the crystal should be placed on
+    pub pos: CaBlockPos,
+    pub not_blocked_by_crystal: bool,
+    pub requires_base_place: bool,
+    /// The damage a crystal at the specific position would deal to the enemy.
+    pub enemy_damage: Option<f32>,
+    /// The damage a crystal at the specific position would deal to us.
+    pub self_damage: Option<f32>,
+    /// The distance to us (`pos.distToCenterSqr(player.position())`).
+    pub distance_sq: f64,
+}
+
+impl PlacementPositionCandidate {
+    pub fn new(
+        pos: CaBlockPos,
+        not_blocked_by_crystal: bool,
+        requires_base_place: bool,
+        player_position: (f64, f64, f64),
+    ) -> Self {
+        let (cx, cy, cz) = (
+            pos.0 as f64 + 0.5,
+            pos.1 as f64 + 0.5,
+            pos.2 as f64 + 0.5,
+        );
+        let dx = cx - player_position.0;
+        let dy = cy - player_position.1;
+        let dz = cz - player_position.2;
+        PlacementPositionCandidate {
+            pos,
+            not_blocked_by_crystal,
+            requires_base_place,
+            enemy_damage: None,
+            self_damage: None,
+            distance_sq: dx * dx + dy * dy + dz * dz,
+        }
+    }
+
+    /// Evaluates the explosion damage to the target, sets it to `None` if the
+    /// position is invalid. `damage_fn` is
+    /// `CrystalAuraDamageOptions.approximateExplosionDamage(pos.topCenter,
+    /// BASE_PLACE | PLACE)`; `requires_base_place` selects the submodule.
+    pub fn calculate(&mut self, damage_fn: &dyn Fn((f64, f64, f64), bool) -> Option<(f32, f32)>) {
+        // `pos.topCenter`
+        let damage_source_loc = (
+            self.pos.0 as f64 + 0.5,
+            (self.pos.1 + 1) as f64,
+            self.pos.2 as f64 + 0.5,
+        );
+        match damage_fn(damage_source_loc, self.requires_base_place) {
+            Some((self_damage, enemy_damage)) => {
+                self.self_damage = Some(self_damage);
+                self.enemy_damage = Some(enemy_damage);
+            }
+            None => {
+                self.self_damage = None;
+                self.enemy_damage = None;
+            }
+        }
+    }
+
+    pub fn is_not_invalid(&self) -> bool {
+        self.enemy_damage.is_some()
+    }
+
+    /// Upstream `compareTo`: coarse on enemy damage, fine 1 on the smaller
+    /// self damage, fine 2 on the smaller distance.
+    pub fn compare(&self, other: &PlacementPositionCandidate) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+
+        // coarse sorting
+        let enemy = self
+            .enemy_damage
+            .partial_cmp(&other.enemy_damage)
+            .unwrap_or(Ordering::Equal);
+        if enemy != Ordering::Equal {
+            return enemy;
+        }
+
+        // equal -> fine sorting 1
+        let self_damage = other
+            .self_damage
+            .partial_cmp(&self.self_damage)
+            .unwrap_or(Ordering::Equal);
+        if self_damage != Ordering::Equal {
+            return self_damage;
+        }
+
+        // equal -> fine sorting 2
+        other
+            .distance_sq
+            .partial_cmp(&self.distance_sq)
+            .unwrap_or(Ordering::Equal)
+    }
+
+    /// Upstream `equals`/`hashCode` key: `pos` + `requiresBasePlace`.
+    pub fn same_key(&self, other: &PlacementPositionCandidate) -> bool {
+        self.pos == other.pos && self.requires_base_place == other.requires_base_place
+    }
+}
+
+/// The engine surfaces the place side reads: the player, the world (block
+/// states, entity blocking, condition chain + candidate cache), the base
+/// place submodule, and the sorted sphere helper.
+pub trait CaPlaceFactoryHooks {
+    /// `player.position()`.
+    fn ca_player_position(&self) -> (f64, f64, f64);
+    /// `player.blockPosition()`.
+    fn ca_player_block_position(&self) -> CaBlockPos;
+    /// `ModuleCrystalAura.targetTracker.target` position.
+    fn ca_target_position(&self) -> Option<CaBlockPos>;
+    /// `SubmoduleCrystalPlacer.oldVersion`.
+    fn ca_old_version(&self) -> bool;
+    /// `conditionChain.all { condition -> condition.isValid(context, cache,
+    /// pos) }` with the `CandidateCache` the chain builds.
+    fn ca_conditions_valid(&mut self, context: &PlacementContext, pos: CaBlockPos) -> bool;
+    /// `CrystalAuraDamageOptions.approximateExplosionDamage(loc,
+    /// RequestingSubmodule.PLACE | BASE_PLACE)` as a (self, enemy) pair.
+    fn ca_damage(&self, loc: (f64, f64, f64), requires_base_place: bool) -> Option<(f32, f32)>;
+    /// `cache.canPlace` (whether the position can hold a crystal without a
+    /// base place).
+    fn ca_cache_can_place(&self, pos: CaBlockPos) -> bool;
+    /// `cache.up.isBlockedByEntitiesReturnCrystal(box, excludeIds, false)`:
+    /// returns (blocked, crystal entity on the block).
+    fn ca_up_blocked_by_entities(
+        &self,
+        pos_above: CaBlockPos,
+        expected_crystal: (f64, f64, f64, f64, f64, f64),
+        exclude_ids: Option<&[i32]>,
+    ) -> (bool, Option<CrystalEntityId>);
+    /// `BlockPos.ZERO.getSortedSphere(maxRange)`.
+    fn ca_sorted_sphere(&self, max_range: f32) -> Vec<CaBlockPos>;
+
+    // SubmoduleBasePlace seams (that submodule is a later slice)
+    fn ca_base_place_should_run(&self) -> bool;
+    fn ca_base_place_current_target(&self) -> Option<PlacementPositionCandidate>;
+    fn ca_set_base_place_current_target(&mut self, target: Option<PlacementPositionCandidate>);
+    fn ca_base_place_layers(&self, target_y: i32) -> (i32, i32);
+    fn ca_min_advantage(&self) -> f32;
+}
+
+/// Upstream `CrystalAuraPlaceTargetFactory` state.
+#[derive(Debug, Default, Clone)]
+pub struct PlaceTargetFactoryState {
+    pub placement_target: Option<CaBlockPos>,
+    pub previous_target: Option<CaBlockPos>,
+    /// `sphere` starts at `BlockPos.ZERO.getSortedSphere(4.5f)`.
+    pub sphere: Option<Vec<CaBlockPos>>,
+}
+
+/// Upstream `CrystalAuraPlaceTargetFactory.updateSphere()`.
+pub fn ca_place_update_sphere(
+    hooks: &dyn CaPlaceFactoryHooks,
+    state: &mut PlaceTargetFactoryState,
+    settings: &CrystalPlacerSettings,
+) {
+    state.sphere = Some(hooks.ca_sorted_sphere(crystal_placer_max_range(settings)));
+}
+
+/// Upstream `CrystalAuraPlaceTargetFactory.updateTarget(excludeIds)`.
+pub fn ca_place_update_target(
+    hooks: &mut dyn CaPlaceFactoryHooks,
+    state: &mut PlaceTargetFactoryState,
+    settings: &CrystalPlacerSettings,
+    exclude_ids: Option<&[i32]>,
+) {
+    // Reset current target
+    state.previous_target = state.placement_target;
+    state.placement_target = None;
+
+    let base_place = hooks.ca_base_place_should_run();
+    let current_base_place_target: Option<PlacementPositionCandidate> = if base_place {
+        None
+    } else {
+        hooks.ca_base_place_current_target()
+    };
+
+    // find all valid positions
+    let mut positions: Vec<PlacementPositionCandidate> = Vec::new();
+    if ca_place_evaluate_candidate_positions(hooks, state, settings, base_place, exclude_ids, &mut positions) {
+        // return if the crystal aura doesn't target anything
+        return;
+    }
+
+    // collect all valid positions
+    let final_positions: Vec<PlacementPositionCandidate> = positions
+        .into_iter()
+        .filter(PlacementPositionCandidate::is_not_invalid)
+        .collect();
+
+    // choose the best available target
+    let best_target = match ca_place_select_optimal_candidate(
+        final_positions,
+        current_base_place_target.as_ref(),
+        hooks.ca_min_advantage(),
+    ) {
+        Some(best) => best,
+        None => return,
+    };
+
+    // set the base place target
+    let differs = match current_base_place_target {
+        Some(ref current) => !current.same_key(&best_target),
+        None => true,
+    };
+    if best_target.requires_base_place && differs {
+        hooks.ca_set_base_place_current_target(Some(best_target.clone()));
+    } else if differs {
+        // base place isn't required
+        hooks.ca_set_base_place_current_target(None);
+    }
+
+    // finally, update the current target
+    if best_target.not_blocked_by_crystal && !best_target.requires_base_place {
+        state.placement_target = Some(best_target.pos);
+    }
+}
+
+/// Upstream `evaluateCandidatePositions`: returns true when the module does
+/// not target anything.
+#[allow(clippy::too_many_arguments)]
+pub fn ca_place_evaluate_candidate_positions(
+    hooks: &mut dyn CaPlaceFactoryHooks,
+    state: &mut PlaceTargetFactoryState,
+    _settings: &CrystalPlacerSettings,
+    base_place: bool,
+    exclude_ids: Option<&[i32]>,
+    positions: &mut Vec<PlacementPositionCandidate>,
+) -> bool {
+    let target = match hooks.ca_target_position() {
+        Some(target) => target,
+        None => return true,
+    };
+    let expected_crystal = if hooks.ca_old_version() {
+        let mut full = FULL_BOX;
+        full.4 = 2.0; // setMaxY(2.0)
+        full
+    } else {
+        FULL_BOX
+    };
+    let base_place_layers = if base_place {
+        hooks.ca_base_place_layers(target.1)
+    } else {
+        (0, -1) // IntRange.EMPTY
+    };
+
+    // create the context
+    let context = PlacementContext {
+        base_place,
+        base_place_layers,
+        expected_crystal,
+        target,
+    };
+
+    let player_pos = hooks.ca_player_block_position();
+    let player_position = hooks.ca_player_position();
+    let sphere = state
+        .sphere
+        .clone()
+        .unwrap_or_else(|| hooks.ca_sorted_sphere(4.5));
+    for offset in sphere {
+        // conditionChain
+        let pos = (
+            player_pos.0 + offset.0,
+            player_pos.1 + offset.1,
+            player_pos.2 + offset.2,
+        );
+
+        if hooks.ca_conditions_valid(&context, pos) {
+            let can_place = hooks.ca_cache_can_place(pos);
+            let (blocked, crystal) =
+                hooks.ca_up_blocked_by_entities(pos, expected_crystal, exclude_ids);
+            let crystal = crystal.is_some();
+            if !blocked || crystal {
+                let mut candidate =
+                    PlacementPositionCandidate::new(pos, !crystal, !can_place, player_position);
+                candidate.calculate(&|loc, requires_base_place| hooks.ca_damage(loc, requires_base_place));
+                positions.push(candidate);
+            }
+        }
+    }
+
+    false
+}
+
+/// Upstream `selectOptimalCandidate`.
+pub fn ca_place_select_optimal_candidate(
+    final_positions: Vec<PlacementPositionCandidate>,
+    current_base_place_target: Option<&PlacementPositionCandidate>,
+    min_advantage: f32,
+) -> Option<PlacementPositionCandidate> {
+    // choose the target with the maximum damage, and remember the best one
+    // that does not require base place (upstream `filterNot { ... }.maxOrNull()`)
+    let mut best_target: Option<PlacementPositionCandidate> = None;
+    let mut best_non_base_place: Option<PlacementPositionCandidate> = None;
+    for candidate in final_positions.into_iter() {
+        best_target = Some(match best_target {
+            None => candidate.clone(),
+            Some(current) => {
+                if candidate.compare(&current) == std::cmp::Ordering::Greater {
+                    candidate.clone()
+                } else {
+                    current
+                }
+            }
+        });
+        if !candidate.requires_base_place {
+            best_non_base_place = Some(match best_non_base_place {
+                None => candidate,
+                Some(current) => {
+                    if candidate.compare(&current) == std::cmp::Ordering::Greater {
+                        candidate
+                    } else {
+                        current
+                    }
+                }
+            });
+        }
+    }
+    let mut best_target = best_target?;
+
+    // find a target position that will not require base place if possible
+    if best_target.requires_base_place {
+        if let Some(non_base_place_target) = best_non_base_place {
+            if best_target.enemy_damage.unwrap_or(f32::MIN) - non_base_place_target.enemy_damage.unwrap_or(f32::MIN) <= min_advantage {
+                best_target = non_base_place_target;
+            }
+        }
+    }
+
+    // if base place already is placing a block and this block is still
+    // relevant, we wait for it
+    if let Some(current) = current_base_place_target {
+        if current.is_not_invalid()
+            && best_target.enemy_damage.unwrap_or(f32::MIN) - current.enemy_damage.unwrap_or(f32::MIN)
+                <= min_advantage
+        {
+            best_target = current.clone();
+        }
+    }
+
+    Some(best_target)
+}
+
+// ----- SubmoduleCrystalPlacer.kt -----
+
+/// Flattened `Place` settings (ported into the orchestrator tree) as the
+/// placer reads them.
+#[derive(Clone, Copy, Debug)]
+pub struct CrystalPlacerSettings {
+    pub enabled: bool,
+    /// `Delay` 0 0..1000 (ms)
+    pub delay_ms: i64,
+    /// `Range` 4.5 1..6
+    pub range: f32,
+    /// `WallsRange` 4.5 0..6
+    pub walls_range: f32,
+    /// `OnlyAbove` false
+    pub only_above: bool,
+    /// `Sequenced` false
+    pub sequenced: bool,
+    /// `NotFacingAway` false (only applies without OnlyAbove)
+    pub not_facing_away: bool,
+    /// `Jitter` false (only applies without OnlyAbove)
+    pub jitter: bool,
+}
+
+impl Default for CrystalPlacerSettings {
+    fn default() -> Self {
+        CrystalPlacerSettings {
+            enabled: true,
+            delay_ms: 0,
+            range: 4.5,
+            walls_range: 4.5,
+            only_above: false,
+            sequenced: false,
+            not_facing_away: false,
+            jitter: false,
+        }
+    }
+}
+
+/// Upstream `getMaxRange() = max(range, wallsRange)`.
+pub fn crystal_placer_max_range(settings: &CrystalPlacerSettings) -> f32 {
+    settings.range.max(settings.walls_range)
+}
+
+/// Upstream `BlockHitResult` (the fields the placer reads).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CaBlockHitResult {
+    pub block_pos: CaBlockPos,
+}
+
+/// The engine surfaces the placer reads: the player, the rotation manager and
+/// mode, the world raytracers, the inventory, the crystal item slot, the
+/// placement renderer, `SubmoduleIdPredict`, and `mc.execute`.
+pub trait CaPlacerHooks {
+    fn ca_eye_position(&self) -> (f64, f64, f64);
+    /// `Slots.OffhandWithHotbar.findClosestSlot(Items.END_CRYSTAL)?.inventorySlot`.
+    fn ca_crystal_slot(&self) -> Option<i32>;
+    /// `raytraceUpperBlockSide(eye, range, wallsRange, targetPos,
+    /// rotationsNotToMatch)` -> (rotation with vector, direction).
+    fn ca_raytrace_upper_block_side(
+        &self,
+        eye: (f64, f64, f64),
+        range: f64,
+        walls_range: f64,
+        target_pos: CaBlockPos,
+        rotations_not_to_match: Option<&[Rotation]>,
+    ) -> Option<((Rotation, (f64, f64, f64)), i32)>;
+    /// `findClosestPointOnBlockInLineWithCrystal(eye, range, wallsRange,
+    /// targetPos, notFacingAway, rotationsNotToMatch)`.
+    fn ca_find_closest_point_on_block_in_line_with_crystal(
+        &self,
+        eye: (f64, f64, f64),
+        range: f64,
+        walls_range: f64,
+        target_pos: CaBlockPos,
+        not_facing_away: bool,
+        rotations_not_to_match: Option<&[Rotation]>,
+    ) -> Option<((Rotation, (f64, f64, f64)), i32)>;
+    /// `ModuleCrystalAura.rotationMode.activeMode is NoRotationMode`.
+    fn ca_rotation_mode_is_no_rotation(&self) -> bool;
+    /// `raytraceBlock(maxRange, rotation, targetPos, state)`.
+    fn ca_raytrace_block(
+        &self,
+        max_range: f64,
+        rotation: Rotation,
+        target_pos: CaBlockPos,
+    ) -> Option<CaBlockHitResult>;
+    /// `RotationManager.serverRotation`.
+    fn ca_server_rotation(&self) -> Rotation;
+    /// `ModuleCrystalAura.rotationMode.activeMode.rotate(rotation,
+    /// isFinished, onFinished)`: returns whether `onFinished` ran.
+    fn ca_rotate(&mut self, rotation: Rotation, is_finished: bool) -> bool;
+    /// `player.clickBlockWithSlot(hit.withDirection(side), slot, swingMode,
+    /// switchMode, sequenced)`.
+    fn ca_click_block_with_slot(&mut self, hit: CaBlockHitResult, slot: i32, side: i32, sequenced: bool);
+    /// `SubmoduleIdPredict.run(targetPos)`.
+    fn ca_id_predict_run(&mut self, target_pos: CaBlockPos);
+    /// `mc.execute { placementRenderer.addBlock(it) }` /
+    /// `removeBlock(it)`.
+    fn ca_renderer_add_block(&mut self, pos: CaBlockPos);
+    fn ca_renderer_remove_block(&mut self, pos: CaBlockPos);
+}
+
+/// Placer state: the `Chronometer`, the last `blockHitResult`, and the
+/// previous-rotation deque (capacity 2, upstream `ArrayDeque(2)`).
+#[derive(Debug, Default)]
+pub struct CrystalPlacerState {
+    pub chronometer: Chronometer,
+    pub block_hit_result: Option<CaBlockHitResult>,
+    /// stores the mutable rotation and a copy to compare with the produced
+    /// rotations
+    pub previous_rotations: std::collections::VecDeque<(Rotation, Rotation)>,
+}
+
+/// Upstream `SubmoduleCrystalPlacer.tick(excludeIds)`.
+pub fn ca_placer_tick(
+    hooks: &mut dyn CaPlacerHooks,
+    factory_hooks: &mut dyn CaPlaceFactoryHooks,
+    factory: &mut PlaceTargetFactoryState,
+    state: &mut CrystalPlacerState,
+    settings: &CrystalPlacerSettings,
+    exclude_ids: Option<&[i32]>,
+    now_ms: u64,
+) {
+    if !settings.enabled || !state.chronometer.has_at_least_elapsed(settings.delay_ms as u64, now_ms) {
+        return;
+    }
+
+    // if we don't have crystals, we don't need to run the method
+    let slot = match hooks.ca_crystal_slot() {
+        Some(slot) => slot,
+        None => return,
+    };
+
+    ca_place_update_target(factory_hooks, factory, settings, exclude_ids);
+
+    ca_placer_remove_from_renderer(hooks, factory);
+
+    let target_pos = match factory.placement_target {
+        Some(target) => target,
+        None => return,
+    };
+
+    let not_same_rotation = match state.previous_rotations.back().map(|(rotation, _)| *rotation) {
+        Some(last) => hooks.ca_server_rotation() != last,
+        None => true,
+    };
+    let rotations_not_to_match: Option<Vec<Rotation>> = if not_same_rotation && settings.jitter {
+        Some(state.previous_rotations.iter().map(|(_, copy)| *copy).collect())
+    } else {
+        None
+    };
+
+    let mut side = 0; // Direction.UP
+    let found = if settings.only_above {
+        hooks.ca_raytrace_upper_block_side(
+            hooks.ca_eye_position(),
+            settings.range as f64,
+            settings.walls_range as f64,
+            target_pos,
+            rotations_not_to_match.as_deref(),
+        )
+    } else {
+        let data = hooks.ca_find_closest_point_on_block_in_line_with_crystal(
+            hooks.ca_eye_position(),
+            settings.range as f64,
+            settings.walls_range as f64,
+            target_pos,
+            settings.not_facing_away,
+            rotations_not_to_match.as_deref(),
+        );
+        match data {
+            Some(data) => {
+                side = data.1;
+                Some(data)
+            }
+            None => None,
+        }
+    };
+    let (rotation_with_vector, _) = match found {
+        Some(found) => found,
+        None => return,
+    };
+
+    if hooks.ca_rotation_mode_is_no_rotation() {
+        state.block_hit_result = match hooks.ca_raytrace_block(
+            crystal_placer_max_range(settings) as f64,
+            rotation_with_vector.0,
+            target_pos,
+        ) {
+            Some(hit) => Some(hit),
+            None => return,
+        };
+    }
+
+    ca_placer_add_to_renderer(hooks, factory);
+    ca_placer_update_previous(state, rotation_with_vector);
+    ca_placer_queue_placing(
+        hooks, state, settings, rotation_with_vector.0, target_pos, side, slot, now_ms,
+    );
+}
+
+/// Upstream `SubmoduleCrystalPlacer.queuePlacing`.
+pub fn ca_placer_queue_placing(
+    hooks: &mut dyn CaPlacerHooks,
+    state: &mut CrystalPlacerState,
+    settings: &CrystalPlacerSettings,
+    rotation: Rotation,
+    target_pos: CaBlockPos,
+    side: i32,
+    slot: i32,
+    now_ms: u64,
+) {
+    // create the action chain to execute (upstream evaluates isFinished lazily
+    // inside rotate; the seam evaluates it first and keeps the hit)
+    let is_finished = {
+        let hit = hooks.ca_raytrace_block(
+            crystal_placer_max_range(settings) as f64,
+            hooks.ca_server_rotation(),
+            target_pos,
+        );
+        match hit {
+            None => false,
+            Some(hit) => {
+                state.block_hit_result = Some(hit);
+                hit.block_pos == target_pos
+            }
+        }
+    };
+    if hooks.ca_rotate(rotation, is_finished) {
+        if !state.chronometer.has_at_least_elapsed(settings.delay_ms as u64, now_ms) {
+            return;
+        }
+
+        let hit = match state.block_hit_result {
+            Some(hit) => hit,
+            None => return,
+        };
+        let slot = match hooks.ca_crystal_slot() {
+            Some(slot) => slot,
+            None => return,
+        };
+
+        hooks.ca_click_block_with_slot(hit, slot, side, settings.sequenced);
+        hooks.ca_id_predict_run(target_pos);
+        state.chronometer.reset(now_ms);
+    }
+}
+
+/// Upstream `SubmoduleCrystalPlacer.updatePrevious`.
+pub fn ca_placer_update_previous(state: &mut CrystalPlacerState, rotation_with_vector: (Rotation, (f64, f64, f64))) {
+    if state.previous_rotations.len() == 2 {
+        state.previous_rotations.pop_front();
+    }
+
+    // stores the mutable rotation and a copy to compare with the produced rotations
+    state.previous_rotations.push_back((rotation_with_vector.0, rotation_with_vector.0));
+}
+
+/// Upstream `SubmoduleCrystalPlacer.addToRenderer`.
+fn ca_placer_add_to_renderer(hooks: &mut dyn CaPlacerHooks, factory: &PlaceTargetFactoryState) {
+    if factory.placement_target == factory.previous_target {
+        return;
+    }
+
+    if let Some(target) = factory.placement_target {
+        hooks.ca_renderer_add_block(target);
+    }
+}
+
+/// Upstream `SubmoduleCrystalPlacer.removeFromRenderer`.
+fn ca_placer_remove_from_renderer(hooks: &mut dyn CaPlacerHooks, factory: &PlaceTargetFactoryState) {
+    if factory.placement_target == factory.previous_target {
+        return;
+    }
+
+    if let Some(previous) = factory.previous_target {
+        hooks.ca_renderer_remove_block(previous);
+    }
+}
+
+#[cfg(test)]
+mod crystal_place_tests {
+    use super::*;
+
+    #[test]
+    fn candidate_compare_matches_upstream_ordering() {
+        let mut a = PlacementPositionCandidate::new((0, 64, 0), true, false, (0.0, 64.0, 0.0));
+        let mut b = PlacementPositionCandidate::new((1, 64, 0), true, false, (0.0, 64.0, 0.0));
+        a.enemy_damage = Some(10.0);
+        a.self_damage = Some(2.0);
+        b.enemy_damage = Some(10.0);
+        b.self_damage = Some(5.0);
+
+        // equal enemy damage -> smaller self damage wins
+        assert_eq!(a.compare(&b), std::cmp::Ordering::Greater);
+
+        // equal self damage -> smaller distance wins
+        b.self_damage = Some(2.0);
+        let mut c = PlacementPositionCandidate::new((5, 64, 5), true, false, (0.0, 64.0, 0.0));
+        c.enemy_damage = Some(10.0);
+        c.self_damage = Some(2.0);
+        assert_eq!(a.compare(&c), std::cmp::Ordering::Greater); // a is closer
+
+        // higher enemy damage wins outright
+        c.enemy_damage = Some(11.0);
+        assert_eq!(a.compare(&c), std::cmp::Ordering::Less);
+    }
+
+    #[test]
+    fn candidate_calculate_sets_or_clears_damage() {
+        let mut candidate = PlacementPositionCandidate::new((0, 64, 0), true, false, (0.0, 64.0, 0.0));
+        candidate.calculate(&|_, _| None);
+        assert!(!candidate.is_not_invalid());
+
+        candidate.calculate(&|loc, base| {
+            assert_eq!(loc, (0.5, 65.0, 0.5)); // pos.topCenter
+            if base { None } else { Some((3.0, 9.0)) }
+        });
+        assert!(candidate.is_not_invalid());
+        assert_eq!(candidate.enemy_damage, Some(9.0));
+        assert_eq!(candidate.self_damage, Some(3.0));
+    }
+
+    struct PlaceMock {
+        player_position: (f64, f64, f64),
+        player_block: CaBlockPos,
+        target: Option<CaBlockPos>,
+        old_version: bool,
+        conditions_ok: bool,
+        can_place: bool,
+        blocked: bool,
+        crystal_on_block: Option<CrystalEntityId>,
+        sphere: Vec<CaBlockPos>,
+        damage: Option<(f32, f32)>,
+        base_place_should_run: bool,
+        base_place_target: Option<PlacementPositionCandidate>,
+        base_place_set: Vec<Option<CaBlockPos>>,
+        min_advantage: f32,
+    }
+
+    impl Default for PlaceMock {
+        fn default() -> Self {
+            PlaceMock {
+                player_position: (0.5, 64.0, 0.5),
+                player_block: (0, 64, 0),
+                target: Some((10, 64, 10)),
+                old_version: false,
+                conditions_ok: true,
+                can_place: true,
+                blocked: false,
+                crystal_on_block: None,
+                sphere: vec![(0, 1, 0), (1, 1, 0)],
+                damage: Some((2.0, 12.0)),
+                base_place_should_run: false,
+                base_place_target: None,
+                base_place_set: Vec::new(),
+                min_advantage: 0.5,
+            }
+        }
+    }
+
+    impl CaPlaceFactoryHooks for PlaceMock {
+        fn ca_player_position(&self) -> (f64, f64, f64) { self.player_position }
+        fn ca_player_block_position(&self) -> CaBlockPos { self.player_block }
+        fn ca_target_position(&self) -> Option<CaBlockPos> { self.target }
+        fn ca_old_version(&self) -> bool { self.old_version }
+        fn ca_conditions_valid(&mut self, _context: &PlacementContext, _pos: CaBlockPos) -> bool { self.conditions_ok }
+        fn ca_damage(&self, _loc: (f64, f64, f64), _requires_base_place: bool) -> Option<(f32, f32)> { self.damage }
+        fn ca_cache_can_place(&self, _pos: CaBlockPos) -> bool { self.can_place }
+        fn ca_up_blocked_by_entities(&self, _pos_above: CaBlockPos, _expected_crystal: (f64, f64, f64, f64, f64, f64), _exclude_ids: Option<&[i32]>) -> (bool, Option<CrystalEntityId>) { (self.blocked, self.crystal_on_block) }
+        fn ca_sorted_sphere(&self, _max_range: f32) -> Vec<CaBlockPos> { self.sphere.clone() }
+        fn ca_base_place_should_run(&self) -> bool { self.base_place_should_run }
+        fn ca_base_place_current_target(&self) -> Option<PlacementPositionCandidate> { self.base_place_target.clone() }
+        fn ca_set_base_place_current_target(&mut self, target: Option<PlacementPositionCandidate>) { self.base_place_set.push(target.map(|t| t.pos)); }
+        fn ca_base_place_layers(&self, _target_y: i32) -> (i32, i32) { (0, 1) }
+        fn ca_min_advantage(&self) -> f32 { self.min_advantage }
+    }
+
+    #[test]
+    fn update_target_picks_unblocked_position() {
+        let mut hooks = PlaceMock::default();
+        let mut state = PlaceTargetFactoryState::default();
+        let settings = CrystalPlacerSettings::default();
+
+        ca_place_update_target(&mut hooks, &mut state, &settings, None);
+        assert_eq!(state.placement_target, Some((0, 65, 0)));
+        // previous target got recorded on the second run
+        ca_place_update_target(&mut hooks, &mut state, &settings, None);
+        assert_eq!(state.previous_target, Some((0, 65, 0)));
+    }
+
+    #[test]
+    fn update_target_returns_when_no_target() {
+        let mut hooks = PlaceMock::default();
+        hooks.target = None;
+        let mut state = PlaceTargetFactoryState::default();
+        let settings = CrystalPlacerSettings::default();
+
+        ca_place_update_target(&mut hooks, &mut state, &settings, None);
+        assert_eq!(state.placement_target, None);
+        assert!(state.previous_target.is_none());
+    }
+
+    #[test]
+    fn blocked_free_position_becomes_candidate() {
+        let mut hooks = PlaceMock::default();
+        // blocked with a crystal on top: candidate kept, notBlockedByCrystal false
+        hooks.blocked = true;
+        hooks.crystal_on_block = Some(3);
+        let mut state = PlaceTargetFactoryState::default();
+        let settings = CrystalPlacerSettings::default();
+        ca_place_update_target(&mut hooks, &mut state, &settings, None);
+        // requiresBasePlace=false (canPlace) but notBlockedByCrystal=false ->
+        // placement_target stays None
+        assert_eq!(state.placement_target, None);
+
+        // blocked without a crystal: skipped entirely (upstream
+        // `!blocked.keyBoolean() || crystal`)
+        let mut hooks = PlaceMock::default();
+        hooks.blocked = true;
+        let mut state = PlaceTargetFactoryState::default();
+        ca_place_update_target(&mut hooks, &mut state, &settings, None);
+        assert_eq!(state.placement_target, None);
+        assert!(hooks.base_place_set.is_empty());
+
+        // not blocked but canPlace=false -> requiresBasePlace=true -> base
+        // place target set, placement target stays None
+        let mut hooks = PlaceMock::default();
+        hooks.can_place = false;
+        let mut state = PlaceTargetFactoryState::default();
+        ca_place_update_target(&mut hooks, &mut state, &settings, None);
+        assert_eq!(hooks.base_place_set.last(), Some(&Some((0, 65, 0))));
+        assert_eq!(state.placement_target, None);
+    }
+
+    #[test]
+    fn select_optimal_prefers_non_base_place_within_advantage() {
+        let mut base = PlacementPositionCandidate::new((0, 65, 0), true, true, (0.0, 64.0, 0.0));
+        base.enemy_damage = Some(12.0);
+        base.self_damage = Some(1.0);
+        let mut simple = PlacementPositionCandidate::new((1, 65, 0), true, false, (0.0, 64.0, 0.0));
+        simple.enemy_damage = Some(11.8); // within minAdvantage 0.5
+        simple.self_damage = Some(1.0);
+
+        let best = ca_place_select_optimal_candidate(vec![base.clone(), simple.clone()], None, 0.5).unwrap();
+        assert_eq!(best.pos, (1, 65, 0)); // swapped to the non-base-place target
+
+        // outside the advantage window the base-place target stays
+        let mut far = PlacementPositionCandidate::new((1, 65, 0), true, false, (0.0, 64.0, 0.0));
+        far.enemy_damage = Some(10.0);
+        far.self_damage = Some(1.0);
+        let best = ca_place_select_optimal_candidate(vec![base.clone(), far], None, 0.5).unwrap();
+        assert_eq!(best.pos, (0, 65, 0));
+    }
+
+    struct PlacerMock {
+        eye: (f64, f64, f64),
+        slot: Option<i32>,
+        upper: Option<((Rotation, (f64, f64, f64)), i32)>,
+        closest: Option<((Rotation, (f64, f64, f64)), i32)>,
+        no_rotation: bool,
+        hit: Option<CaBlockHitResult>,
+        server: Rotation,
+        rotate_fires: bool,
+        clicked: Vec<(CaBlockPos, i32, i32)>,
+        id_predicts: Vec<CaBlockPos>,
+        added: Vec<CaBlockPos>,
+        removed: Vec<CaBlockPos>,
+    }
+
+    impl Default for PlacerMock {
+        fn default() -> Self {
+            PlacerMock {
+                eye: (0.5, 64.0, 0.5),
+                slot: Some(40),
+                upper: Some(((Rotation { yaw: 10.0, pitch: 20.0 }, (0.0, 1.0, 0.0)), 0)),
+                closest: Some(((Rotation { yaw: 10.0, pitch: 20.0 }, (1.0, 0.0, 0.0)), 2)),
+                no_rotation: false,
+                hit: Some(CaBlockHitResult { block_pos: (0, 65, 0) }),
+                server: Rotation { yaw: 0.0, pitch: 0.0 },
+                rotate_fires: true,
+                clicked: Vec::new(),
+                id_predicts: Vec::new(),
+                added: Vec::new(),
+                removed: Vec::new(),
+            }
+        }
+    }
+
+    impl CaPlacerHooks for PlacerMock {
+        fn ca_eye_position(&self) -> (f64, f64, f64) { self.eye }
+        fn ca_crystal_slot(&self) -> Option<i32> { self.slot }
+        fn ca_raytrace_upper_block_side(&self, _eye: (f64, f64, f64), _range: f64, _walls_range: f64, _target_pos: CaBlockPos, _rotations_not_to_match: Option<&[Rotation]>) -> Option<((Rotation, (f64, f64, f64)), i32)> { self.upper }
+        fn ca_find_closest_point_on_block_in_line_with_crystal(&self, _eye: (f64, f64, f64), _range: f64, _walls_range: f64, _target_pos: CaBlockPos, _not_facing_away: bool, _rotations_not_to_match: Option<&[Rotation]>) -> Option<((Rotation, (f64, f64, f64)), i32)> { self.closest }
+        fn ca_rotation_mode_is_no_rotation(&self) -> bool { self.no_rotation }
+        fn ca_raytrace_block(&self, _max_range: f64, _rotation: Rotation, _target_pos: CaBlockPos) -> Option<CaBlockHitResult> { self.hit }
+        fn ca_server_rotation(&self) -> Rotation { self.server }
+        fn ca_rotate(&mut self, _rotation: Rotation, is_finished: bool) -> bool { self.rotate_fires && is_finished }
+        fn ca_click_block_with_slot(&mut self, hit: CaBlockHitResult, slot: i32, side: i32, _sequenced: bool) { self.clicked.push((hit.block_pos, slot, side)); }
+        fn ca_id_predict_run(&mut self, target_pos: CaBlockPos) { self.id_predicts.push(target_pos); }
+        fn ca_renderer_add_block(&mut self, pos: CaBlockPos) { self.added.push(pos); }
+        fn ca_renderer_remove_block(&mut self, pos: CaBlockPos) { self.removed.push(pos); }
+    }
+
+    #[test]
+    fn placer_tick_gates_and_places() {
+        let mut hooks = PlacerMock::default();
+        let mut factory_hooks = PlaceMock::default();
+        let mut factory = PlaceTargetFactoryState::default();
+        let mut state = CrystalPlacerState::default();
+        let settings = CrystalPlacerSettings::default();
+
+        ca_placer_tick(&mut hooks, &mut factory_hooks, &mut factory, &mut state, &settings, None, 1000);
+        assert_eq!(hooks.clicked, vec![((0, 65, 0), 40, 2)]);
+        assert_eq!(hooks.id_predicts, vec![(0, 65, 0)]);
+        assert_eq!(state.chronometer.last_reset_ms, 1000);
+        assert_eq!(state.previous_rotations.len(), 1);
+
+        // no slot -> nothing
+        let mut hooks = PlacerMock::default();
+        hooks.slot = None;
+        let mut state = CrystalPlacerState::default();
+        ca_placer_tick(&mut hooks, &mut factory_hooks, &mut factory, &mut state, &settings, None, 1000);
+        assert!(hooks.clicked.is_empty());
+
+        // disabled -> nothing
+        let mut settings = CrystalPlacerSettings::default();
+        settings.enabled = false;
+        let mut state = CrystalPlacerState::default();
+        ca_placer_tick(&mut hooks, &mut factory_hooks, &mut factory, &mut state, &settings, None, 1000);
+        assert!(hooks.clicked.is_empty());
+
+        // delay not elapsed -> nothing
+        settings.enabled = true;
+        settings.delay_ms = 500;
+        state.chronometer.reset(1000);
+        ca_placer_tick(&mut hooks, &mut factory_hooks, &mut factory, &mut state, &settings, None, 1200);
+        assert!(hooks.clicked.is_empty());
+    }
+
+    #[test]
+    fn queue_placing_requires_matching_hit_and_rotation() {
+        let mut hooks = PlacerMock::default();
+        let mut state = CrystalPlacerState::default();
+        state.block_hit_result = Some(CaBlockHitResult { block_pos: (0, 65, 0) });
+        let settings = CrystalPlacerSettings::default();
+
+        // hit does not match the target -> rotation not finished -> no click
+        hooks.hit = Some(CaBlockHitResult { block_pos: (9, 9, 9) });
+        ca_placer_queue_placing(&mut hooks, &mut state, &settings, Rotation { yaw: 0.0, pitch: 0.0 }, (0, 65, 0), 0, 40, 1000);
+        assert!(hooks.clicked.is_empty());
+
+        // rotation not fired -> no click
+        hooks.hit = Some(CaBlockHitResult { block_pos: (0, 65, 0) });
+        hooks.rotate_fires = false;
+        ca_placer_queue_placing(&mut hooks, &mut state, &settings, Rotation { yaw: 0.0, pitch: 0.0 }, (0, 65, 0), 0, 40, 1000);
+        assert!(hooks.clicked.is_empty());
+
+        // finished -> click + id predict + chronometer reset
+        hooks.rotate_fires = true;
+        ca_placer_queue_placing(&mut hooks, &mut state, &settings, Rotation { yaw: 0.0, pitch: 0.0 }, (0, 65, 0), 0, 40, 1000);
+        assert_eq!(hooks.clicked, vec![((0, 65, 0), 40, 0)]);
+        assert_eq!(hooks.id_predicts, vec![(0, 65, 0)]);
+        assert_eq!(state.chronometer.last_reset_ms, 1000);
+    }
+
+    #[test]
+    fn max_range_is_max_of_both() {
+        let settings = CrystalPlacerSettings::default();
+        assert_eq!(crystal_placer_max_range(&settings), 4.5);
+    }
+}

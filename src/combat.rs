@@ -7266,3 +7266,307 @@ mod tick_base_visuals_tests {
         assert!((tb_looking_at([0.0, 0.0, 2.0], [0.0, 0.0, 0.0]).1).abs() < 1e-4);
     }
 }
+
+// ----- ModuleVelocity.kt (GPL-3.0, (c) 2015-2026 CCBlueX) -----
+//
+// Upstream alias: "AntiKnockBack". The 14 `VelocityMode` choices stay a
+// dispatch seam until the `velocity/mode/` files port; the module itself is
+// the packet dispatcher. Upstream `isLocalPlayerVelocity()`: a
+// `ClientboundSetEntityMotionPacket` aimed at the local player, or a
+// `ClientboundExplodePacket` with player knockback.
+
+/// The upstream `Mode` choice tags, verbatim.
+pub const VELOCITY_MODE_TAGS: [&str; 14] = [
+    "Modify",
+    "Reversal",
+    "Strafe",
+    "JumpReset",
+    "Lag",
+    "Reduce",
+    "Hypixel",
+    "Dexland",
+    "Hylex",
+    "BlocksMC",
+    "Grim-2.3.71",
+    "Grim-2.3.44-MC1.17",
+    "AAC-4.4.2",
+    "Intave-2026-10-02",
+];
+
+/// Upstream `Velocity` world seams for one `PacketEvent`.
+pub struct VelocityHooks<'a> {
+    /// Upstream `event.original`.
+    pub original: bool,
+    /// Upstream `packet.isLocalPlayerVelocity()`.
+    pub local_player_velocity: bool,
+    /// Upstream `packet is ClientboundPlayerPositionPacket`.
+    pub player_position_packet: bool,
+    /// Upstream the selected mode's run on the re-dispatched packet event;
+    /// returns whether that event stayed uncancelled.
+    pub mode_run: Box<dyn FnMut() -> bool + 'a>,
+}
+
+/// Upstream the module's mutable state.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct VelocityState {
+    /// Upstream `internal var pause: Int`, decremented once per game tick.
+    pub pause: i64,
+}
+
+/// What `ModuleVelocity.packetHandler` did to one incoming packet.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum VelocityPacketOutcome {
+    /// The packet flows on untouched.
+    PassThrough,
+    /// Upstream the original velocity packet was cancelled, optionally
+    /// delayed, then re-dispatched: `handled` says whether the packet was
+    /// handled or dropped, `waited_ms` the wall-clock wait before it.
+    Cancelled { waited_ms: u64, handled: bool },
+    /// Upstream `pause = PauseOnFlag`.
+    Paused,
+}
+
+pub fn velocity() -> Module {
+    Module::new(
+        "Velocity",
+        COMBAT,
+        vec![
+            // choices("Mode", VelocityModify, arrayOf(...)) with tagBy; the
+            // default is VelocityModify ("Modify")
+            choice("Mode", "Modify", &VELOCITY_MODE_TAGS),
+            int_range("Delay", 0, 0, 0, 40), // "ticks" suffix
+            int("PauseOnFlag", 0, 0, 20),    // "ticks" suffix
+        ],
+    )
+}
+
+/// Upstream `Delay.random()` on the `Delay` `IntRange` in `0..40`.
+fn velocity_delay_random(module: &Module, roll: f64) -> i64 {
+    let (from, to) = module
+        .setting("Delay")
+        .map(|value| &value.kind)
+        .and_then(|kind| kind.int_range())
+        .unwrap_or((0, 0));
+    from + (roll * ((to - from + 1) as f64)).floor() as i64
+}
+
+/// Upstream `ModuleVelocity.pauseHandler` on `GameTickEvent`.
+pub fn velocity_pause_handler(state: &mut VelocityState) {
+    if state.pause > 0 {
+        state.pause -= 1;
+    }
+}
+
+/// Upstream `ModuleVelocity.packetHandler`, a `sequenceHandler` on
+/// `PacketEvent` with priority 1. `delay_roll` is the `Delay.random()` roll.
+pub fn velocity_packet_handler(
+    module: &Module,
+    state: &mut VelocityState,
+    hooks: &mut VelocityHooks,
+    delay_roll: f64,
+) -> VelocityPacketOutcome {
+    if !hooks.original || state.pause > 0 {
+        return VelocityPacketOutcome::PassThrough;
+    }
+
+    if hooks.local_player_velocity {
+        // When delay is above 0, we will delay the velocity update
+        let (_, to) = module
+            .setting("Delay")
+            .map(|value| &value.kind)
+            .and_then(|kind| kind.int_range())
+            .unwrap_or((0, 0));
+        if to > 0 {
+            // cancelEvent()
+            let ticks = velocity_delay_random(module, delay_roll);
+            let waited_ms = if ticks > 0 {
+                // tickUntil { System.currentTimeMillis() >= timeToWait }
+                (ticks as u64) * 50
+            } else {
+                0
+            };
+
+            // A fresh, non-original PacketEvent re-dispatches the packet
+            let handled = (hooks.mode_run)();
+
+            return VelocityPacketOutcome::Cancelled { waited_ms, handled };
+        }
+    } else if hooks.player_position_packet {
+        state.pause = tb_setting_i64(module, "PauseOnFlag", 0);
+        return VelocityPacketOutcome::Paused;
+    }
+
+    VelocityPacketOutcome::PassThrough
+}
+
+#[cfg(test)]
+mod velocity_tests {
+    use super::*;
+
+    fn vel_hooks<'a>(
+        original: bool,
+        local_velocity: bool,
+        position_packet: bool,
+        handled: &'a mut bool,
+    ) -> VelocityHooks<'a> {
+        VelocityHooks {
+            original,
+            local_player_velocity: local_velocity,
+            player_position_packet: position_packet,
+            mode_run: Box::new(move || *handled),
+        }
+    }
+
+    #[test]
+    fn velocity_passes_packets_through_when_not_original_or_paused() {
+        let module = velocity();
+        let mut state = VelocityState::default();
+        let mut handled = false;
+
+        // A non-original event never runs
+        {
+            let mut hooks = vel_hooks(false, true, false, &mut handled);
+            assert_eq!(
+                velocity_packet_handler(&module, &mut state, &mut hooks, 0.5),
+                VelocityPacketOutcome::PassThrough
+            );
+        }
+
+        // A paused module passes everything through
+        state.pause = 3;
+        {
+            let mut hooks = vel_hooks(true, true, true, &mut handled);
+            assert_eq!(
+                velocity_packet_handler(&module, &mut state, &mut hooks, 0.5),
+                VelocityPacketOutcome::PassThrough
+            );
+        }
+        assert_eq!(state.pause, 3);
+        assert!(!handled);
+    }
+
+    #[test]
+    fn velocity_with_a_zero_delay_keeps_the_velocity_packet() {
+        let module = velocity();
+        let mut state = VelocityState::default();
+        let mut handled = false;
+
+        // Default Delay 0..0: delay.last is 0, so the packet is untouched
+        {
+            let mut hooks = vel_hooks(true, true, false, &mut handled);
+            assert_eq!(
+                velocity_packet_handler(&module, &mut state, &mut hooks, 0.5),
+                VelocityPacketOutcome::PassThrough
+            );
+        }
+        assert!(!handled);
+    }
+
+    #[test]
+    fn velocity_cancels_the_packet_delay_and_redispatches() {
+        let mut module = velocity();
+        // IntRange(from, to, lo, hi): Delay 2..10 inside 0..40
+        module.setting_mut("Delay").unwrap().kind = ValueKind::IntRange(2, 10, 0, 40);
+        let mut state = VelocityState::default();
+
+        // delay.random() with roll 0.5 over 2..10: 2 + floor(0.5 * 9) = 6
+        {
+            let mut handled = true;
+            let mut hooks = vel_hooks(true, true, false, &mut handled);
+            assert_eq!(
+                velocity_packet_handler(&module, &mut state, &mut hooks, 0.5),
+                VelocityPacketOutcome::Cancelled { waited_ms: 6 * 50, handled: true }
+            );
+        }
+
+        // The mode cancelling the re-dispatched event drops the packet
+        {
+            let mut handled = false;
+            let mut hooks = vel_hooks(true, true, false, &mut handled);
+            assert_eq!(
+                velocity_packet_handler(&module, &mut state, &mut hooks, 0.5),
+                VelocityPacketOutcome::Cancelled { waited_ms: 6 * 50, handled: false }
+            );
+        }
+
+        // delay.random() = 0 skips the wait but still re-dispatches
+        module.setting_mut("Delay").unwrap().kind = ValueKind::IntRange(0, 2, 0, 40);
+        {
+            let mut handled = true;
+            let mut hooks = vel_hooks(true, true, false, &mut handled);
+            assert_eq!(
+                velocity_packet_handler(&module, &mut state, &mut hooks, 0.0),
+                VelocityPacketOutcome::Cancelled { waited_ms: 0, handled: true }
+            );
+        }
+    }
+
+    #[test]
+    fn velocity_pauses_on_a_player_position_packet() {
+        let mut module = velocity();
+        let mut state = VelocityState::default();
+        let mut handled = false;
+
+        {
+            let mut hooks = vel_hooks(true, false, true, &mut handled);
+            assert_eq!(
+                velocity_packet_handler(&module, &mut state, &mut hooks, 0.5),
+                VelocityPacketOutcome::Paused
+            );
+        }
+        assert_eq!(state.pause, 0);
+
+        // PauseOnFlag 12: the position packet arms the pause
+        module.setting_mut("PauseOnFlag").unwrap().kind = ValueKind::Int(12, 0, 20);
+        {
+            let mut hooks = vel_hooks(true, false, true, &mut handled);
+            assert_eq!(
+                velocity_packet_handler(&module, &mut state, &mut hooks, 0.5),
+                VelocityPacketOutcome::Paused
+            );
+        }
+        assert_eq!(state.pause, 12);
+
+        // Each game tick decrements the pause
+        velocity_pause_handler(&mut state);
+        velocity_pause_handler(&mut state);
+        assert_eq!(state.pause, 10);
+
+        // Once the pause hits zero, packets run again
+        state.pause = 1;
+        velocity_pause_handler(&mut state);
+        {
+            let mut hooks = vel_hooks(true, true, false, &mut handled);
+            assert_eq!(
+                velocity_packet_handler(&module, &mut state, &mut hooks, 0.5),
+                VelocityPacketOutcome::PassThrough
+            );
+        }
+    }
+
+    #[test]
+    fn velocity_mode_tags_match_the_upstream_choices() {
+        let module = velocity();
+        let mode = module.setting("Mode").unwrap();
+        assert_eq!(mode.kind.choice(), Some("Modify"));
+        assert_eq!(
+            VELOCITY_MODE_TAGS,
+            [
+                "Modify",
+                "Reversal",
+                "Strafe",
+                "JumpReset",
+                "Lag",
+                "Reduce",
+                "Hypixel",
+                "Dexland",
+                "Hylex",
+                "BlocksMC",
+                "Grim-2.3.71",
+                "Grim-2.3.44-MC1.17",
+                "AAC-4.4.2",
+                "Intave-2026-10-02",
+            ]
+        );
+    }
+}

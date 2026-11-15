@@ -10488,3 +10488,607 @@ mod velocity_reduce_tests {
         );
     }
 }
+
+// ----- velocity/mode/VelocityHypixel20250127.kt (GPL-3.0, (c) 2015-2026 CCBlueX) -----
+//
+// Deprecated upstream: will be removed with the release of 0.43.0 and
+// ported to LiquidBounce Legacy Add-on.
+
+/// Upstream `VelocityHypixel20250127.absorbedVelocity`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct VelocityHypixelState {
+    pub absorbed_velocity: bool,
+}
+
+/// What the packet handler did with a `PacketEvent`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum VelocityHypixelPacketOutcome {
+    /// `ModuleFly.enabled` short-circuit, or not a local SetEntityMotion.
+    Untouched,
+    /// First in-air velocity update cancelled and absorbed.
+    CancelledAndAbsorbed,
+    /// The packet movement was rewritten to the player's own delta x/z.
+    MovementReplaced { x: f64, z: f64 },
+}
+
+/// Upstream `packetHandler`, a `handler` on `PacketEvent`. `ModuleFly.enabled`
+/// arrives as `fly_enabled`.
+pub fn velocity_hypixel_packet_handler(
+    state: &mut VelocityHypixelState,
+    fly_enabled: bool,
+    is_set_entity_motion: bool,
+    packet_id_matches_player: bool,
+    on_ground: bool,
+    delta_x: f64,
+    delta_z: f64,
+) -> VelocityHypixelPacketOutcome {
+    if fly_enabled {
+        return VelocityHypixelPacketOutcome::Untouched;
+    }
+
+    // Check if this is a regular velocity update
+    if is_set_entity_motion && packet_id_matches_player {
+        if !on_ground && !state.absorbed_velocity {
+            // event.cancelEvent()
+            state.absorbed_velocity = true;
+            return VelocityHypixelPacketOutcome::CancelledAndAbsorbed;
+        }
+
+        // packet.movement.x = player.deltaMovement.x
+        // packet.movement.z = player.deltaMovement.z
+        return VelocityHypixelPacketOutcome::MovementReplaced {
+            x: delta_x,
+            z: delta_z,
+        };
+    }
+
+    VelocityHypixelPacketOutcome::Untouched
+}
+
+/// Upstream `gameHandler`, a `handler` on `GameTickEvent`.
+pub fn velocity_hypixel_game_tick_handler(state: &mut VelocityHypixelState, on_ground: bool) {
+    if on_ground {
+        state.absorbed_velocity = false;
+    }
+}
+
+/// Upstream `disable()` (`super.disable()` included).
+pub fn velocity_hypixel_disable(state: &mut VelocityHypixelState) {
+    state.absorbed_velocity = false;
+}
+
+// ----- velocity/mode/VelocityGrim2371.kt (GPL-3.0, (c) 2015-2026 CCBlueX) -----
+//
+// Grim anticheat (2.3.71) bypass: cancels the damage velocity, queues
+// incoming packets, then clicks the block under the player with a 90-degree
+// pitch rotation to confirm the position.
+
+/// Upstream `VelocityMode("Grim-2.3.71", aliases = listOf("Grim2371"))`.
+pub const VELOCITY_GRIM_NAME: &str = "Grim-2.3.71";
+pub const VELOCITY_GRIM_ALIASES: [&str; 1] = ["Grim2371"];
+
+/// Upstream `MAX_FREEZE_TICKS = 20` (to prevent freezing).
+pub const VELOCITY_GRIM_MAX_FREEZE_TICKS: i64 = 20;
+
+/// A `BlockHitResult`: the block position hit and the face direction.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VelocityGrimBlockHit {
+    pub block_pos: (i64, i64, i64),
+    pub direction: VelocityGrimDirection,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum VelocityGrimDirection {
+    Up,
+    Down,
+    North,
+    South,
+    West,
+    East,
+}
+
+/// Upstream `BlockPos.relative(direction)`.
+pub fn velocity_grim_hit_relative(hit: VelocityGrimBlockHit) -> (i64, i64, i64) {
+    let (x, y, z) = hit.block_pos;
+    match hit.direction {
+        VelocityGrimDirection::Up => (x, y + 1, z),
+        VelocityGrimDirection::Down => (x, y - 1, z),
+        VelocityGrimDirection::North => (x, y, z - 1),
+        VelocityGrimDirection::South => (x, y, z + 1),
+        VelocityGrimDirection::West => (x - 1, y, z),
+        VelocityGrimDirection::East => (x + 1, y, z),
+    }
+}
+
+/// Upstream state: `cancelNextVelocity`, `delay`, `needClick`,
+/// `waitForPing`, `waitForUpdate`, `hitResult`, `shouldSkip`, `freezeTicks`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct VelocityGrimState {
+    pub cancel_next_velocity: bool,
+    pub delay: bool,
+    pub need_click: bool,
+    pub wait_for_ping: bool,
+    pub wait_for_update: bool,
+    pub hit_result: Option<VelocityGrimBlockHit>,
+    pub should_skip: bool,
+    pub freeze_ticks: i64,
+}
+
+/// Upstream `enable()` (`waitForPing` is deliberately not reset upstream).
+pub fn velocity_grim_enable(state: &mut VelocityGrimState) {
+    state.cancel_next_velocity = false;
+    state.delay = false;
+    state.need_click = false;
+    state.wait_for_update = false;
+    state.hit_result = None;
+    state.should_skip = false;
+    state.freeze_ticks = 0;
+}
+
+/// Upstream `disable()`: `BlinkManager.flush(TransferOrigin.INCOMING)` runs
+/// unconditionally.
+pub fn velocity_grim_disable(_state: &mut VelocityGrimState) -> VelocityReduceDisableOutcome {
+    VelocityReduceDisableOutcome::FlushedIncoming
+}
+
+/// What the sequence packet handler did with a `PacketEvent`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum VelocityGrimPacketOutcome {
+    /// The event is untouched.
+    Untouched,
+    /// An interact/attack/spectator-action/use-item-on packet flagged the
+    /// next tick to skip the click.
+    SkipFlagged,
+    /// A `ServerboundMovePlayerPacket` with a position was cancelled while
+    /// waiting for the block update.
+    CancelledMovePlayer,
+    /// A `ServerboundPongPacket` while waiting for the ping: `waitTicks(1)`
+    /// ran and both waits cleared.
+    PongReceived,
+    /// A `ClientboundBlockUpdatePacket` at the player's block position:
+    /// `waitTicks(1)` ran, `waitForPing` armed, `needClick` cleared.
+    BlockUpdateAtPlayer,
+    /// Waiting (`waitForUpdate || delay`), the event is untouched.
+    Waiting,
+    /// A local-player damage packet armed `cancelNextVelocity`.
+    DamageSeen,
+    /// The damage velocity was cancelled: `delay` armed for the click.
+    VelocityCancelled,
+}
+
+/// Upstream `packetHandler`, a `sequenceHandler` on `PacketEvent`.
+/// `isLocalPlayerVelocity()` takes its default `considerExplosion = true`.
+#[allow(clippy::too_many_arguments)]
+pub fn velocity_grim_packet_handler(
+    state: &mut VelocityGrimState,
+    is_interact_or_attack_or_spectator_or_use_item_on: bool,
+    is_move_player_with_position: bool,
+    is_pong: bool,
+    is_block_update: bool,
+    block_update_pos: Option<(i64, i64, i64)>,
+    player_block_pos: (i64, i64, i64),
+    is_local_player_damage: bool,
+    is_local_player_velocity: bool,
+) -> VelocityGrimPacketOutcome {
+    let mut cancelled = false;
+
+    if is_interact_or_attack_or_spectator_or_use_item_on {
+        state.should_skip = true;
+        return VelocityGrimPacketOutcome::SkipFlagged;
+    }
+
+    if is_move_player_with_position && state.wait_for_update {
+        // event.cancelEvent()
+        cancelled = true;
+    }
+
+    if is_pong && state.wait_for_ping {
+        // waitTicks(1)
+        state.wait_for_update = false;
+        state.wait_for_ping = false;
+        return VelocityGrimPacketOutcome::PongReceived;
+    }
+
+    if cancelled {
+        return VelocityGrimPacketOutcome::CancelledMovePlayer;
+    }
+
+    if let Some(pos) = block_update_pos {
+        if is_block_update && state.wait_for_update && pos == player_block_pos {
+            // waitTicks(1)
+            state.wait_for_ping = true;
+            state.need_click = false;
+            return VelocityGrimPacketOutcome::BlockUpdateAtPlayer;
+        }
+    }
+
+    if state.wait_for_update || state.delay {
+        return VelocityGrimPacketOutcome::Waiting;
+    }
+
+    // Check for damage to make sure it will only cancel damage velocity (that
+    // all we need), and not affect other types of velocity
+    if is_local_player_damage {
+        state.cancel_next_velocity = true;
+        return VelocityGrimPacketOutcome::DamageSeen;
+    } else if state.cancel_next_velocity && is_local_player_velocity {
+        // event.cancelEvent()
+        state.delay = true;
+        state.cancel_next_velocity = false;
+        state.need_click = true;
+        return VelocityGrimPacketOutcome::VelocityCancelled;
+    }
+
+    VelocityGrimPacketOutcome::Untouched
+}
+
+/// What the blink queue handler did with a `BlinkPacketEvent`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum VelocityGrimBlinkOutcome {
+    /// The event is untouched.
+    Untouched,
+    /// Upstream `event.action = BlinkManager.Action.QUEUE`.
+    Queue,
+}
+
+/// Upstream `queuePacketHandler`, a `handler` on `BlinkPacketEvent`.
+pub fn velocity_grim_blink_packet_handler(
+    state: &VelocityGrimState,
+    origin_incoming: bool,
+) -> VelocityGrimBlinkOutcome {
+    if state.wait_for_update || !state.delay || !origin_incoming {
+        return VelocityGrimBlinkOutcome::Untouched;
+    }
+
+    VelocityGrimBlinkOutcome::Queue
+}
+
+/// The `ServerboundMovePlayerPacket` the click sends.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum VelocityGrimClickSend {
+    /// `ServerboundMovePlayerPacket.Rot(player.yRot, 90f, onGround,
+    /// horizontalCollision)`, sent when the server rotation pitch is not 90.
+    Rot {
+        yaw: f32,
+        on_ground: bool,
+        horizontal_collision: bool,
+    },
+    /// `ServerboundMovePlayerPacket.StatusOnly(onGround, horizontalCollision)`.
+    StatusOnly {
+        on_ground: bool,
+        horizontal_collision: bool,
+    },
+}
+
+/// What the player tick handler did on a `PlayerTickEvent`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum VelocityGrimTickOutcome {
+    /// Nothing happened.
+    Untouched,
+    /// The click ran: incoming flush, `useItemOn` (with `swing` telling
+    /// whether `shouldSwingHand()` triggered the DO_NOT_HIDE swing) and the
+    /// rotation/status packet sent.
+    Clicked { swing: bool, sent: VelocityGrimClickSend },
+    /// The tick was cancelled while waiting for the block update.
+    Frozen,
+    /// The freeze cap (`MAX_FREEZE_TICKS = 20`) was exceeded and all waits
+    /// cleared.
+    FreezeCapCleared,
+}
+
+/// Upstream `playerTickHandler`, a `handler` on `PlayerTickEvent`. The
+/// `traceFromPlayer(rotation = serverRotation.copy(pitch = 90F))` raytrace
+/// arrives resolved as `trace_hit`, and `useItemOn` as `use_item_on_swing`.
+#[allow(clippy::too_many_arguments)]
+pub fn velocity_grim_player_tick_handler(
+    state: &mut VelocityGrimState,
+    trace_hit: Option<VelocityGrimBlockHit>,
+    player_block_pos: (i64, i64, i64),
+    is_using_item: bool,
+    server_rotation_pitch: f32,
+    player_yaw: f32,
+    on_ground: bool,
+    horizontal_collision: bool,
+    use_item_on_swing: bool,
+) -> VelocityGrimTickOutcome {
+    let mut outcome = VelocityGrimTickOutcome::Untouched;
+
+    if state.need_click && !state.should_skip && !is_using_item {
+        state.hit_result = trace_hit
+            .filter(|hit| velocity_grim_hit_relative(*hit) == player_block_pos);
+    }
+
+    if state.hit_result.is_some() {
+        state.delay = false;
+
+        // BlinkManager.flush(TransferOrigin.INCOMING)
+        // interaction.useItemOn(player, MAIN_HAND, hitResult).shouldSwingHand()
+        //   -> SwingMode.DO_NOT_HIDE.interactSwing(MAIN_HAND)
+        let swing = use_item_on_swing;
+
+        let sent = if server_rotation_pitch != 90.0 {
+            VelocityGrimClickSend::Rot {
+                yaw: player_yaw,
+                on_ground,
+                horizontal_collision,
+            }
+        } else {
+            VelocityGrimClickSend::StatusOnly {
+                on_ground,
+                horizontal_collision,
+            }
+        };
+
+        state.freeze_ticks = 0;
+        state.wait_for_update = true;
+        state.hit_result = None;
+        state.need_click = false;
+        outcome = VelocityGrimTickOutcome::Clicked { swing, sent };
+    }
+
+    if state.wait_for_update {
+        // event.cancelEvent()
+        state.freeze_ticks += 1;
+        if state.freeze_ticks > VELOCITY_GRIM_MAX_FREEZE_TICKS {
+            state.wait_for_update = false;
+            state.wait_for_ping = false;
+            state.need_click = false;
+            return VelocityGrimTickOutcome::FreezeCapCleared;
+        } else if outcome == VelocityGrimTickOutcome::Untouched {
+            outcome = VelocityGrimTickOutcome::Frozen;
+        }
+    }
+
+    state.should_skip = false;
+    outcome
+}
+
+#[cfg(test)]
+mod velocity_hypixel_grim_tests {
+    use super::*;
+
+    #[test]
+    fn velocity_hypixel_cancels_the_first_air_velocity_and_rewrites_the_rest() {
+        let mut state = VelocityHypixelState::default();
+
+        // Fly enabled short-circuits everything
+        assert_eq!(
+            velocity_hypixel_packet_handler(&mut state, true, true, true, false, 0.3, 0.4),
+            VelocityHypixelPacketOutcome::Untouched
+        );
+
+        // Not a SetEntityMotion for the local player: untouched
+        assert_eq!(
+            velocity_hypixel_packet_handler(&mut state, false, false, true, false, 0.3, 0.4),
+            VelocityHypixelPacketOutcome::Untouched
+        );
+
+        // First in-air velocity: cancelled and absorbed
+        assert_eq!(
+            velocity_hypixel_packet_handler(&mut state, false, true, true, false, 0.3, 0.4),
+            VelocityHypixelPacketOutcome::CancelledAndAbsorbed
+        );
+        assert!(state.absorbed_velocity);
+
+        // The next in-air velocity: movement rewritten to the player delta
+        assert_eq!(
+            velocity_hypixel_packet_handler(&mut state, false, true, true, false, 0.3, 0.4),
+            VelocityHypixelPacketOutcome::MovementReplaced { x: 0.3, z: 0.4 }
+        );
+
+        // On the ground the absorbed flag resets
+        velocity_hypixel_game_tick_handler(&mut state, true);
+        assert!(!state.absorbed_velocity);
+        // ...and the first air velocity cancels again
+        assert_eq!(
+            velocity_hypixel_packet_handler(&mut state, false, true, true, false, 0.3, 0.4),
+            VelocityHypixelPacketOutcome::CancelledAndAbsorbed
+        );
+
+        // disable() clears the flag
+        velocity_hypixel_disable(&mut state);
+        assert!(!state.absorbed_velocity);
+    }
+
+    #[test]
+    fn velocity_grim_packet_flow_cancels_the_damage_velocity_once() {
+        let mut state = VelocityGrimState::default();
+        velocity_grim_enable(&mut state);
+
+        // Interact/attack/use-item-on packets flag the skip
+        assert_eq!(
+            velocity_grim_packet_handler(&mut state, true, false, false, false, None, (0, 0, 0), false, false),
+            VelocityGrimPacketOutcome::SkipFlagged
+        );
+        assert!(state.should_skip);
+
+        // Damage recorded, then the velocity cancelled and the click armed
+        assert_eq!(
+            velocity_grim_packet_handler(&mut state, false, false, false, false, None, (0, 0, 0), true, false),
+            VelocityGrimPacketOutcome::DamageSeen
+        );
+        assert!(state.cancel_next_velocity);
+        assert_eq!(
+            velocity_grim_packet_handler(&mut state, false, false, false, false, None, (0, 0, 0), false, true),
+            VelocityGrimPacketOutcome::VelocityCancelled
+        );
+        assert!(state.delay);
+        assert!(state.need_click);
+        assert!(!state.cancel_next_velocity);
+
+        // While delay holds, further packets wait
+        assert_eq!(
+            velocity_grim_packet_handler(&mut state, false, false, false, false, None, (0, 0, 0), true, false),
+            VelocityGrimPacketOutcome::Waiting
+        );
+
+        // Incoming packets queue while delay is on and not waiting for an update
+        assert_eq!(
+            velocity_grim_blink_packet_handler(&state, true),
+            VelocityGrimBlinkOutcome::Queue
+        );
+        assert_eq!(
+            velocity_grim_blink_packet_handler(&state, false),
+            VelocityGrimBlinkOutcome::Untouched
+        );
+    }
+
+    #[test]
+    fn velocity_grim_block_update_and_pong_clear_the_waits() {
+        let mut state = VelocityGrimState::default();
+        velocity_grim_enable(&mut state);
+        state.delay = true;
+        state.need_click = true;
+
+        // The click ran, so the mode waits for the block update
+        state.wait_for_update = true;
+
+        // Move player packets with a position are cancelled while waiting
+        assert_eq!(
+            velocity_grim_packet_handler(&mut state, false, true, false, false, None, (5, 60, 5), false, false),
+            VelocityGrimPacketOutcome::CancelledMovePlayer
+        );
+
+        // A block update elsewhere does nothing
+        assert_eq!(
+            velocity_grim_packet_handler(&mut state, false, false, false, true, Some((9, 60, 9)), (5, 60, 5), false, false),
+            VelocityGrimPacketOutcome::Waiting
+        );
+
+        // The block update at the player's own block position: ping armed
+        assert_eq!(
+            velocity_grim_packet_handler(&mut state, false, false, false, true, Some((5, 60, 5)), (5, 60, 5), false, false),
+            VelocityGrimPacketOutcome::BlockUpdateAtPlayer
+        );
+        assert!(state.wait_for_ping);
+        assert!(!state.need_click);
+
+        // Incoming packets no longer queue while waiting for the update
+        assert_eq!(
+            velocity_grim_blink_packet_handler(&state, true),
+            VelocityGrimBlinkOutcome::Untouched
+        );
+
+        // The pong clears both waits after waitTicks(1)
+        assert_eq!(
+            velocity_grim_packet_handler(&mut state, false, false, true, false, None, (5, 60, 5), false, false),
+            VelocityGrimPacketOutcome::PongReceived
+        );
+        assert!(!state.wait_for_ping);
+        assert!(!state.wait_for_update);
+
+        // disable() always flushes
+        assert_eq!(
+            velocity_grim_disable(&mut state),
+            VelocityReduceDisableOutcome::FlushedIncoming
+        );
+    }
+
+    #[test]
+    fn velocity_grim_click_arms_from_the_trace_and_freezes() {
+        let mut state = VelocityGrimState::default();
+        velocity_grim_enable(&mut state);
+        state.delay = true;
+        state.need_click = true;
+
+        // A trace that does not resolve to the block above the player's own
+        // block position is dropped
+        let miss = VelocityGrimBlockHit {
+            block_pos: (9, 60, 9),
+            direction: VelocityGrimDirection::Up,
+        };
+        let hit = VelocityGrimBlockHit {
+            block_pos: (5, 59, 5),
+            direction: VelocityGrimDirection::Up,
+        };
+        assert_eq!(
+            velocity_grim_player_tick_handler(
+                &mut state, Some(miss), (5, 60, 5), false, 0.0, 10.0, true, false, true
+            ),
+            VelocityGrimTickOutcome::Untouched
+        );
+        assert_eq!(state.hit_result, None);
+
+        // The right trace arms the hit and the click runs in the same tick:
+        // flush, useItemOn swing, rotation packet, freeze armed
+        assert_eq!(
+            velocity_grim_player_tick_handler(
+                &mut state, Some(hit), (5, 60, 5), false, 0.0, 10.0, true, false, true
+            ),
+            VelocityGrimTickOutcome::Clicked {
+                swing: true,
+                sent: VelocityGrimClickSend::Rot {
+                    yaw: 10.0,
+                    on_ground: true,
+                    horizontal_collision: false
+                }
+            }
+        );
+        assert_eq!(state.hit_result, None);
+        assert!(state.wait_for_update);
+        assert!(!state.delay);
+        assert!(!state.need_click);
+
+        // Waiting ticks freeze the player event
+        assert_eq!(
+            velocity_grim_player_tick_handler(
+                &mut state, None, (5, 60, 5), false, 0.0, 10.0, true, false, true
+            ),
+            VelocityGrimTickOutcome::Frozen
+        );
+        // the click tick itself also froze (upstream freezes in the same handler pass)
+        assert_eq!(state.freeze_ticks, 2);
+
+        // Using the item blocks the trace arm; shouldSkip skips it too
+        state.wait_for_update = false;
+        state.need_click = true;
+        state.should_skip = true;
+        assert_eq!(
+            velocity_grim_player_tick_handler(
+                &mut state, Some(hit), (5, 60, 5), false, 0.0, 10.0, true, false, true
+            ),
+            VelocityGrimTickOutcome::Untouched
+        );
+        assert_eq!(state.hit_result, None);
+        // shouldSkip clears at the end of every tick
+        assert!(!state.should_skip);
+
+        // Server pitch already at 90 sends the status-only packet (still in
+        // the same tick as the trace)
+        let mut state = VelocityGrimState::default();
+        velocity_grim_enable(&mut state);
+        state.need_click = true;
+        assert_eq!(
+            velocity_grim_player_tick_handler(
+                &mut state, Some(hit), (5, 60, 5), false, 90.0, 10.0, true, false, false
+            ),
+            VelocityGrimTickOutcome::Clicked {
+                swing: false,
+                sent: VelocityGrimClickSend::StatusOnly {
+                    on_ground: true,
+                    horizontal_collision: false
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn velocity_grim_freeze_cap_clears_the_waits() {
+        let mut state = VelocityGrimState::default();
+        velocity_grim_enable(&mut state);
+        state.wait_for_update = true;
+        state.wait_for_ping = true;
+        state.need_click = true;
+        state.freeze_ticks = VELOCITY_GRIM_MAX_FREEZE_TICKS;
+
+        assert_eq!(
+            velocity_grim_player_tick_handler(
+                &mut state, None, (5, 60, 5), false, 0.0, 10.0, true, false, true
+            ),
+            VelocityGrimTickOutcome::FreezeCapCleared
+        );
+        assert!(!state.wait_for_update);
+        assert!(!state.wait_for_ping);
+        assert!(!state.need_click);
+    }
+}

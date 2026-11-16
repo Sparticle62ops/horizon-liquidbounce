@@ -27470,3 +27470,952 @@ mod ca_damage_options_tests {
         assert_ne!(oldest.crystal, (1.0, 64.0, 1.0));
     }
 }
+// ----- combat/elytratarget/*.kt (GPL-3.0, upstream credit CCBlueX) -----
+
+/// Upstream `LivingEntity` slice the elytratarget modules read: position,
+/// delta movement, bounding-box height, eye position and the elytra
+/// (`isFallFlying`) state.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EtEntity {
+    /// `entity.position()`
+    pub pos: Vec3,
+    /// `entity.deltaMovement`
+    pub delta_movement: Vec3,
+    /// `entity.bbHeight`
+    pub bb_height: f64,
+    /// `entity.eyePosition`
+    pub eye_pos: Vec3,
+    /// `entity.isFallFlying`
+    pub fall_flying: bool,
+}
+
+/// Upstream `TargetRotatePosition` (elytratarget/TargetRotatePosition.kt).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EtRotatePosition {
+    /// EYES("Eyes", { it.eyePosition })
+    Eyes,
+    /// CENTER("Center", { it.position().add(0.0, it.bbHeight / 2.0, 0.0) })
+    Center,
+}
+
+impl EtRotatePosition {
+    fn position(self, target: &EtEntity) -> Vec3 {
+        match self {
+            EtRotatePosition::Eyes => target.eye_pos,
+            EtRotatePosition::Center => Vec3 {
+                x: target.pos.x,
+                y: target.pos.y + target.bb_height / 2.0,
+                z: target.pos.z,
+            },
+        }
+    }
+}
+
+/// Upstream `PredictMode` (private enum in TargetEntityMovementPrediction.kt).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EtPredictMode {
+    /// SIMPLE("Simple", { targetPosition.fma(multiplier, target.deltaMovement) })
+    Simple,
+    /// WITH_GRAVITY("WithGravity", { SIMPLE.predict(...) - Vec3(0, 0.5 * 0.05 * multiplier^2, 0) })
+    WithGravity,
+}
+
+impl EtPredictMode {
+    fn predict(self, target: &EtEntity, target_position: Vec3, multiplier: f64) -> Vec3 {
+        match self {
+            EtPredictMode::Simple => et_fma(target_position, multiplier, target.delta_movement),
+            EtPredictMode::WithGravity => {
+                let simple = et_fma(target_position, multiplier, target.delta_movement);
+                Vec3 {
+                    x: simple.x,
+                    y: simple.y - 0.5 * 0.05 * multiplier * multiplier,
+                    z: simple.z,
+                }
+            }
+        }
+    }
+}
+
+/// Upstream `MovementCorrection` for the rotation plan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EtMovementCorrection {
+    Strict,
+    ChangeLook,
+}
+
+/// Upstream `RotationManager.setRotationTarget(plan, priority, provider)`
+/// record for the elytra rotation update (`RotationTarget` plan).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EtRotationTargetCall {
+    pub rotation: Rotation,
+    /// `RotationTarget.entity`
+    pub entity_pos: Vec3,
+    pub ticks_until_reset: u32,
+    pub reset_threshold: f32,
+    pub consider_inventory: bool,
+    pub movement_correction: EtMovementCorrection,
+}
+
+/// Upstream `HotbarItemSlot` slice AutoFirework reads (firework rocket slot).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EtHotbarSlot {
+    /// `slot.hotbarIndex` (null for the offhand slot)
+    pub hotbar_index: Option<i32>,
+    /// `slot.useHand`
+    pub use_hand: u8,
+}
+
+fn et_fma(a: Vec3, multiplier: f64, operand: Vec3) -> Vec3 {
+    Vec3 {
+        x: multiplier * operand.x + a.x,
+        y: multiplier * operand.y + a.y,
+        z: multiplier * operand.z + a.z,
+    }
+}
+
+fn et_sub(a: Vec3, b: Vec3) -> Vec3 {
+    Vec3 { x: a.x - b.x, y: a.y - b.y, z: a.z - b.z }
+}
+
+/// Upstream `Vec3.normalize` (zero length returns the zero vector).
+fn et_normalize(v: Vec3) -> Vec3 {
+    let length = (v.x * v.x + v.y * v.y + v.z * v.z).sqrt();
+    if length == 0.0 {
+        Vec3 { x: 0.0, y: 0.0, z: 0.0 }
+    } else {
+        Vec3 { x: v.x / length, y: v.y / length, z: v.z / length }
+    }
+}
+
+fn et_distance_to_sq(a: Vec3, b: Vec3) -> f64 {
+    let d = et_sub(a, b);
+    d.x * d.x + d.y * d.y + d.z * d.z
+}
+
+/// Upstream `Math.clamp(value, min, max)`.
+fn et_clamp(value: f32, min: f32, max: f32) -> f32 {
+    if value < min {
+        min
+    } else if value > max {
+        max
+    } else {
+        value
+    }
+}
+
+/// Upstream `ModuleElytraTarget` settings (`Safe`, `AlwaysGlide`), the
+/// `Rotations` group (`Sharp`, `IgnoreKillAuraRotation`, `Look`,
+/// `AutoDistance`, `RotateAt`), the `Prediction` group (`Mode`,
+/// `GlidingOnly`, `Multiplier`), the `AutoFirework` group (`UseMode`,
+/// `ExtraDistance`, `SlotResetDelay`, `SyncCooldownWithKillAura`,
+/// `Cooldown`) and the `TargetRenderer` toggle, plus the `TargetTracker`
+/// defaults.
+pub fn elytra_target() -> Module {
+    Module::new(
+        "ElytraTarget",
+        COMBAT,
+        vec![
+            // TargetTracker() defaults
+            float("Range", 4.5, 1.0, 12.0),
+            multi_choice("Priority", &["Type", "Health"], &["Type", "Distance", "Health", "Direction", "Fov"]),
+            float("FOV", 180.0, 0.0, 180.0),
+            int("HurtTime", 10, 0, 10),
+            boolean("Safe", true),
+            boolean("AlwaysGlide", false),
+            // TargetRenderer(this, targetTracker) (render seam)
+            boolean("TargetRenderer", true),
+            // ElytraRotationProcessor (ValueGroup "Rotations")
+            boolean("Sharp", false),
+            boolean("IgnoreKillAuraRotation", true),
+            boolean("Look", false),
+            boolean("AutoDistance", true),
+            choice("RotateAt", "Eyes", &["Eyes", "Center"]),
+            // TargetEntityMovementPrediction (ToggleableValueGroup "Prediction", true)
+            boolean("Prediction", true),
+            choice("Mode", "Simple", &["Simple", "WithGravity"]),
+            boolean("GlidingOnly", true),
+            float_range("Multiplier", 1.8, 2.0, 0.5, 3.0),
+            // AutoFirework (ToggleableValueGroup "AutoFirework", true)
+            boolean("AutoFirework", true),
+            choice("UseMode", "Normal", &["Normal", "Packet"]),
+            float("ExtraDistance", 50.0, 5.0, 100.0),
+            int_range("SlotResetDelay", 0, 0, 0, 20),
+            boolean("SyncCooldownWithKillAura", false),
+            int_range("Cooldown", 8, 10, 1, 50),
+        ],
+    )
+}
+
+/// Engine seams the elytratarget modules read.
+pub trait EtEngine {
+    /// `ModuleElytraTarget` enabled state (the `super.running` leg).
+    fn et_module_enabled(&mut self) -> bool;
+    /// `player.isFallFlying`
+    fn player_fall_flying(&mut self) -> bool;
+    /// `player.abilities.flying`
+    fn player_abilities_flying(&mut self) -> bool;
+    /// `player.position()`
+    fn player_position(&mut self) -> Vec3;
+    /// `player.inventory.selectedSlot`
+    fn player_selected_slot(&mut self) -> i32;
+    /// `player.inventory.selectedSlot = index`
+    fn set_selected_slot(&mut self, index: i32);
+    /// `player.yRot`
+    fn player_yaw(&mut self) -> f32;
+    /// `player.xRot`
+    fn player_pitch(&mut self) -> f32;
+    /// `world.noCollision(player.boundingBox.move(player.deltaMovement))`
+    fn world_no_collision_moved(&mut self) -> bool;
+    /// `player.push(0.0, 0.1, 0.0)`
+    fn player_push(&mut self, dy: f64);
+    /// `targetTracker.selectFirst { player.hasLineOfSight(it) }`
+    fn select_first_with_los(&mut self) -> Option<EtEntity>;
+    /// `System.currentTimeMillis()`
+    fn now_ms(&mut self) -> u64;
+    /// `Random.nextDouble()`
+    fn random_next_double(&mut self) -> f64;
+    /// `RotationManager.setRotationTarget(plan, priority, provider)` calls, in order.
+    fn set_rotation_target(&mut self, call: EtRotationTargetCall);
+    /// `ModuleKillAura.running`
+    fn kill_aura_running(&mut self) -> bool;
+    /// `KillAura.clicker.isClickTick`
+    fn kill_aura_click_tick(&mut self) -> bool;
+    /// `KillAura.targetTracker.target?.squaredBoxedDistanceTo(player)`
+    fn kill_aura_target_squared_distance(&mut self) -> Option<f64>;
+    /// `KillAura.range.interactionRange.sq()`
+    fn kill_aura_interaction_range_sq(&mut self) -> f64;
+    /// `target.squaredBoxedDistanceTo(player)` for the elytra target.
+    fn et_target_squared_boxed_distance_to_player(&mut self, target: &EtEntity) -> f64;
+    /// `Slots.OffhandWithHotbar.findSlot(Items.FIREWORK_ROCKET)`
+    fn find_firework_slot(&mut self) -> Option<EtHotbarSlot>;
+    /// `useHotbarSlotOrOffhand(slot, resetDelay)`
+    fn use_hotbar_slot_or_offhand(&mut self, slot: &EtHotbarSlot, reset_delay: i64);
+    /// `network.sendHeldItemChange(index)`
+    fn send_held_item_change(&mut self, index: i32);
+    /// `interaction.startPrediction { ServerboundUseItemPacket(slot.useHand, sequence, player.yRot, player.xRot) }`
+    fn send_use_item_packet(&mut self, use_hand: u8, yaw: f32, pitch: f32);
+    /// `waitTicks(1)` inside `canUseFirework`
+    fn wait_ticks(&mut self, ticks: u32);
+}
+
+/// Module state: the target tracker plus the AutoFirework runtime fields.
+#[derive(Clone, Debug, Default)]
+pub struct ElytraTargetState {
+    /// `targetTracker.target`
+    pub target: Option<EtEntity>,
+    /// `fireworkCooldown` (initial 750)
+    pub firework_cooldown: u64,
+    /// `fireworkChronometer`
+    pub firework_chronometer: Chronometer,
+    /// `waitTicks(1)` suspension inside `canUseFirework`, resumed next tick
+    pub waiting_use: bool,
+    /// target captured when the wait was scheduled
+    pub wait_target: Option<EtEntity>,
+}
+
+pub fn elytra_target_state() -> ElytraTargetState {
+    ElytraTargetState { firework_cooldown: 750, ..Default::default() }
+}
+
+/// Upstream `ModuleElytraTarget.running` = super.running && player.isFallFlying.
+pub fn et_running(hooks: &mut dyn EtEngine) -> bool {
+    hooks.et_module_enabled() && hooks.player_fall_flying()
+}
+
+/// Upstream `ModuleElytraTarget.canAlwaysGlide`.
+pub fn et_can_always_glide(module: &Module, state: &ElytraTargetState, hooks: &mut dyn EtEngine) -> bool {
+    setting_bool(module, "AlwaysGlide", false)
+        && state.target.is_some()
+        && hooks.et_module_enabled()
+        && !hooks.player_abilities_flying()
+}
+
+/// Upstream `ModuleElytraTarget.canIgnoreKillAuraRotations`.
+pub fn et_can_ignore_kill_aura_rotations(module: &Module, hooks: &mut dyn EtEngine) -> bool {
+    et_running(hooks) && setting_bool(module, "IgnoreKillAuraRotation", true)
+}
+
+/// Upstream `ModuleElytraTarget.isSameTargetRendering`.
+pub fn et_is_same_target_rendering(
+    module: &Module,
+    state: &ElytraTargetState,
+    hooks: &mut dyn EtEngine,
+    target: &EtEntity,
+) -> bool {
+    et_running(hooks)
+        && setting_bool(module, "TargetRenderer", true)
+        && state.target.map_or(false, |t| t == *target)
+}
+
+/// Upstream `targetUpdateHandler` (tickHandler): reset + LOS select, then the
+/// Safe push against the moved bounding box.
+pub fn et_target_update(module: &Module, state: &mut ElytraTargetState, hooks: &mut dyn EtEngine) {
+    state.target = None; // targetTracker.reset()
+    state.target = hooks.select_first_with_los(); // selectFirst { hasLineOfSight }
+    if setting_bool(module, "Safe", true) && !hooks.world_no_collision_moved() {
+        hooks.player_push(0.1);
+    }
+}
+
+/// Upstream `ModuleElytraTarget.onDisabled` (`targetTracker.reset()`).
+pub fn et_on_disabled(state: &mut ElytraTargetState) {
+    state.target = None;
+}
+
+/// Upstream `TargetEntityMovementPrediction.predictPosition`.
+pub fn et_predict_position(module: &Module, hooks: &mut dyn EtEngine, target: &EtEntity, target_position: Vec3) -> Vec3 {
+    let enabled = setting_bool(module, "Prediction", true);
+    let gliding_only = setting_bool(module, "GlidingOnly", true);
+    if !enabled || (gliding_only && !target.fall_flying) {
+        return target_position;
+    }
+    let mode = match module.setting("Mode").and_then(|v| v.kind.choice()) {
+        Some("WithGravity") => EtPredictMode::WithGravity,
+        _ => EtPredictMode::Simple,
+    };
+    let (lo, hi) = setting_float_range(module, "Multiplier", (1.8, 2.0));
+    let multiplier = lo + hooks.random_next_double() * (hi - lo);
+    mode.predict(target, target_position, multiplier)
+}
+
+/// Upstream `ElytraRotationProcessor.process` (adaptive smoothing).
+pub fn et_process(module: &Module, hooks: &mut dyn EtEngine, current: Rotation, target: Rotation) -> Rotation {
+    let sharp = setting_bool(module, "Sharp", false);
+    let delta_yaw = angle_difference(target.yaw, current.yaw);
+    let delta_pitch = target.pitch - current.pitch;
+    let difference = (delta_yaw * delta_yaw + delta_pitch * delta_pitch).sqrt();
+
+    let current_time = hooks.now_ms() as f64;
+
+    let should_boost = (current_time / 300.0).sin() > 0.8;
+    let is_target_behind = delta_yaw.abs() > 90.0;
+
+    let speed_multiplier: f64 = if should_boost { 2.0 } else { 1.2 };
+
+    let smooth_boost: f64 = if should_boost {
+        ((current_time % 360.0) / 300.0 * std::f64::consts::PI).sin() * 0.8 + 1.2
+    } else {
+        1.2
+    };
+
+    let back_target_multiplier: f64 = if is_target_behind {
+        2.2 * (current_time / 150.0).sin() * 0.2 + 1.0
+    } else {
+        1.2
+    };
+
+    let speed = speed_multiplier * smooth_boost;
+
+    let base_yaw_speed = if sharp { 45.0 * 1.5 } else { 45.0 };
+    let base_pitch_speed = if sharp { 35.0 * 1.5 } else { 35.0 };
+    let yaw_speed = base_yaw_speed * speed * back_target_multiplier;
+    let pitch_speed = base_pitch_speed * speed;
+
+    let micro_adjustment =
+        ((current_time / 80.0).sin() * 0.08 + (current_time / 120.0).cos() * 0.05) as f32;
+
+    let mut move_yaw = et_clamp(delta_yaw, -(yaw_speed as f32), yaw_speed as f32);
+    let mut move_pitch = et_clamp(delta_pitch, -(pitch_speed as f32), pitch_speed as f32);
+
+    if difference < 5.0 {
+        move_yaw += micro_adjustment * 0.2;
+        move_pitch += micro_adjustment * 0.8;
+    }
+
+    Rotation {
+        yaw: current.yaw + move_yaw,
+        pitch: et_clamp(current.pitch + move_pitch, -90.0, 90.0),
+    }
+}
+
+/// Upstream `rotationsUpdate` (handler<RotationUpdateEvent>).
+pub fn et_rotations_update(module: &Module, state: &ElytraTargetState, hooks: &mut dyn EtEngine) {
+    let target = match state.target {
+        Some(t) => t,
+        None => return,
+    };
+
+    let correction = if setting_bool(module, "Look", false) {
+        EtMovementCorrection::ChangeLook
+    } else {
+        EtMovementCorrection::Strict
+    };
+
+    let rotation = et_calculate_rotation(module, hooks, &target);
+    hooks.set_rotation_target(EtRotationTargetCall {
+        rotation,
+        entity_pos: target.pos,
+        ticks_until_reset: 1,
+        reset_threshold: 1.0,
+        consider_inventory: true,
+        movement_correction: correction,
+    });
+}
+
+/// Upstream `ElytraRotationProcessor.calculateRotation`.
+fn et_calculate_rotation(module: &Module, hooks: &mut dyn EtEngine, target: &EtEntity) -> Rotation {
+    let rotate_at = match module.setting("RotateAt").and_then(|v| v.kind.choice()) {
+        Some("Center") => EtRotatePosition::Center,
+        _ => EtRotatePosition::Eyes,
+    };
+    let predicted = et_predict_position(module, hooks, target, rotate_at.position(target));
+    let mut target_pos = et_fma(predicted, 4.0, et_random_direction_vector(hooks));
+
+    if setting_bool(module, "AutoDistance", true) {
+        let from = hooks.player_position();
+        let direction = et_normalize(et_sub(target_pos, from));
+        let distance = et_distance_to_sq(from, direction);
+
+        if distance < 10.0 * 10.0 {
+            target_pos = et_fma(target_pos, distance - 10.0, direction);
+        }
+    }
+
+    Rotation::looking_at(target_pos, hooks.player_position())
+}
+
+/// Upstream `ElytraRotationProcessor.randomDirectionVector`.
+fn et_random_direction_vector(hooks: &mut dyn EtEngine) -> Vec3 {
+    let t = hooks.now_ms() as f64 / 1000.0;
+    Vec3 {
+        x: (t * 1.8).sin() * 0.04 + (hooks.random_next_double() - 0.5) * 0.02,
+        y: (t * 2.2).sin() * 0.03 + (hooks.random_next_double() - 0.5) * 0.015,
+        z: (t * 1.8).cos() * 0.04 + (hooks.random_next_double() - 0.5) * 0.02,
+    }
+}
+
+/// Upstream `FireworkUseMode` (private enum in AutoFirework.kt).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EtFireworkUseMode {
+    /// NORMAL("Normal", { useHotbarSlotOrOffhand(slot, resetDelay) })
+    Normal,
+    /// PACKET("Packet", { silent slot switch + ServerboundUseItemPacket + restore })
+    Packet,
+}
+
+/// Upstream `AutoFirework.canUseFirework` tri-state: use now, wait one tick
+/// then use, or skip this tick.
+enum EtCanUse {
+    Ready,
+    WaitThenReady,
+    No,
+}
+
+fn et_can_use_firework(hooks: &mut dyn EtEngine, sync_cooldown: bool) -> EtCanUse {
+    let in_sync_window = hooks.kill_aura_click_tick()
+        && hooks
+            .kill_aura_target_squared_distance()
+            .map_or(false, |d| d >= hooks.kill_aura_interaction_range_sq());
+    if !hooks.kill_aura_running() || !sync_cooldown || in_sync_window {
+        return EtCanUse::Ready;
+    }
+    // The KillAura is ready to perform the click; use the firework on the
+    // next tick, after KillAura performed the click.
+    if hooks.kill_aura_click_tick() {
+        hooks.wait_ticks(1);
+        EtCanUse::WaitThenReady
+    } else {
+        EtCanUse::No
+    }
+}
+
+/// Upstream `AutoFirework.autoFireworkHandler` (tickHandler).
+pub fn et_auto_firework_tick(module: &Module, state: &mut ElytraTargetState, hooks: &mut dyn EtEngine) {
+    if state.waiting_use {
+        // The coroutine resumes inside `waitTicks(1)`: the use path runs now.
+        state.waiting_use = false;
+        let target = state.wait_target.take();
+        if let Some(slot) = hooks.find_firework_slot() {
+            let (lo, hi) = setting_int_range(module, "SlotResetDelay", (0, 0));
+            let reset_delay = et_random_int_in(lo, hi, hooks);
+            et_use_firework_slot(module, hooks, &slot, reset_delay);
+            state.firework_chronometer.reset(hooks.now_ms());
+        }
+        if let Some(target) = target {
+            et_update_firework_cooldown(module, state, hooks, &target);
+        }
+        return;
+    }
+    let target = match state.target {
+        Some(t) => t,
+        None => return,
+    };
+
+    let cooldown_reached = state
+        .firework_chronometer
+        .has_elapsed(hooks.now_ms(), state.firework_cooldown * 50);
+    if cooldown_reached {
+        let sync = setting_bool(module, "SyncCooldownWithKillAura", false);
+        match et_can_use_firework(hooks, sync) {
+            EtCanUse::Ready => {
+                if let Some(slot) = hooks.find_firework_slot() {
+                    let (lo, hi) = setting_int_range(module, "SlotResetDelay", (0, 0));
+                    let reset_delay = et_random_int_in(lo, hi, hooks);
+                    et_use_firework_slot(module, hooks, &slot, reset_delay);
+                    state.firework_chronometer.reset(hooks.now_ms());
+                }
+            }
+            EtCanUse::WaitThenReady => {
+                state.waiting_use = true;
+                state.wait_target = Some(target);
+            }
+            EtCanUse::No => {}
+        }
+    }
+
+    et_update_firework_cooldown(module, state, hooks, &target);
+}
+
+/// Upstream trailing `fireworkCooldown` update in the tick handler.
+fn et_update_firework_cooldown(
+    module: &Module,
+    state: &mut ElytraTargetState,
+    hooks: &mut dyn EtEngine,
+    target: &EtEntity,
+) {
+    let extra = match module.setting("ExtraDistance").map(|v| &v.kind) {
+        Some(ValueKind::Float(v, _, _)) => *v,
+        _ => 50.0,
+    };
+    let (lo, hi) = setting_int_range(module, "Cooldown", (8, 10));
+    state.firework_cooldown = if hooks.et_target_squared_boxed_distance_to_player(target) > extra * extra {
+        hi as u64
+    } else {
+        lo as u64
+    };
+}
+
+/// Upstream `intRange.random()`: inclusive integer pick from the range.
+fn et_random_int_in(lo: i64, hi: i64, hooks: &mut dyn EtEngine) -> i64 {
+    if hi <= lo {
+        return lo;
+    }
+    let pick = lo + (hooks.random_next_double() * ((hi - lo + 1) as f64)).floor() as i64;
+    pick.min(hi)
+}
+
+/// Upstream `FireworkUseMode.useFireworkSlot`.
+fn et_use_firework_slot(module: &Module, hooks: &mut dyn EtEngine, slot: &EtHotbarSlot, reset_delay: i64) {
+    match module.setting("UseMode").and_then(|v| v.kind.choice()) {
+        Some("Packet") => {
+            let _ = reset_delay; // PACKET ignores the reset delay upstream
+            let cur_slot = hooks.player_selected_slot();
+            let slot_update_flag = slot.hotbar_index.map_or(false, |i| i != cur_slot);
+
+            if slot_update_flag {
+                let index = slot.hotbar_index.unwrap();
+                hooks.set_selected_slot(index);
+                hooks.send_held_item_change(index);
+            }
+
+            let (yaw, pitch) = (hooks.player_yaw(), hooks.player_pitch());
+            hooks.send_use_item_packet(slot.use_hand, yaw, pitch);
+
+            if slot_update_flag {
+                hooks.set_selected_slot(cur_slot);
+                hooks.send_held_item_change(cur_slot);
+            }
+        }
+        // NORMAL
+        _ => hooks.use_hotbar_slot_or_offhand(slot, reset_delay),
+    }
+}
+
+ mod et_elytra_target_tests {
+     use super::*;
+
+     fn vec(x: f64, y: f64, z: f64) -> Vec3 {
+         Vec3 { x, y, z }
+     }
+
+     fn et_target(pos: Vec3, dm: Vec3, bb: f64, eye: Vec3, flying: bool) -> EtEntity {
+         EtEntity { pos, delta_movement: dm, bb_height: bb, eye_pos: eye, fall_flying: flying }
+     }
+
+     fn enable(module: &mut Module, name: &str) {
+         if let Some(v) = module.setting_mut(name) {
+             if let ValueKind::Bool(b) = &mut v.kind {
+                 *b = true;
+             }
+         }
+     }
+
+     fn set_choice(module: &mut Module, name: &str, value: &str) {
+         if let Some(v) = module.setting_mut(name) {
+             if let ValueKind::Choice(s, _) = &mut v.kind {
+                 *s = value.to_string();
+             }
+         }
+     }
+
+     struct EtMock {
+         module_enabled: bool,
+         fall_flying: bool,
+         abilities_flying: bool,
+         player_pos: Vec3,
+         selected_slot: i32,
+         yaw: f32,
+         pitch: f32,
+         no_collision: bool,
+         pushes: Vec<f64>,
+         los_target: Option<EtEntity>,
+         now: u64,
+         rnd: f64,
+         rotation_calls: Vec<EtRotationTargetCall>,
+         ka_running: bool,
+         ka_click_tick: bool,
+         ka_target_sq: Option<f64>,
+         ka_range_sq: f64,
+         target_sq_dist: f64,
+         firework_slot: Option<EtHotbarSlot>,
+         hotbar_uses: Vec<i64>,
+         held_changes: Vec<i32>,
+         use_packets: Vec<(u8, f32, f32)>,
+         waits: Vec<u32>,
+         slot_sets: Vec<i32>,
+     }
+
+     impl Default for EtMock {
+         fn default() -> Self {
+             EtMock {
+                 module_enabled: true,
+                 fall_flying: true,
+                 abilities_flying: false,
+                 player_pos: vec(0.0, 0.0, 0.0),
+                 selected_slot: 0,
+                 yaw: 0.0,
+                 pitch: 0.0,
+                 no_collision: true,
+                 pushes: Vec::new(),
+                 los_target: None,
+                 now: 0,
+                 rnd: 0.0,
+                 rotation_calls: Vec::new(),
+                 ka_running: false,
+                 ka_click_tick: false,
+                 ka_target_sq: None,
+                 ka_range_sq: 25.0,
+                 target_sq_dist: 0.0,
+                 firework_slot: None,
+                 hotbar_uses: Vec::new(),
+                 held_changes: Vec::new(),
+                 use_packets: Vec::new(),
+                 waits: Vec::new(),
+                 slot_sets: Vec::new(),
+             }
+         }
+     }
+
+     impl EtEngine for EtMock {
+         fn et_module_enabled(&mut self) -> bool { self.module_enabled }
+         fn player_fall_flying(&mut self) -> bool { self.fall_flying }
+         fn player_abilities_flying(&mut self) -> bool { self.abilities_flying }
+         fn player_position(&mut self) -> Vec3 { self.player_pos }
+         fn player_selected_slot(&mut self) -> i32 { self.selected_slot }
+         fn set_selected_slot(&mut self, index: i32) { self.slot_sets.push(index); }
+         fn player_yaw(&mut self) -> f32 { self.yaw }
+         fn player_pitch(&mut self) -> f32 { self.pitch }
+         fn world_no_collision_moved(&mut self) -> bool { self.no_collision }
+         fn player_push(&mut self, dy: f64) { self.pushes.push(dy); }
+         fn select_first_with_los(&mut self) -> Option<EtEntity> { self.los_target }
+         fn now_ms(&mut self) -> u64 { self.now }
+         fn random_next_double(&mut self) -> f64 { self.rnd }
+         fn set_rotation_target(&mut self, call: EtRotationTargetCall) { self.rotation_calls.push(call); }
+         fn kill_aura_running(&mut self) -> bool { self.ka_running }
+         fn kill_aura_click_tick(&mut self) -> bool { self.ka_click_tick }
+         fn kill_aura_target_squared_distance(&mut self) -> Option<f64> { self.ka_target_sq }
+         fn kill_aura_interaction_range_sq(&mut self) -> f64 { self.ka_range_sq }
+         fn et_target_squared_boxed_distance_to_player(&mut self, _t: &EtEntity) -> f64 { self.target_sq_dist }
+         fn find_firework_slot(&mut self) -> Option<EtHotbarSlot> { self.firework_slot }
+         fn use_hotbar_slot_or_offhand(&mut self, _slot: &EtHotbarSlot, reset_delay: i64) { self.hotbar_uses.push(reset_delay); }
+         fn send_held_item_change(&mut self, index: i32) { self.held_changes.push(index); }
+         fn send_use_item_packet(&mut self, hand: u8, yaw: f32, pitch: f32) { self.use_packets.push((hand, yaw, pitch)); }
+         fn wait_ticks(&mut self, ticks: u32) { self.waits.push(ticks); }
+     }
+
+     #[test]
+     fn et_running_gates_on_module_and_fall_flying() {
+         let mut hooks = EtMock::default();
+         assert!(et_running(&mut hooks));
+         hooks.module_enabled = false;
+         assert!(!et_running(&mut hooks));
+         hooks.module_enabled = true;
+         hooks.fall_flying = false;
+         assert!(!et_running(&mut hooks));
+     }
+
+     #[test]
+     fn et_can_always_glide_needs_the_setting_target_and_no_abilities_flight() {
+         let mut module = elytra_target();
+         let mut hooks = EtMock::default();
+         let state = elytra_target_state();
+         // AlwaysGlide defaults false
+         assert!(!et_can_always_glide(&module, &state, &mut hooks));
+         enable(&mut module, "AlwaysGlide");
+         assert!(!et_can_always_glide(&module, &state, &mut hooks)); // no target yet
+         let mut state = state;
+         state.target = Some(et_target(
+             vec(5.0, 70.0, 0.0),
+             Vec3::ZERO,
+             1.8,
+             vec(5.0, 71.4, 0.0),
+             true,
+         ));
+         assert!(et_can_always_glide(&module, &state, &mut hooks));
+         hooks.module_enabled = false;
+         assert!(!et_can_always_glide(&module, &state, &mut hooks));
+         hooks.module_enabled = true;
+         hooks.abilities_flying = true;
+         assert!(!et_can_always_glide(&module, &state, &mut hooks));
+     }
+
+     #[test]
+     fn et_can_ignore_kill_aura_rotations_follows_running() {
+         let module = elytra_target();
+         let mut hooks = EtMock::default();
+         assert!(et_can_ignore_kill_aura_rotations(&module, &mut hooks));
+         hooks.fall_flying = false;
+         assert!(!et_can_ignore_kill_aura_rotations(&module, &mut hooks));
+     }
+
+     #[test]
+     fn et_target_update_resets_selects_los_and_pushes_when_unsafe() {
+         let module = elytra_target();
+         let mut hooks = EtMock::default();
+         let mut state = elytra_target_state();
+         state.target = Some(et_target(vec(1.0, 1.0, 1.0), Vec3::ZERO, 1.8, vec(1.0, 1.9, 1.0), true));
+         // safe: no collision along the moved bounding box
+         hooks.los_target = Some(et_target(vec(9.0, 70.0, 2.0), Vec3::ZERO, 1.8, vec(9.0, 71.4, 2.0), true));
+         et_target_update(&module, &mut state, &mut hooks);
+         assert_eq!(state.target.unwrap().pos, vec(9.0, 70.0, 2.0));
+         assert!(hooks.pushes.is_empty());
+         // unsafe: the Safe setting pushes 0.1 on Y
+         hooks.no_collision = false;
+         et_target_update(&module, &mut state, &mut hooks);
+         assert_eq!(hooks.pushes, vec![0.1]);
+         // no LOS candidate: the tracker stays empty
+         hooks.los_target = None;
+         et_target_update(&module, &mut state, &mut hooks);
+         assert!(state.target.is_none());
+     }
+
+     #[test]
+     fn et_on_disabled_resets_tracker() {
+         let mut state = elytra_target_state();
+         state.target = Some(et_target(vec(1.0, 1.0, 1.0), Vec3::ZERO, 1.8, vec(1.0, 1.9, 1.0), true));
+         et_on_disabled(&mut state);
+         assert!(state.target.is_none());
+     }
+
+     #[test]
+     fn et_is_same_target_rendering_matches_the_tracked_target() {
+         let module = elytra_target();
+         let mut hooks = EtMock::default();
+         let t = et_target(vec(10.0, 70.0, 0.0), Vec3::ZERO, 1.8, vec(10.0, 71.8, 0.0), true);
+         let mut state = elytra_target_state();
+         assert!(!et_is_same_target_rendering(&module, &state, &mut hooks, &t));
+         state.target = Some(t);
+         assert!(et_is_same_target_rendering(&module, &state, &mut hooks, &t));
+         let other = et_target(vec(11.0, 70.0, 0.0), Vec3::ZERO, 1.8, vec(11.0, 71.8, 0.0), true);
+         assert!(!et_is_same_target_rendering(&module, &state, &mut hooks, &other));
+     }
+
+     #[test]
+     fn et_predict_simple_and_gravity_and_gliding_gate() {
+         let mut module = elytra_target();
+         let mut hooks = EtMock::default(); // rnd 0.0 -> multiplier = 1.8
+         let pos = vec(10.0, 70.0, 0.0);
+         let t = et_target(pos, vec(1.0, 0.0, 0.0), 1.8, vec(10.0, 71.8, 0.0), true);
+         let out = et_predict_position(&module, &mut hooks, &t, pos);
+         assert_eq!(out, vec(11.8, 70.0, 0.0));
+         // glidingOnly + not fall-flying: the position is returned unchanged
+         let grounded = et_target(pos, vec(1.0, 0.0, 0.0), 1.8, vec(10.0, 71.8, 0.0), false);
+         assert_eq!(et_predict_position(&module, &mut hooks, &grounded, pos), pos);
+         // WithGravity subtracts 0.5 * 0.05 * multiplier^2 on Y
+         set_choice(&mut module, "Mode", "WithGravity");
+         let out = et_predict_position(&module, &mut hooks, &t, pos);
+         assert_eq!(out.x, 11.8);
+         assert_eq!(out.y, 70.0 - 0.5 * 0.05 * 1.8 * 1.8);
+     }
+
+     #[test]
+     fn et_rotate_position_eyes_and_center() {
+         let t = et_target(vec(10.0, 70.0, 0.0), Vec3::ZERO, 2.0, vec(10.0, 71.6, 0.0), true);
+         assert_eq!(EtRotatePosition::Eyes.position(&t), t.eye_pos);
+         assert_eq!(EtRotatePosition::Center.position(&t), vec(10.0, 71.0, 0.0));
+     }
+
+     #[test]
+     fn et_process_clamps_to_speed_and_adds_micro_adjustment() {
+         let module = elytra_target();
+         let mut hooks = EtMock::default(); // now = 0: no boost, micro = 0.05
+         let current = Rotation { yaw: 0.0, pitch: 0.0 };
+         // target behind: yaw delta 170 clamps to yawSpeed 45 * 1.2 * 1.2 = 64.8
+         let behind = Rotation { yaw: 170.0, pitch: 0.0 };
+         let out = et_process(&module, &mut hooks, current, behind);
+         assert_eq!(out.yaw, 64.8);
+         assert_eq!(out.pitch, 0.0);
+         // small delta below 5: micro adjustment rides along
+         let near = Rotation { yaw: 2.0, pitch: 1.0 };
+         let out = et_process(&module, &mut hooks, current, near);
+         assert_eq!(out.yaw, 2.0 + 0.05 * 0.2);
+         assert_eq!(out.pitch, 1.0 + 0.05 * 0.8);
+     }
+
+     #[test]
+     fn et_rotations_update_emits_plan_strict_by_default() {
+         let module = elytra_target();
+         let mut hooks = EtMock::default();
+         let mut state = elytra_target_state();
+         state.target = Some(et_target(vec(10.0, 0.0, 0.0), Vec3::ZERO, 1.8, vec(10.0, 0.0, 0.0), true));
+         et_rotations_update(&module, &state, &mut hooks);
+         assert_eq!(hooks.rotation_calls.len(), 1);
+         let call = hooks.rotation_calls[0];
+         assert_eq!(call.entity_pos, vec(10.0, 0.0, 0.0));
+         assert_eq!(call.ticks_until_reset, 1);
+         assert_eq!(call.reset_threshold, 1.0);
+         assert!(call.consider_inventory);
+         assert_eq!(call.movement_correction, EtMovementCorrection::Strict);
+         // expected aim: predicted eye + 4 * randomDirection, then the
+         // autoDistance pullback (distanceToSqr of the unit direction = 1 < 100,
+         // fma(1 - 10, direction))
+         let base = vec(10.0, 0.0, 0.0);
+         let predicted = et_fma(base, 1.8, Vec3::ZERO); // Simple, multiplier 1.8, zero velocity
+         let mut target_pos = et_fma(predicted, 4.0, et_random_direction_vector(&mut hooks));
+         let from = vec(0.0, 0.0, 0.0);
+         let direction = et_normalize(et_sub(target_pos, from));
+         target_pos = et_fma(target_pos, 1.0 - 10.0, direction);
+         let expected = Rotation::looking_at(target_pos, from);
+         assert_eq!(call.rotation.yaw, expected.yaw);
+         assert_eq!(call.rotation.pitch, expected.pitch);
+         // no target: no plan
+         let empty = elytra_target_state();
+         let mut hooks = EtMock::default();
+         et_rotations_update(&module, &empty, &mut hooks);
+         assert!(hooks.rotation_calls.is_empty());
+     }
+
+     #[test]
+     fn et_rotations_update_uses_change_look_when_look_enabled() {
+         let mut module = elytra_target();
+         enable(&mut module, "Look");
+         let mut hooks = EtMock::default();
+         let mut state = elytra_target_state();
+         state.target = Some(et_target(vec(10.0, 0.0, 0.0), Vec3::ZERO, 1.8, vec(10.0, 0.0, 0.0), true));
+         et_rotations_update(&module, &state, &mut hooks);
+         assert_eq!(hooks.rotation_calls[0].movement_correction, EtMovementCorrection::ChangeLook);
+     }
+
+     #[test]
+     fn et_auto_firework_needs_a_target() {
+         let module = elytra_target();
+         let mut hooks = EtMock::default();
+         hooks.now = 100_000;
+         hooks.firework_slot = Some(EtHotbarSlot { hotbar_index: Some(3), use_hand: 0 });
+         let mut state = elytra_target_state();
+         state.target = None;
+         et_auto_firework_tick(&module, &mut state, &mut hooks);
+         assert!(hooks.hotbar_uses.is_empty());
+         assert!(hooks.waits.is_empty());
+     }
+
+     #[test]
+     fn et_auto_firework_uses_on_cooldown_and_updates_delay_by_distance() {
+         let module = elytra_target();
+         let mut hooks = EtMock::default();
+         hooks.now = 100_000; // initial 750-tick cooldown (37_500 ms) elapsed
+         hooks.firework_slot = Some(EtHotbarSlot { hotbar_index: Some(3), use_hand: 0 });
+         hooks.target_sq_dist = 60.0 * 60.0; // beyond ExtraDistance^2 (2500)
+         let mut state = elytra_target_state();
+         state.target = Some(et_target(vec(60.0, 0.0, 0.0), Vec3::ZERO, 1.8, vec(60.0, 0.0, 0.0), true));
+         et_auto_firework_tick(&module, &mut state, &mut hooks);
+         assert_eq!(hooks.hotbar_uses, vec![0]); // SlotResetDelay 0..0
+         assert_eq!(state.firework_cooldown, 10); // far: cooldown.last
+         // chronometer was reset: 100 ms later the 500 ms cooldown holds
+         hooks.now = 100_100;
+         et_auto_firework_tick(&module, &mut state, &mut hooks);
+         assert_eq!(hooks.hotbar_uses.len(), 1);
+         // near target: the cooldown drops to Cooldown.first (8) and fires again
+         hooks.target_sq_dist = 40.0 * 40.0;
+         state.firework_chronometer.reset(0);
+         et_auto_firework_tick(&module, &mut state, &mut hooks);
+         assert_eq!(hooks.hotbar_uses.len(), 2);
+         assert_eq!(state.firework_cooldown, 8);
+         // no firework rocket found: no use, no reset
+         hooks.firework_slot = None;
+         state.firework_chronometer.reset(0);
+         et_auto_firework_tick(&module, &mut state, &mut hooks);
+         assert_eq!(hooks.hotbar_uses.len(), 2);
+     }
+
+     #[test]
+     fn et_auto_firework_packet_mode_swaps_slot_and_sends_use() {
+         let mut module = elytra_target();
+         set_choice(&mut module, "UseMode", "Packet");
+         let mut hooks = EtMock::default();
+         hooks.now = 100_000;
+         hooks.firework_slot = Some(EtHotbarSlot { hotbar_index: Some(5), use_hand: 1 });
+         hooks.yaw = 30.0;
+         hooks.pitch = -10.0;
+         let mut state = elytra_target_state();
+         state.target = Some(et_target(vec(10.0, 0.0, 0.0), Vec3::ZERO, 1.8, vec(10.0, 0.0, 0.0), true));
+         et_auto_firework_tick(&module, &mut state, &mut hooks);
+         assert!(hooks.hotbar_uses.is_empty());
+         assert_eq!(hooks.slot_sets, vec![5, 0]);
+         assert_eq!(hooks.held_changes, vec![5, 0]);
+         assert_eq!(hooks.use_packets, vec![(1, 30.0, -10.0)]);
+         // offhand slot (hotbarIndex null): use packet only, no swap
+         let mut hooks = EtMock::default();
+         hooks.now = 100_000;
+         hooks.firework_slot = Some(EtHotbarSlot { hotbar_index: None, use_hand: 1 });
+         let mut state = elytra_target_state();
+         state.target = Some(et_target(vec(10.0, 0.0, 0.0), Vec3::ZERO, 1.8, vec(10.0, 0.0, 0.0), true));
+         et_auto_firework_tick(&module, &mut state, &mut hooks);
+         assert!(hooks.slot_sets.is_empty());
+         assert!(hooks.held_changes.is_empty());
+         assert_eq!(hooks.use_packets, vec![(1, 0.0, 0.0)]);
+     }
+
+     #[test]
+     fn et_auto_firework_syncs_with_kill_aura_click_tick() {
+         let mut module = elytra_target();
+         let mut hooks = EtMock::default();
+         hooks.now = 100_000;
+         hooks.ka_running = true;
+         hooks.ka_click_tick = true;
+         hooks.ka_target_sq = Some(10.0); // below range^2 (25): sync window active
+         hooks.firework_slot = Some(EtHotbarSlot { hotbar_index: Some(0), use_hand: 0 });
+         let mut state = elytra_target_state();
+         state.target = Some(et_target(vec(10.0, 0.0, 0.0), Vec3::ZERO, 1.8, vec(10.0, 0.0, 0.0), true));
+         // SyncCooldownWithKillAura defaults false: the use goes out now
+         et_auto_firework_tick(&module, &mut state, &mut hooks);
+         assert_eq!(hooks.hotbar_uses.len(), 1);
+         // with sync on: this tick waits one tick
+         let mut hooks = EtMock::default();
+         hooks.now = 100_000;
+         hooks.ka_running = true;
+         hooks.ka_click_tick = true;
+         hooks.ka_target_sq = Some(10.0);
+         hooks.firework_slot = Some(EtHotbarSlot { hotbar_index: Some(0), use_hand: 0 });
+         enable(&mut module, "SyncCooldownWithKillAura");
+         let mut state = elytra_target_state();
+         state.target = Some(et_target(vec(10.0, 0.0, 0.0), Vec3::ZERO, 1.8, vec(10.0, 0.0, 0.0), true));
+         et_auto_firework_tick(&module, &mut state, &mut hooks);
+         assert_eq!(hooks.waits, vec![1]);
+         assert!(hooks.hotbar_uses.is_empty());
+         assert!(state.waiting_use);
+         // next tick: the wait resumes and the firework is used
+         hooks.now = 100_050;
+         et_auto_firework_tick(&module, &mut state, &mut hooks);
+         assert_eq!(hooks.hotbar_uses, vec![0]);
+         assert!(!state.waiting_use);
+         // KillAura target beyond range: no wait even with sync on
+         hooks.waits.clear();
+         hooks.ka_target_sq = Some(30.0);
+         state.firework_chronometer.reset(0);
+         et_auto_firework_tick(&module, &mut state, &mut hooks);
+         assert!(hooks.waits.is_empty());
+         assert_eq!(hooks.hotbar_uses.len(), 2);
+     }
+ }
+

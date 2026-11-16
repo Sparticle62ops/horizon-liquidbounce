@@ -28419,3 +28419,1205 @@ fn et_use_firework_slot(module: &Module, hooks: &mut dyn EtEngine, slot: &EtHotb
      }
  }
 
+// ----- combat/aimbot/*.kt (GPL-3.0, upstream credit CCBlueX) 1:1 port -----
+// ModuleAutoBow.kt (60), autobow/AutoBowAimbotFeature.kt (95),
+// autobow/AutoBowAutoShootFeature.kt (237),
+// autobow/AutoBowFastChargeFeature.kt (79), ModuleProjectileAimbot.kt (72).
+// Module aliases ("BowAssist", "BowAimbot") and the render trees are seams.
+
+/// Upstream `ModuleAutoBow` settings: the `AutoBowAimbotFeature`
+/// (`BowAimbot`, true) tree with its `TargetTracker(TargetPriority.DISTANCE)`
+/// defaults (Priority set [Type, Distance], no range provider, FOV 180,
+/// HurtTime 10), `ThroughWalls`, the `TargetRenderer` render seam and its
+/// `RotationsValueGroup`; the `AutoBowAutoShootFeature` (`AutoShoot`, true)
+/// tree; and the `AutoBowFastChargeFeature` (`FastCharge`, false) tree.
+pub fn auto_bow() -> Module {
+    Module::new(
+        "AutoBow",
+        COMBAT,
+        vec![
+            // AutoBowAimbotFeature (ToggleableValueGroup "BowAimbot", true)
+            boolean("BowAimbot", true),
+            // TargetTracker(TargetPriority.DISTANCE)
+            multi_choice("Priority", &["Type", "Distance"], &["Type", "Distance", "Health", "Direction", "Fov"]),
+            float("FOV", 180.0, 0.0, 180.0),
+            int("HurtTime", 10, 0, 10),
+            boolean("ThroughWalls", true),
+            // TargetRenderer(AutoBowAimbotFeature, targetTracker) (render seam)
+            boolean("TargetRenderer", true),
+            // RotationsValueGroup(this)
+            boolean("PostMove", false),
+            boolean("Instant", false),
+            choice("AngleSmooth", "Linear", &["Linear", "Sigmoid"]),
+            float_range("HorizontalTurnSpeed", 180.0, 180.0, 0.0, 180.0),
+            float_range("VerticalTurnSpeed", 180.0, 180.0, 0.0, 180.0),
+            float("Steepness", 10.0, 0.0, 20.0),
+            float("Midpoint", 0.3, 0.0, 1.0),
+            choice("MovementCorrection", "Silent", &["Off", "Strict", "Silent"]),
+            float("ResetThreshold", 2.0, 1.0, 180.0),
+            int("TicksUntilReset", 5, 1, 30),
+            // AutoBowAutoShootFeature (ToggleableValueGroup "AutoShoot", true)
+            boolean("AutoShoot", true),
+            int("Charged", 15, 3, 20), // "ticks"
+            float_range("ChargedRandom", 0.0, 0.0, -10.0, 10.0), // "ticks"
+            float("DelayBetweenShots", 0.0, 0.0, 5.0), // "s"
+            float("AimThreshold", 1.5, 1.0, 4.0), // "°"
+            boolean("RequiresHypotheticalHit", false),
+            boolean("UsePrechargedCrossbow", false),
+            // AutoBowFastChargeFeature (ToggleableValueGroup "FastCharge", false)
+            boolean("FastCharge", false),
+            int("Speed", 20, 3, 20),
+            boolean("NotInTheAir", true),
+            boolean("NotDuringMove", false),
+            boolean("NotDuringRegeneration", false),
+            choice("PacketType", "Full", &["OnGroundOnly", "PositionAndOnGround", "LookAndOnGround", "Full"]),
+        ],
+    )
+}
+
+/// Upstream `ModuleProjectileAimbot` settings: its `TargetSelector()`
+/// (Priority default [Type, Health], no range provider, FOV 180, HurtTime 10)
+/// and its `RotationsValueGroup`.
+pub fn projectile_aimbot() -> Module {
+    Module::new(
+        "ProjectileAimbot",
+        COMBAT,
+        vec![
+            // targetSelector = TargetSelector()
+            multi_choice("Priority", &["Type", "Health"], &["Type", "Distance", "Health", "Direction", "Fov"]),
+            float("FOV", 180.0, 0.0, 180.0),
+            int("HurtTime", 10, 0, 10),
+            // rotations = RotationsValueGroup(this)
+            boolean("PostMove", false),
+            boolean("Instant", false),
+            choice("AngleSmooth", "Linear", &["Linear", "Sigmoid"]),
+            float_range("HorizontalTurnSpeed", 180.0, 180.0, 0.0, 180.0),
+            float_range("VerticalTurnSpeed", 180.0, 180.0, 0.0, 180.0),
+            float("Steepness", 10.0, 0.0, 20.0),
+            float("Midpoint", 0.3, 0.0, 1.0),
+            choice("MovementCorrection", "Silent", &["Off", "Strict", "Silent"]),
+            float("ResetThreshold", 2.0, 1.0, 180.0),
+            int("TicksUntilReset", 5, 1, 30),
+        ],
+    )
+}
+
+/// Item shape the autobow handlers branch on (`BowItem`, `TridentItem`,
+/// `CrossbowItem` flags; an empty stack is `NONE`).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct AbwStack {
+    pub is_bow: bool,
+    pub is_trident: bool,
+    pub is_crossbow: bool,
+    /// `CrossbowItem.isCharged(this)`
+    pub crossbow_charged: bool,
+}
+
+impl Default for Rotation {
+    fn default() -> Self {
+        Rotation { yaw: 0.0, pitch: 0.0 }
+    }
+}
+
+impl AbwStack {
+    pub const NONE: AbwStack =
+        AbwStack { is_bow: false, is_trident: false, is_crossbow: false, crossbow_charged: false };
+}
+
+/// Upstream `TridentItem.THROW_THRESHOLD_TIME`.
+const AB_TRIDENT_THROW_THRESHOLD_TIME: i32 = 10;
+
+/// A world entity the aimbot handlers aim at (engine-owned id).
+pub type AbwEntity = u64;
+
+/// Upstream `RotationManager.setRotationTarget(rotation, priority =
+/// IMPORTANT_FOR_USAGE_1, provider, valueGroup)` call. `consider_inventory`
+/// is `considerInventory` (RotationsValueGroup default false through
+/// `toRotationTarget`; the BowAimbot call omits it like the upstream default).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AbwRotationTargetCall {
+    pub rotation: Rotation,
+    /// provider: 0 = ModuleAutoBow, 1 = ModuleProjectileAimbot
+    pub provider: u8,
+    pub consider_inventory: bool,
+}
+
+/// An entity from `world.entitiesForRendering()` prepared for
+/// `getHypotheticalHit` (upstream `findAndBuildSimulatedEntities` pairs each
+/// `AbstractClientPlayer` with its `PlayerSimulationCache` simulation).
+#[derive(Clone)]
+pub struct AbwSimEntity {
+    pub id: AbwEntity,
+    /// `entity.position()`
+    pub pos: Vec3,
+    /// `entity.deltaMovement`
+    pub delta_movement: Vec3,
+    /// `entity.boundingBox` (min, max)
+    pub bb_min: Vec3,
+    pub bb_max: Vec3,
+    /// `entity is AbstractClientPlayer`
+    pub is_player: bool,
+    /// `PlayerSimulationCache.getSimulationForOtherPlayers(entity)`'s
+    /// `getSnapshotAt(ticks).pos` when the simulation exists.
+    pub snapshot_at: Option<std::sync::Arc<dyn Fn(i32) -> [f64; 3]>>,
+}
+
+/// Engine seams the aimbot-subdir modules read.
+pub trait AbwEngine {
+    /// `ModuleAutoBow.running` (the `super.running` leg)
+    fn abw_module_enabled(&mut self) -> bool;
+    /// `ModuleProjectileAimbot.running`
+    fn abw_projectile_module_enabled(&mut self) -> bool;
+    /// `player.useItem` for `onStopUsingItem` (`item is BowItem`)
+    fn abw_stop_using_item(&mut self) -> Option<AbwStack>;
+    /// `player.usingItemOrNull` as (hand, stack); hand 0 main, 1 offhand
+    fn abw_using_item(&mut self) -> Option<(u8, AbwStack)>;
+    /// `player.usingItemHand`
+    fn abw_using_item_hand(&mut self) -> Option<u8>;
+    /// `player.getItemInHand(hand)` (`handItems`; empty stack = NONE)
+    fn abw_hand_item(&mut self, hand: u8) -> AbwStack;
+    /// `player.isUsingItem`
+    fn abw_is_using_item(&mut self) -> bool;
+    /// `player.ticksUsingItem`
+    fn abw_ticks_using_item(&mut self) -> i32;
+    /// `CrossbowItem.getChargeDuration(stack, player)`
+    fn abw_crossbow_charge_duration(&mut self, stack: &AbwStack) -> i32;
+    /// `player.onGround()`
+    fn abw_on_ground(&mut self) -> bool;
+    /// `player.moving`
+    fn abw_moving(&mut self) -> bool;
+    /// `player.hasEffect(MobEffects.REGENERATION)`
+    fn abw_has_regeneration(&mut self) -> bool;
+    /// `network.send(packetType.generatePacket())`
+    fn abw_send_move_packet(&mut self, packet_type: MovePacketType);
+    /// `player.updatingUsingItem()` (the visual tick effect)
+    fn abw_updating_using_item(&mut self);
+    /// `useItem(hand)` (`InteractionUtils.useItem`)
+    fn abw_use_item(&mut self, hand: u8);
+    /// `mc.options.keyUse.isPressed` at the `KeybindIsPressedEvent`
+    fn abw_key_use_pressed(&mut self) -> bool;
+    /// `System.currentTimeMillis()`
+    fn abw_now_ms(&mut self) -> u64;
+    /// `ModuleAutoBow.random.nextGaussian()`
+    fn abw_next_gaussian(&mut self) -> f64;
+    /// `RotationManager.serverRotation`
+    fn abw_server_rotation(&mut self) -> Rotation;
+    /// `RotationManager.activeRotationTarget?.rotation`
+    fn abw_active_rotation_target_rotation(&mut self) -> Option<Rotation>;
+    /// `RotationManager.setRotationTarget(...)` calls, in order.
+    fn abw_set_rotation_target(&mut self, call: AbwRotationTargetCall);
+    /// `HeldItemTrajectoryResolver.resolveHeldItemPrimaryShot(player, stack,
+    /// considerAimAssist)`'s `trajectoryInfo.initialVelocity`.
+    fn abw_resolve_primary_shot_velocity(
+        &mut self,
+        stack: &AbwStack,
+        consider_aim_assist: bool,
+    ) -> Option<f32>;
+    /// `SituationalProjectileAngleCalculator.calculateAngleForEntity(
+    /// trajectoryInfo, enemy)` (or the `VerifyHitResult` variant).
+    fn abw_calculate_angle_for_entity(
+        &mut self,
+        velocity: f32,
+        enemy: AbwEntity,
+        verify_hit_result: bool,
+    ) -> Option<Rotation>;
+    /// `targetTracker.selectFirst { rotation != null }` against the BowAimbot
+    /// tracker (Priority [Type, Distance], FOV, HurtTime).
+    fn abw_aimbot_select_first(
+        &mut self,
+        velocity: f32,
+        verify_hit_result: bool,
+    ) -> Option<(AbwEntity, Rotation)>;
+    /// `AutoBowAimbotFeature.targetTracker.target`
+    fn abw_aimbot_target(&mut self) -> Option<AbwEntity>;
+    /// BowAimbot `targetTracker.reset()`
+    fn abw_reset_aimbot_tracker(&mut self);
+    /// `targetSelector.targets().firstOrNull()`
+    fn abw_projectile_first_target(&mut self) -> Option<AbwEntity>;
+    /// `hypotheticalHit.shouldBeAttacked()`
+    fn abw_should_be_attacked(&mut self, entity: AbwEntity) -> bool;
+    /// `player.eyePosition`
+    fn abw_eye_position(&mut self) -> Vec3;
+    /// `SimulatedArrow(world, pos, velocity, collideEntities = false)`; the
+    /// handle feeds `pos` / `tick()`.
+    fn abw_sim_arrow_create(&mut self, pos: Vec3, velocity: Vec3) -> u64;
+    /// `arrow.pos`
+    fn abw_sim_arrow_pos(&mut self, arrow: u64) -> Vec3;
+    /// `arrow.tick()`
+    fn abw_sim_arrow_tick(&mut self, arrow: u64);
+    /// `world.entitiesForRendering().filter { it.shouldBeAttacked() &&
+    /// Line(player.eyePosition, player.rotation.directionVector)
+    /// .distanceToSqr(it.position()) < 10.0 * 10.0 }`, each `AbstractClientPlayer`
+    /// paired with its `PlayerSimulationCache.getSimulationForOtherPlayers`
+    /// simulation.
+    fn abw_shootable_entities(&mut self) -> Vec<AbwSimEntity>;
+}
+
+/// Module state for the AutoBow family: the shot timer, the random charge
+/// offset and the `forceUncharged` flag.
+#[derive(Clone, Debug, Default)]
+pub struct AutoBowState {
+    /// `ModuleAutoBow.lastShotTimer`
+    pub last_shot_timer: Chronometer,
+    /// `AutoBowAutoShootFeature.currentChargeRandom`
+    pub current_charge_random: Option<i64>,
+    /// `AutoBowAutoShootFeature.forceUncharged`
+    pub force_uncharged: bool,
+    /// `AutoBowAimbotFeature.targetTracker.target`
+    pub aimbot_target: Option<AbwEntity>,
+}
+
+fn abw_setting_float(module: &Module, name: &str, default: f64) -> f64 {
+    match module.setting(name).map(|v| &v.kind) {
+        Some(ValueKind::Float(v, _, _)) => *v,
+        _ => default,
+    }
+}
+
+fn abw_packet_type(module: &Module) -> MovePacketType {
+    match module.setting("PacketType").map(|v| &v.kind) {
+        Some(ValueKind::Choice(sel, _)) if sel == "OnGroundOnly" => MovePacketType::OnGroundOnly,
+        Some(ValueKind::Choice(sel, _)) if sel == "PositionAndOnGround" => {
+            MovePacketType::PositionAndOnGround
+        }
+        Some(ValueKind::Choice(sel, _)) if sel == "LookAndOnGround" => MovePacketType::LookAndOnGround,
+        _ => MovePacketType::Full,
+    }
+}
+
+impl AutoBowState {
+    /// Upstream `updateChargeRandom`: a half-gaussian pick inside the
+    /// ChargedRandom range, truncated like Kotlin's `toInt()`.
+    fn update_charge_random(&mut self, module: &Module, hooks: &mut dyn AbwEngine) {
+        let (start, end) = setting_float_range(module, "ChargedRandom", (0.0, 0.0));
+        let len_half = (end - start) / 2.0;
+        let mid = start + len_half;
+        let gaussian = hooks.abw_next_gaussian();
+        self.current_charge_random =
+            Some(((mid + gaussian * len_half) as i64).clamp(start as i64, end as i64));
+    }
+
+    /// Upstream `getChargedRandom` (lazily seeded).
+    fn get_charged_random(&mut self, module: &Module, hooks: &mut dyn AbwEngine) -> i64 {
+        if self.current_charge_random.is_none() {
+            self.update_charge_random(module, hooks);
+        }
+        self.current_charge_random.unwrap()
+    }
+}
+
+/// Upstream `ModuleAutoBow.onStopUsingItem` (the use-item release hook).
+pub fn abw_on_stop_using_item(state: &mut AutoBowState, hooks: &mut dyn AbwEngine) {
+    if let Some(stack) = hooks.abw_stop_using_item() {
+        if stack.is_bow {
+            state.last_shot_timer.reset(hooks.abw_now_ms());
+        }
+    }
+}
+
+/// Upstream `ModuleAutoBow.onDisabled` (`AutoBowAimbotFeature.targetTracker.reset()`).
+pub fn abw_on_disabled(state: &mut AutoBowState, hooks: &mut dyn AbwEngine) {
+    state.aimbot_target = None;
+    hooks.abw_reset_aimbot_tracker();
+}
+
+/// Upstream `AutoBowAutoShootFeature.onDisabled`.
+pub fn abw_auto_shoot_on_disabled(state: &mut AutoBowState) {
+    state.force_uncharged = false;
+}
+
+/// Upstream module event dispatch: the AutoShoot, BowAimbot and FastCharge
+/// trees run in registration order while the module is enabled; the
+/// `FastCharge` group gate sits here because its default is off.
+pub fn abw_tick(module: &Module, state: &mut AutoBowState, hooks: &mut dyn AbwEngine) {
+    if !hooks.abw_module_enabled() {
+        return;
+    }
+    abw_auto_shoot_tick(module, state, hooks);
+    abw_aimbot_tick(module, state, hooks);
+    if setting_bool(module, "FastCharge", false) {
+        abw_fast_charge_tick(module, hooks);
+    }
+}
+
+/// Upstream `AutoBowAimbotFeature.tickRepeatable` (GameTickEvent handler).
+pub fn abw_aimbot_tick(module: &Module, state: &mut AutoBowState, hooks: &mut dyn AbwEngine) {
+    if !setting_bool(module, "BowAimbot", true) {
+        return;
+    }
+    hooks.abw_reset_aimbot_tracker();
+    state.aimbot_target = None;
+
+    // `val activeStack = player.usingItemOrNull ?: player.handItems.firstOrNull {
+    //   it.item is CrossbowItem && CrossbowItem.isCharged(it) }`
+    let active_stack: AbwStack = if let Some((_, stack)) = hooks.abw_using_item() {
+        stack
+    } else {
+        let main = hooks.abw_hand_item(0);
+        if main.is_crossbow && main.crossbow_charged {
+            main
+        } else {
+            let off = hooks.abw_hand_item(1);
+            if off.is_crossbow && off.crossbow_charged {
+                off
+            } else {
+                AbwStack::NONE
+            }
+        }
+    };
+
+    let active_item = active_stack.is_bow || active_stack.is_trident || active_stack.is_crossbow;
+    if !active_item {
+        return;
+    }
+
+    let Some(velocity) = hooks.abw_resolve_primary_shot_velocity(&active_stack, true) else {
+        return;
+    };
+
+    // `if (throughWalls) SituationalProjectileAngleCalculator
+    //  else SituationalProjectileAngleCalculator.VerifyHitResult`
+    let verify_hit_result = !setting_bool(module, "ThroughWalls", true);
+    if let Some((enemy, rotation)) = hooks.abw_aimbot_select_first(velocity, verify_hit_result) {
+        state.aimbot_target = Some(enemy);
+        hooks.abw_set_rotation_target(AbwRotationTargetCall {
+            rotation,
+            provider: 0,
+            consider_inventory: true,
+        });
+    }
+}
+
+/// Upstream `AutoBowFastChargeFeature.tickRepeatable` (GameTickEvent handler).
+pub fn abw_fast_charge_tick(module: &Module, hooks: &mut dyn AbwEngine) {
+    let Some((_, current_item)) = hooks.abw_using_item() else {
+        return;
+    };
+
+    // Should speed up game ticks when using bow
+    if current_item.is_bow {
+        if setting_bool(module, "NotInTheAir", true) && !hooks.abw_on_ground() {
+            return;
+        }
+
+        if setting_bool(module, "NotDuringMove", false) && hooks.abw_moving() {
+            return;
+        }
+
+        if setting_bool(module, "NotDuringRegeneration", false) && hooks.abw_has_regeneration() {
+            return;
+        }
+
+        let speed = setting_int(module, "Speed", 20);
+        let packet_type = abw_packet_type(module);
+        for _ in 0..speed {
+            if !hooks.abw_is_using_item() {
+                break; // `return@repeat`
+            }
+
+            // Speed up ticks (MC 1.8)
+            hooks.abw_send_move_packet(packet_type);
+
+            // Show visual effect (not required to work - but looks better)
+            hooks.abw_updating_using_item();
+        }
+    }
+}
+
+/// Upstream `AutoBowAutoShootFeature.tickHandler` (GameTickEvent handler).
+pub fn abw_auto_shoot_tick(module: &Module, state: &mut AutoBowState, hooks: &mut dyn AbwEngine) {
+    if !setting_bool(module, "AutoShoot", true) {
+        return;
+    }
+    state.force_uncharged = false;
+
+    // `val usingItemHand = player.usingItemHand ?: if (usePrechargedCrossbow) {
+    //   InteractionHand.entries.find { player.getItemInHand(it).isChargedCrossbow }
+    //     ?: return@handler } else { return@handler }`
+    let hand = match hooks.abw_using_item_hand() {
+        Some(hand) => Some(hand),
+        None => {
+            if setting_bool(module, "UsePrechargedCrossbow", false) {
+                (0..=1u8).find(|&hand| {
+                    let stack = hooks.abw_hand_item(hand);
+                    stack.is_crossbow && stack.crossbow_charged
+                })
+            } else {
+                None
+            }
+        }
+    };
+    let Some(hand) = hand else {
+        return;
+    };
+
+    // `val usingItemStack = player.usingItemOrNull ?: player.getItemInHand(usingItemHand)`
+    let stack = hooks
+        .abw_using_item()
+        .map(|(_, stack)| stack)
+        .unwrap_or_else(|| hooks.abw_hand_item(hand));
+
+    if stack.is_crossbow {
+        let pull_time = hooks.abw_crossbow_charge_duration(&stack);
+        let charged_now = stack.crossbow_charged;
+        if !charged_now && hooks.abw_ticks_using_item() < pull_time {
+            return;
+        }
+    } else if stack.is_bow {
+        if hooks.abw_ticks_using_item()
+            < setting_int(module, "Charged", 15) as i32 + state.get_charged_random(module, hooks) as i32
+        {
+            return;
+        }
+    } else if stack.is_trident {
+        if hooks.abw_ticks_using_item() <= AB_TRIDENT_THROW_THRESHOLD_TIME {
+            return;
+        }
+    } else {
+        return;
+    }
+
+    if !state.last_shot_timer.has_elapsed(
+        hooks.abw_now_ms(),
+        (abw_setting_float(module, "DelayBetweenShots", 0.0) * 1000.0) as u64,
+    ) {
+        return;
+    }
+
+    if setting_bool(module, "RequiresHypotheticalHit", false) {
+        // `val hypotheticalHit = getHypotheticalHit()`
+        let hit = abw_hypothetical_hit(hooks);
+        let hit_attacks = hit.map_or(false, |entity| hooks.abw_should_be_attacked(entity));
+        if !hit_attacks {
+            return;
+        }
+    } else if setting_bool(module, "BowAimbot", true) {
+        if hooks.abw_aimbot_target().is_none() {
+            return;
+        }
+
+        let Some(target_rotation) = hooks.abw_active_rotation_target_rotation() else {
+            return;
+        };
+
+        let aim_difference =
+            hooks.abw_server_rotation().direction_angle_to(target_rotation) as f64;
+
+        if aim_difference > abw_setting_float(module, "AimThreshold", 1.5) {
+            return;
+        }
+    }
+
+    if stack.is_crossbow {
+        let charged_now = stack.crossbow_charged;
+        if charged_now {
+            hooks.abw_use_item(hand);
+            state.last_shot_timer.reset(hooks.abw_now_ms());
+        } else {
+            state.force_uncharged = true;
+        }
+    } else {
+        state.force_uncharged = true;
+        if stack.is_bow {
+            state.update_charge_random(module, hooks);
+        }
+    }
+}
+
+/// Upstream `AutoBowAutoShootFeature.keybindHandler` (KeybindIsPressedEvent):
+/// while `forceUncharged` is set the use key is reported unpressed so the
+/// uncharged bow cannot fire. Returns the event's effective pressed state.
+pub fn abw_keybind_is_pressed(state: &AutoBowState, key_use_pressed: bool) -> bool {
+    if key_use_pressed && state.force_uncharged {
+        false
+    } else {
+        key_use_pressed
+    }
+}
+
+/// Upstream `AutoBowAutoShootFeature.getHypotheticalHit`: 40 simulated arrow
+/// ticks against the aim line's entities, each box inflated by
+/// `projectileEntityHitMargin(i)` and moved by the entity's predicted
+/// position.
+fn abw_hypothetical_hit(hooks: &mut dyn AbwEngine) -> Option<AbwEntity> {
+    hooks.abw_using_item_hand()?;
+    let rotation = hooks.abw_server_rotation();
+    let (_, active_item) = hooks.abw_using_item()?;
+    let Some(velocity) = hooks.abw_resolve_primary_shot_velocity(&active_item, false) else {
+        return None;
+    };
+
+    let eye = hooks.abw_eye_position();
+    let arrow = hooks.abw_sim_arrow_create(
+        eye,
+        abw_scale_vec(rotation.direction_vector(), velocity as f64),
+    );
+    let entities = hooks.abw_shootable_entities();
+
+    for i in 0..40i32 {
+        let last_pos = hooks.abw_sim_arrow_pos(arrow);
+
+        hooks.abw_sim_arrow_tick(arrow);
+        let arrow_pos = hooks.abw_sim_arrow_pos(arrow);
+
+        for entity in &entities {
+            // `if (entity is AbstractClientPlayer && simulatedPos != null)
+            //   simulatedPos.getSnapshotAt(i).pos
+            //  else entity.position().fma(i.toDouble(), entity.deltaMovement)`
+            let predicted_pos = if entity.is_player {
+                match &entity.snapshot_at {
+                    Some(snapshot_at) => {
+                        let snapshot = snapshot_at(i);
+                        Vec3 { x: snapshot[0], y: snapshot[1], z: snapshot[2] }
+                    }
+                    None => et_fma(entity.pos, i as f64, entity.delta_movement),
+                }
+            } else {
+                et_fma(entity.pos, i as f64, entity.delta_movement)
+            };
+
+            // `entity.boundingBox.inflate(margin).move(predictedPos - entity.position())`
+            let margin = abw_projectile_entity_hit_margin(i) as f64;
+            let offset = Vec3 {
+                x: predicted_pos.x - entity.pos.x,
+                y: predicted_pos.y - entity.pos.y,
+                z: predicted_pos.z - entity.pos.z,
+            };
+            let min = Vec3 {
+                x: entity.bb_min.x - margin + offset.x,
+                y: entity.bb_min.y - margin + offset.y,
+                z: entity.bb_min.z - margin + offset.z,
+            };
+            let max = Vec3 {
+                x: entity.bb_max.x + margin + offset.x,
+                y: entity.bb_max.y + margin + offset.y,
+                z: entity.bb_max.z + margin + offset.z,
+            };
+
+            if abw_box_clip(last_pos, arrow_pos, min, max).is_some() {
+                return Some(entity.id);
+            }
+        }
+    }
+
+    None
+}
+
+/// Upstream `AutoBowAutoShootFeature.projectileEntityHitMargin(tickCount)`
+/// (`ProjectileUtil.computeMargin`).
+fn abw_projectile_entity_hit_margin(tick_count: i32) -> f32 {
+    ((tick_count - 2) as f32 / 20.0).clamp(0.0, 0.3)
+}
+
+/// `AABB.clip(from, to)`: the ray-box hit point (slab test), None on a miss.
+fn abw_box_clip(from: Vec3, to: Vec3, min: Vec3, max: Vec3) -> Option<Vec3> {
+    let dir = Vec3 { x: to.x - from.x, y: to.y - from.y, z: to.z - from.z };
+    let mut tmin = 0.0f64;
+    let mut tmax = 1.0f64;
+    let axes = [
+        (from.x, dir.x, min.x, max.x),
+        (from.y, dir.y, min.y, max.y),
+        (from.z, dir.z, min.z, max.z),
+    ];
+    for (origin, delta, low, high) in axes {
+        if delta.abs() < f64::EPSILON {
+            if origin < low || origin > high {
+                return None;
+            }
+        } else {
+            let inv = 1.0 / delta;
+            let mut t1 = (low - origin) * inv;
+            let mut t2 = (high - origin) * inv;
+            if t1 > t2 {
+                std::mem::swap(&mut t1, &mut t2);
+            }
+            tmin = tmin.max(t1);
+            tmax = tmax.min(t2);
+            if tmin > tmax {
+                return None;
+            }
+        }
+    }
+    Some(Vec3 {
+        x: from.x + dir.x * tmin,
+        y: from.y + dir.y * tmin,
+        z: from.z + dir.z * tmin,
+    })
+}
+
+fn abw_scale_vec(v: Vec3, s: f64) -> Vec3 {
+    Vec3 { x: v.x * s, y: v.y * s, z: v.z * s }
+}
+
+/// Upstream `ModuleProjectileAimbot.tickHandler` (GameTickEvent handler).
+pub fn abw_projectile_aimbot_tick(hooks: &mut dyn AbwEngine) {
+    if !hooks.abw_projectile_module_enabled() {
+        return;
+    }
+    let Some(target) = hooks.abw_projectile_first_target() else {
+        return;
+    };
+
+    // `player.handItems.firstNotNullOfOrNull { ... }`
+    let mut rotation = None;
+    for hand in 0..=1u8 {
+        let stack = hooks.abw_hand_item(hand);
+        let Some(velocity) = hooks.abw_resolve_primary_shot_velocity(&stack, true) else {
+            continue;
+        };
+        if let Some(angle) = hooks.abw_calculate_angle_for_entity(velocity, target, false) {
+            rotation = Some(angle);
+            break;
+        }
+    }
+    let Some(rotation) = rotation else {
+        return;
+    };
+
+    hooks.abw_set_rotation_target(AbwRotationTargetCall {
+        rotation,
+        provider: 1,
+        consider_inventory: false,
+    });
+}
+
+#[cfg(test)]
+mod abw_aimbot_tests {
+    use super::*;
+
+    fn bow() -> AbwStack { AbwStack { is_bow: true, ..AbwStack::NONE } }
+    fn charged_crossbow() -> AbwStack {
+        AbwStack { is_crossbow: true, crossbow_charged: true, ..AbwStack::NONE }
+    }
+    fn uncharged_crossbow() -> AbwStack { AbwStack { is_crossbow: true, ..AbwStack::NONE } }
+    fn trident() -> AbwStack { AbwStack { is_trident: true, ..AbwStack::NONE } }
+
+    #[derive(Default)]
+    struct AbwHooks {
+        enabled: bool,
+        proj_enabled: bool,
+        stop_using: Option<AbwStack>,
+        using_item: Option<(u8, AbwStack)>,
+        using_hand: Option<u8>,
+        hands: [AbwStack; 2],
+        is_using: bool,
+        ticks_using: i32,
+        crossbow_charge_duration: i32,
+        on_ground: bool,
+        moving: bool,
+        regen: bool,
+        packets: Vec<MovePacketType>,
+        updates: u32,
+        used_items: Vec<u8>,
+        key_use: bool,
+        now: u64,
+        gaussians: Vec<f64>,
+        gaussian_idx: usize,
+        server_rotation: Rotation,
+        active_target_rotation: Option<Rotation>,
+        rotation_calls: Vec<AbwRotationTargetCall>,
+        velocity: Option<f32>,
+        select_first_calls: Vec<(f32, bool)>,
+        select_first: Option<(AbwEntity, Rotation)>,
+        angles: Vec<(f32, bool)>,
+        angle_result: Option<Rotation>,
+        aimbot_target: Option<AbwEntity>,
+        proj_first_target: Option<AbwEntity>,
+        reset_calls: u32,
+        should_be_attacked: bool,
+        eye: Vec3,
+        arrows: Vec<(Vec3, Vec3)>,
+        arrow_pos: Vec3,
+        arrow_tick_advance: f64,
+        sim_entities: Vec<AbwSimEntity>,
+    }
+
+    impl AbwEngine for AbwHooks {
+        fn abw_module_enabled(&mut self) -> bool { self.enabled }
+        fn abw_projectile_module_enabled(&mut self) -> bool { self.proj_enabled }
+        fn abw_stop_using_item(&mut self) -> Option<AbwStack> { self.stop_using }
+        fn abw_using_item(&mut self) -> Option<(u8, AbwStack)> { self.using_item }
+        fn abw_using_item_hand(&mut self) -> Option<u8> { self.using_hand }
+        fn abw_hand_item(&mut self, hand: u8) -> AbwStack { self.hands[hand as usize] }
+        fn abw_is_using_item(&mut self) -> bool { self.is_using }
+        fn abw_ticks_using_item(&mut self) -> i32 { self.ticks_using }
+        fn abw_crossbow_charge_duration(&mut self, _stack: &AbwStack) -> i32 {
+            self.crossbow_charge_duration
+        }
+        fn abw_on_ground(&mut self) -> bool { self.on_ground }
+        fn abw_moving(&mut self) -> bool { self.moving }
+        fn abw_has_regeneration(&mut self) -> bool { self.regen }
+        fn abw_send_move_packet(&mut self, packet_type: MovePacketType) {
+            self.packets.push(packet_type);
+        }
+        fn abw_updating_using_item(&mut self) { self.updates += 1; }
+        fn abw_use_item(&mut self, hand: u8) { self.used_items.push(hand); }
+        fn abw_key_use_pressed(&mut self) -> bool { self.key_use }
+        fn abw_now_ms(&mut self) -> u64 { self.now }
+        fn abw_next_gaussian(&mut self) -> f64 {
+            let gaussian = self.gaussians.get(self.gaussian_idx).copied().unwrap_or(0.0);
+            self.gaussian_idx += 1;
+            gaussian
+        }
+        fn abw_server_rotation(&mut self) -> Rotation { self.server_rotation }
+        fn abw_active_rotation_target_rotation(&mut self) -> Option<Rotation> {
+            self.active_target_rotation
+        }
+        fn abw_set_rotation_target(&mut self, call: AbwRotationTargetCall) {
+            self.rotation_calls.push(call);
+        }
+        fn abw_resolve_primary_shot_velocity(
+            &mut self,
+            _stack: &AbwStack,
+            consider_aim_assist: bool,
+        ) -> Option<f32> {
+            self.velocity.map(|v| if consider_aim_assist { v } else { v })
+        }
+        fn abw_aimbot_select_first(
+            &mut self,
+            velocity: f32,
+            verify_hit_result: bool,
+        ) -> Option<(AbwEntity, Rotation)> {
+            self.select_first_calls.push((velocity, verify_hit_result));
+            self.select_first
+        }
+        fn abw_calculate_angle_for_entity(
+            &mut self,
+            velocity: f32,
+            _enemy: AbwEntity,
+            verify_hit_result: bool,
+        ) -> Option<Rotation> {
+            self.angles.push((velocity, verify_hit_result));
+            self.angle_result
+        }
+        fn abw_aimbot_target(&mut self) -> Option<AbwEntity> { self.aimbot_target }
+        fn abw_reset_aimbot_tracker(&mut self) { self.reset_calls += 1; }
+        fn abw_projectile_first_target(&mut self) -> Option<AbwEntity> { self.proj_first_target }
+        fn abw_should_be_attacked(&mut self, _entity: AbwEntity) -> bool { self.should_be_attacked }
+        fn abw_eye_position(&mut self) -> Vec3 { self.eye }
+        fn abw_sim_arrow_create(&mut self, pos: Vec3, velocity: Vec3) -> u64 {
+            self.arrows.push((pos, velocity));
+            self.arrow_pos = pos;
+            (self.arrows.len() as u64) - 1
+        }
+        fn abw_sim_arrow_pos(&mut self, _arrow: u64) -> Vec3 { self.arrow_pos }
+        fn abw_sim_arrow_tick(&mut self, _arrow: u64) {
+            self.arrow_pos = Vec3 {
+                x: self.arrow_pos.x + self.arrow_tick_advance,
+                y: self.arrow_pos.y,
+                z: self.arrow_pos.z,
+            };
+        }
+        fn abw_shootable_entities(&mut self) -> Vec<AbwSimEntity> { self.sim_entities.clone() }
+    }
+
+    #[test]
+    fn aimbot_sets_rotation_target_on_angle_hit() {
+        let module = auto_bow();
+        let mut state = AutoBowState::default();
+        let mut hooks = AbwHooks {
+            enabled: true,
+            using_item: Some((0, bow())),
+            velocity: Some(3.0),
+            select_first: Some((7, Rotation { yaw: 1.0, pitch: 0.0 })),
+            ..Default::default()
+        };
+
+        abw_aimbot_tick(&module, &mut state, &mut hooks);
+
+        assert_eq!(hooks.reset_calls, 1);
+        assert_eq!(hooks.select_first_calls, vec![(3.0, false)]);
+        assert_eq!(state.aimbot_target, Some(7));
+        assert_eq!(
+            hooks.rotation_calls,
+            vec![AbwRotationTargetCall {
+                rotation: Rotation { yaw: 1.0, pitch: 0.0 },
+                provider: 0,
+                consider_inventory: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn aimbot_skips_without_a_usable_item() {
+        let module = auto_bow();
+        let mut state = AutoBowState::default();
+        let mut hooks = AbwHooks { enabled: true, ..Default::default() };
+
+        abw_aimbot_tick(&module, &mut state, &mut hooks);
+
+        assert!(hooks.select_first_calls.is_empty());
+        assert!(hooks.rotation_calls.is_empty());
+        assert_eq!(state.aimbot_target, None);
+    }
+
+    #[test]
+    fn aimbot_falls_back_to_charged_crossbow_in_hand() {
+        let module = auto_bow();
+        let mut state = AutoBowState::default();
+        let mut hooks = AbwHooks {
+            enabled: true,
+            hands: [AbwStack::NONE, charged_crossbow()],
+            velocity: Some(3.0),
+            select_first: Some((7, Rotation { yaw: 0.0, pitch: 0.0 })),
+            ..Default::default()
+        };
+
+        abw_aimbot_tick(&module, &mut state, &mut hooks);
+
+        assert_eq!(hooks.select_first_calls.len(), 1);
+        assert_eq!(hooks.rotation_calls.len(), 1);
+    }
+
+    #[test]
+    fn auto_shoot_fires_a_charged_crossbow() {
+        let module = auto_bow();
+        let mut state = AutoBowState::default();
+        let mut hooks = AbwHooks {
+            enabled: true,
+            using_item: Some((0, charged_crossbow())),
+            using_hand: Some(0),
+            crossbow_charge_duration: 20,
+            ticks_using: 25,
+            now: 5000,
+            aimbot_target: Some(7),
+            server_rotation: Rotation { yaw: -90.0, pitch: 0.0 },
+            active_target_rotation: Some(Rotation { yaw: -90.0, pitch: 0.0 }),
+            ..Default::default()
+        };
+
+        abw_auto_shoot_tick(&module, &mut state, &mut hooks);
+
+        assert_eq!(hooks.used_items, vec![0]);
+        assert!(!state.force_uncharged);
+        assert_eq!(state.last_shot_timer.last_reset_ms, 5000);
+    }
+
+    #[test]
+    fn auto_shoot_holds_the_uncharged_crossbow() {
+        let module = auto_bow();
+        let mut state = AutoBowState::default();
+        let mut hooks = AbwHooks {
+            enabled: true,
+            using_item: Some((0, uncharged_crossbow())),
+            using_hand: Some(0),
+            crossbow_charge_duration: 20,
+            ticks_using: 20,
+            aimbot_target: Some(7),
+            server_rotation: Rotation { yaw: -90.0, pitch: 0.0 },
+            active_target_rotation: Some(Rotation { yaw: -90.0, pitch: 0.0 }),
+            ..Default::default()
+        };
+
+        abw_auto_shoot_tick(&module, &mut state, &mut hooks);
+
+        assert!(hooks.used_items.is_empty());
+        assert!(state.force_uncharged);
+    }
+
+    #[test]
+    fn auto_shoot_waits_for_the_bow_charge() {
+        let module = auto_bow();
+        let mut state = AutoBowState::default();
+
+        let mut hooks = AbwHooks {
+            enabled: true,
+            using_item: Some((0, bow())),
+            using_hand: Some(0),
+            ticks_using: 14,
+            aimbot_target: Some(7),
+            server_rotation: Rotation { yaw: -90.0, pitch: 0.0 },
+            active_target_rotation: Some(Rotation { yaw: -90.0, pitch: 0.0 }),
+            ..Default::default()
+        };
+        abw_auto_shoot_tick(&module, &mut state, &mut hooks);
+        assert!(hooks.used_items.is_empty());
+
+        hooks.ticks_using = 15;
+        abw_auto_shoot_tick(&module, &mut state, &mut hooks);
+        assert!(hooks.used_items.is_empty());
+        assert!(state.force_uncharged);
+        // BowItem re-seeds the charge random on release.
+        assert_eq!(state.current_charge_random, Some(0));
+    }
+
+    #[test]
+    fn auto_shoot_gates_the_bow_on_the_aim_threshold() {
+        let module = auto_bow();
+        let mut state = AutoBowState::default();
+        let mut hooks = AbwHooks {
+            enabled: true,
+            using_item: Some((0, bow())),
+            using_hand: Some(0),
+            ticks_using: 20,
+            aimbot_target: Some(7),
+            server_rotation: Rotation { yaw: -90.0, pitch: 0.0 },
+            active_target_rotation: Some(Rotation { yaw: -80.0, pitch: 0.0 }),
+            ..Default::default()
+        };
+
+        abw_auto_shoot_tick(&module, &mut state, &mut hooks);
+        assert!(hooks.used_items.is_empty());
+        assert!(!state.force_uncharged);
+
+        hooks.active_target_rotation = Some(Rotation { yaw: -90.0, pitch: 0.0 });
+        abw_auto_shoot_tick(&module, &mut state, &mut hooks);
+        assert!(state.force_uncharged);
+    }
+
+    #[test]
+    fn auto_shoot_respects_the_trident_threshold() {
+        let module = auto_bow();
+        let mut state = AutoBowState::default();
+        let mut hooks = AbwHooks {
+            enabled: true,
+            using_item: Some((0, trident())),
+            using_hand: Some(0),
+            ticks_using: AB_TRIDENT_THROW_THRESHOLD_TIME,
+            aimbot_target: Some(7),
+            server_rotation: Rotation { yaw: -90.0, pitch: 0.0 },
+            active_target_rotation: Some(Rotation { yaw: -90.0, pitch: 0.0 }),
+            ..Default::default()
+        };
+
+        abw_auto_shoot_tick(&module, &mut state, &mut hooks);
+        assert!(hooks.used_items.is_empty());
+        assert!(!state.force_uncharged);
+
+        hooks.ticks_using = AB_TRIDENT_THROW_THRESHOLD_TIME + 1;
+        abw_auto_shoot_tick(&module, &mut state, &mut hooks);
+        assert!(state.force_uncharged);
+        assert!(state.current_charge_random.is_none());
+    }
+
+    #[test]
+    fn keybind_suppression_follows_force_uncharged() {
+        let mut state = AutoBowState::default();
+        assert!(abw_keybind_is_pressed(&state, true));
+
+        state.force_uncharged = true;
+        assert!(!abw_keybind_is_pressed(&state, true));
+        // The suppression only rewrites a pressed use key: an unpressed one
+        // stays unpressed.
+        assert!(!abw_keybind_is_pressed(&state, false));
+    }
+
+    #[test]
+    fn fast_charge_sends_full_packets_while_using_the_bow() {
+        let module = auto_bow();
+        let mut hooks = AbwHooks {
+            using_item: Some((0, bow())),
+            using_hand: Some(0),
+            on_ground: true,
+            is_using: true,
+            ..Default::default()
+        };
+
+        abw_fast_charge_tick(&module, &mut hooks);
+
+        assert_eq!(hooks.packets.len(), 20);
+        assert!(hooks.packets.iter().all(|p| *p == MovePacketType::Full));
+        assert_eq!(hooks.updates, 20);
+    }
+
+    #[test]
+    fn fast_charge_skips_in_the_air_by_default() {
+        let module = auto_bow();
+        let mut hooks = AbwHooks {
+            using_item: Some((0, bow())),
+            using_hand: Some(0),
+            on_ground: false,
+            is_using: true,
+            ..Default::default()
+        };
+
+        abw_fast_charge_tick(&module, &mut hooks);
+
+        assert!(hooks.packets.is_empty());
+        assert_eq!(hooks.updates, 0);
+    }
+
+    #[test]
+    fn projectile_aimbot_sets_the_rotation_target_without_inventory() {
+        let mut hooks = AbwHooks {
+            proj_enabled: true,
+            proj_first_target: Some(9),
+            hands: [bow(), AbwStack::NONE],
+            velocity: Some(2.0),
+            angle_result: Some(Rotation { yaw: 5.0, pitch: 0.0 }),
+            ..Default::default()
+        };
+
+        abw_projectile_aimbot_tick(&mut hooks);
+
+        assert_eq!(hooks.angles, vec![(2.0, false)]);
+        assert_eq!(
+            hooks.rotation_calls,
+            vec![AbwRotationTargetCall {
+                rotation: Rotation { yaw: 5.0, pitch: 0.0 },
+                provider: 1,
+                consider_inventory: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn projectile_aimbot_needs_a_target_and_an_angle() {
+        let mut hooks = AbwHooks { proj_enabled: true, ..Default::default() };
+        abw_projectile_aimbot_tick(&mut hooks);
+        assert!(hooks.rotation_calls.is_empty());
+
+        hooks.proj_first_target = Some(9);
+        abw_projectile_aimbot_tick(&mut hooks);
+        assert!(hooks.rotation_calls.is_empty());
+
+        hooks.hands = [bow(), AbwStack::NONE];
+        hooks.velocity = Some(2.0);
+        hooks.angle_result = Some(Rotation { yaw: 5.0, pitch: 0.0 });
+        abw_projectile_aimbot_tick(&mut hooks);
+        assert_eq!(hooks.rotation_calls.len(), 1);
+    }
+
+    #[test]
+    fn hypothetical_hit_finds_the_entity_on_the_aim_line() {
+        let mut hooks = AbwHooks {
+            using_item: Some((0, bow())),
+            using_hand: Some(0),
+            server_rotation: Rotation { yaw: -90.0, pitch: 0.0 },
+            velocity: Some(3.0),
+            eye: Vec3 { x: 0.0, y: 1.0, z: 0.0 },
+            arrow_tick_advance: 3.0,
+            sim_entities: vec![AbwSimEntity {
+                id: 42,
+                pos: Vec3 { x: 10.0, y: 1.0, z: 0.0 },
+                delta_movement: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+                bb_min: Vec3 { x: 9.8, y: 0.2, z: -0.3 },
+                bb_max: Vec3 { x: 10.2, y: 1.8, z: 0.3 },
+                is_player: false,
+                snapshot_at: None,
+            }],
+            ..Default::default()
+        };
+
+        assert_eq!(abw_hypothetical_hit(&mut hooks), Some(42));
+    }
+
+    #[test]
+    fn hypothetical_hit_misses_off_the_aim_line() {
+        let mut hooks = AbwHooks {
+            using_item: Some((0, bow())),
+            using_hand: Some(0),
+            server_rotation: Rotation { yaw: -90.0, pitch: 0.0 },
+            velocity: Some(3.0),
+            eye: Vec3 { x: 0.0, y: 1.0, z: 0.0 },
+            arrow_tick_advance: 3.0,
+            sim_entities: vec![AbwSimEntity {
+                id: 42,
+                pos: Vec3 { x: -10.0, y: 1.0, z: 0.0 },
+                delta_movement: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+                bb_min: Vec3 { x: -10.2, y: 0.2, z: -0.3 },
+                bb_max: Vec3 { x: -9.8, y: 1.8, z: 0.3 },
+                is_player: false,
+                snapshot_at: None,
+            }],
+            ..Default::default()
+        };
+
+        assert_eq!(abw_hypothetical_hit(&mut hooks), None);
+    }
+
+    #[test]
+    fn hypothetical_hit_uses_the_player_simulation_snapshot() {
+        let mut hooks = AbwHooks {
+            using_item: Some((0, bow())),
+            using_hand: Some(0),
+            server_rotation: Rotation { yaw: -90.0, pitch: 0.0 },
+            velocity: Some(3.0),
+            eye: Vec3 { x: 0.0, y: 1.0, z: 0.0 },
+            arrow_tick_advance: 3.0,
+            sim_entities: vec![AbwSimEntity {
+                id: 42,
+                pos: Vec3 { x: 10.0, y: 1.0, z: 0.0 },
+                delta_movement: Vec3 { x: 1.0, y: 0.0, z: 0.0 },
+                bb_min: Vec3 { x: 9.8, y: 0.2, z: -0.3 },
+                bb_max: Vec3 { x: 10.2, y: 1.8, z: 0.3 },
+                is_player: true,
+                snapshot_at: Some(std::sync::Arc::new(|i| [10.0 + i as f64, 1.0, 0.0])),
+            }],
+            ..Default::default()
+        };
+
+        // The box rides the snapshot (+1 x per tick): the segment from 12 to 15
+        // crosses it around tick 4 (box 13.5..14.5 with the 0.1 margin).
+        assert_eq!(abw_hypothetical_hit(&mut hooks), Some(42));
+    }
+
+    #[test]
+    fn projectile_entity_hit_margin_matches_compute_margin() {
+        assert_eq!(abw_projectile_entity_hit_margin(0), 0.0);
+        assert_eq!(abw_projectile_entity_hit_margin(2), 0.0);
+        assert_eq!(abw_projectile_entity_hit_margin(3), 0.05);
+        assert_eq!(abw_projectile_entity_hit_margin(40), 0.3);
+    }
+
+    #[test]
+    fn on_stop_using_item_resets_the_shot_timer_for_bows() {
+        let mut state = AutoBowState::default();
+        let mut hooks = AbwHooks { stop_using: Some(bow()), now: 1234, ..Default::default() };
+
+        abw_on_stop_using_item(&mut state, &mut hooks);
+        assert_eq!(state.last_shot_timer.last_reset_ms, 1234);
+
+        hooks.stop_using = Some(AbwStack { is_crossbow: true, ..AbwStack::NONE });
+        abw_on_stop_using_item(&mut state, &mut hooks);
+        assert_eq!(state.last_shot_timer.last_reset_ms, 1234);
+    }
+
+    #[test]
+    fn on_disabled_resets_the_aimbot_tracker() {
+        let mut state = AutoBowState { aimbot_target: Some(7), ..Default::default() };
+        let mut hooks = AbwHooks::default();
+
+        abw_on_disabled(&mut state, &mut hooks);
+
+        assert_eq!(state.aimbot_target, None);
+        assert_eq!(hooks.reset_calls, 1);
+    }
+
+    #[test]
+    fn auto_shoot_on_disabled_clears_force_uncharged() {
+        let mut state = AutoBowState { force_uncharged: true, ..Default::default() };
+
+        abw_auto_shoot_on_disabled(&mut state);
+
+        assert!(!state.force_uncharged);
+    }
+
+    #[test]
+    fn dispatcher_runs_the_trees_only_while_enabled() {
+        let module = auto_bow();
+        let mut state = AutoBowState::default();
+        let mut hooks = AbwHooks {
+            using_item: Some((0, bow())),
+            using_hand: Some(0),
+            ticks_using: 20,
+            aimbot_target: Some(7),
+            server_rotation: Rotation { yaw: -90.0, pitch: 0.0 },
+            active_target_rotation: Some(Rotation { yaw: -90.0, pitch: 0.0 }),
+            ..Default::default()
+        };
+
+        abw_tick(&module, &mut state, &mut hooks);
+        assert!(hooks.used_items.is_empty()); // module disabled: nothing ran
+
+        hooks.enabled = true;
+        abw_tick(&module, &mut state, &mut hooks);
+        // The bow tree never calls useItem itself: it sets forceUncharged and
+        // lets the suppressed use key do the release. The BowAimbot tree ran.
+        assert!(hooks.used_items.is_empty());
+        assert!(state.force_uncharged);
+        assert_eq!(hooks.reset_calls, 1);
+        // FastCharge default off: no packets from the dispatcher run.
+        assert!(hooks.packets.is_empty());
+    }
+}
